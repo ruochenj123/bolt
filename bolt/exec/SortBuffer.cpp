@@ -62,6 +62,14 @@ SortBuffer::SortBuffer(
   BOLT_CHECK_GT(sortCompareFlags_.size(), 0);
   BOLT_CHECK_EQ(sortColumnIndices.size(), sortCompareFlags_.size());
   BOLT_CHECK_NOT_NULL(nonReclaimableSection_);
+  
+  // Validate that hybrid sort is not used with row-based spilling
+  if (hybridSortEnabled_ && spillConfig_ != nullptr) {
+    BOLT_CHECK_EQ(
+        spillConfig_->rowBasedSpillMode,
+        common::RowBasedSpillMode::DISABLE,
+        "Hybrid sort is not compatible with row-based spilling");
+  }
 
   std::vector<TypePtr> sortedColumnTypes;
   std::vector<TypePtr> nonSortedColumnTypes;
@@ -409,6 +417,10 @@ void SortBuffer::updateEstimatedOutputRowSize() {
 void SortBuffer::spillInput() {
   if (spiller_ == nullptr) {
     BOLT_CHECK(!noMoreInput_);
+    // Coalesce batches in hybrid mode to simplify extraction during spill
+    if (hybridSortEnabled_ && hybridData_ != nullptr) {
+      hybridData_->coalesceBatches();
+    }
     spiller_ = std::make_unique<Spiller>(
         Spiller::Type::kOrderByInput,
         data_.get(),
@@ -417,6 +429,9 @@ void SortBuffer::spillInput() {
         sortCompareFlags_,
         spillConfig_);
     spiller_->setSpillConfig(spillConfig_);
+    if (hybridSortEnabled_ && hybridData_ != nullptr) {
+      spiller_->setHybridMode(true, hybridData_.get());
+    }
 
     if (sorter_.getSortAlgo() != SortAlgo::kAuto) {
       spiller_->setSortAlgo(sorter_.getSortAlgo());
@@ -428,7 +443,11 @@ void SortBuffer::spillInput() {
             << spiller_->container()->usedBytes()
             << ", num rows: " << spiller_->container()->numRows()
             << ", spill file number: " << spiller_->state().numFinishedFiles(0);
-  data_->clear();
+  if (hybridSortEnabled_ && hybridData_ != nullptr) {
+    hybridData_->clear();
+  } else {
+    data_->clear();
+  }
 }
 
 void SortBuffer::spillOutput() {
@@ -447,6 +466,9 @@ void SortBuffer::spillOutput() {
       spillerStoreType_,
       spillConfig_);
   spiller_->setSpillConfig(spillConfig_);
+  if (hybridSortEnabled_ && hybridData_ != nullptr) {
+    spiller_->setHybridMode(true, hybridData_.get());
+  }
 
   auto spillRows = std::vector<char*>(
       sortedRows_.begin() + numOutputRows_, sortedRows_.end());
@@ -456,7 +478,11 @@ void SortBuffer::spillOutput() {
             << spiller_->container()->usedBytes()
             << ", num rows: " << spiller_->container()->numRows()
             << ", spill file number: " << spiller_->state().numFinishedFiles(0);
-  data_->clear();
+  if (hybridSortEnabled_ && hybridData_ != nullptr) {
+    hybridData_->clear();
+  } else {
+    data_->clear();
+  }
   sortedRows_.clear();
   // Finish right after spilling as the output spiller only spills at most
   // once.
