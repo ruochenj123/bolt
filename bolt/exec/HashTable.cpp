@@ -117,7 +117,7 @@ HashTable<ignoreNullKeys>::HashTable(
         hashMode_ != HashMode::kHash,
         pool,
         stringArena);
-    }
+  }
   nextOffset_ = rows_->nextOffset();
 #ifdef ENABLE_BOLT_JIT // generate JIT lazily?
   if (enableJit_) {
@@ -1849,7 +1849,7 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   if (hybridData_) {
     std::unordered_map<uint8_t, HybridContainer*> hybridDataChannel;
     hybridDataChannel[hybridData_->getId()] = hybridData_.get();
-    for (auto &table : otherTables_)
+    for (auto& table : otherTables_)
       hybridDataChannel[table->hybridData()->getId()] = table->hybridData();
     hybridData_->setAllContainers(hybridDataChannel);
   }

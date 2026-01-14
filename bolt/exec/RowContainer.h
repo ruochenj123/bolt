@@ -1855,8 +1855,7 @@ class HybridContainer {
       bool exactSize = false) {
     // keys
     if (isKey(columnIndex)) {
-      keys_->extractColumn(
-          rows, numRows, columnIndex, resultOffset, result);
+      keys_->extractColumn(rows, numRows, columnIndex, resultOffset, result);
     } else {
       // payloads
       // getRowIds should be called out of extracting projection columns
@@ -1876,7 +1875,6 @@ class HybridContainer {
           exactSize);
     }
   };
-  
 
   void extractColumn(
       const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
@@ -1943,7 +1941,8 @@ class HybridContainer {
     return id_;
   }
 
-  void setAllContainers(std::unordered_map<uint8_t, HybridContainer*>& hybridDataChannel) {
+  void setAllContainers(
+      std::unordered_map<uint8_t, HybridContainer*>& hybridDataChannel) {
     allContainers_ = hybridDataChannel;
     maxContainerId_ = 0;
     for (const auto& [cid, _] : allContainers_) {
@@ -2068,11 +2067,12 @@ class HybridContainer {
         std::move(newChildren)));
 
     totalBatches_ = 1;
-  }  
+  }
 
  private:
-  // Get the single container's coalesced data (only valid when isSingleContainer()).
-  // Validates that the single container is actually this container.
+  // Get the single container's coalesced data (only valid when
+  // isSingleContainer()). Validates that the single container is actually this
+  // container.
   RowVector* getSingleContainerData() const {
     BOLT_DCHECK_EQ(allContainers_.size(), 1);
     BOLT_DCHECK_EQ(owningInputs_.size(), 1);
@@ -2445,7 +2445,8 @@ class HybridContainer {
     constexpr vector_size_t kPrefetchDist = 16;
 
     std::vector<const T*> rawValuesByContainer(maxContainerId_ + 1, nullptr);
-    std::vector<const uint64_t*> rawNullsByContainer(maxContainerId_ + 1, nullptr);
+    std::vector<const uint64_t*> rawNullsByContainer(
+        maxContainerId_ + 1, nullptr);
     for (const auto& entry : allContainers_) {
       auto* flatChild = entry.second->owningInputs_[0]
                             ->childAt(columnIndex)
@@ -2755,7 +2756,6 @@ class HybridContainer {
     }
   }
 
-
   template <bool useRowNumbers>
   void getRowIdsInternal(
       const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
@@ -2861,7 +2861,8 @@ inline void HybridContainer::extractNulls(
     if (!isNullable_[columnIndex]) {
       return;
     }
-    std::vector<const uint64_t*> rawNullsByContainer(maxContainerId_ + 1, nullptr);
+    std::vector<const uint64_t*> rawNullsByContainer(
+        maxContainerId_ + 1, nullptr);
     for (const auto& entry : allContainers_) {
       auto* child =
           entry.second->owningInputs_[0]->childAt(payloadColumnIndex).get();
