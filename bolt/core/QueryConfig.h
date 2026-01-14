@@ -581,7 +581,7 @@ class QueryConfig {
 
   static constexpr const char* kParquetRepDefMemoryLimit =
       "parquet_repdef_memory_limit";
-  
+
   static constexpr const char* kHybridJoinEnabled = "hybrid_join_enabled";
 
   /// If true, reorder rows by containerId during hybrid join extraction for
@@ -1001,7 +1001,6 @@ class QueryConfig {
     return config::OFF;
 #endif
   }
-
 
   bool hybridJoinEnabled() const {
     return get<bool>(kHybridJoinEnabled, false);
