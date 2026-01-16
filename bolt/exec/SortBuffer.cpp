@@ -252,20 +252,42 @@ void SortBuffer::noMoreInput() {
     sortedRows_.swap(lateMaterializationRows_);
 
     MicrosecondTimer timer(&sortInSortTimeUs_);
-    // Sort using the HybridContainer's RowContainer for comparison
-    sorter_.sort(
-        sortedRows_.begin(),
-        sortedRows_.end(),
-        [rowContainer, this](const char* leftRow, const char* rightRow) {
-          for (vector_size_t index = 0; index < sortCompareFlags_.size();
-               ++index) {
-            if (auto result = rowContainer->compare(
-                    leftRow, rightRow, index, sortCompareFlags_[index])) {
-              return result < 0;
+
+#ifdef ENABLE_BOLT_JIT
+    // Try to use JIT-compiled comparison for late-m path too
+    if (cmp_ == nullptr && operatorCtx_ &&
+        operatorCtx_->driverCtx()->queryConfig().enableJitRowCmpRow()) {
+      if (rowContainer->JITable(rowContainer->keyTypes())) {
+        auto [jitMod, rowRowCmpfn] = rowContainer->codegenCompare(
+            rowContainer->keyTypes(),
+            sortCompareFlags_,
+            bytedance::bolt::jit::CmpType::SORT_LESS,
+            true);
+        jitModule_ = std::move(jitMod);
+        cmp_ = (RowRowCompare)jitModule_->getFuncPtr(rowRowCmpfn);
+      }
+    }
+    if (cmp_) {
+      sorter_.sort(sortedRows_.begin(), sortedRows_.end(), cmp_);
+    } else {
+#endif
+      // Fallback: Sort using the HybridContainer's RowContainer for comparison
+      sorter_.sort(
+          sortedRows_.begin(),
+          sortedRows_.end(),
+          [rowContainer, this](const char* leftRow, const char* rightRow) {
+            for (vector_size_t index = 0; index < sortCompareFlags_.size();
+                 ++index) {
+              if (auto result = rowContainer->compare(
+                      leftRow, rightRow, index, sortCompareFlags_[index])) {
+                return result < 0;
+              }
             }
-          }
-          return false;
-        });
+            return false;
+          });
+#ifdef ENABLE_BOLT_JIT
+    }
+#endif
     return;
   }
 
