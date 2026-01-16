@@ -237,6 +237,11 @@ BENCHMARK(q22) {
   benchmark.run(planContext);
 }
 
+BENCHMARK(q23) {
+  const auto planContext = queryBuilder->getQueryPlan(23);
+  benchmark.run(planContext);
+}
+
 int tpchBenchmarkMain() {
   benchmark.initialize();
   queryBuilder =

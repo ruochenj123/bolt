@@ -46,8 +46,10 @@
 #include "bolt/exec/TraceConfig.h"
 namespace bytedance::bolt::exec {
 
+class BaseHashTable;  // Forward declaration for late materialization
 class Driver;
 class ExchangeClient;
+class HybridContainer;  // Forward declaration for late materialization
 class LocalExchangeQueue;
 class Operator;
 struct OperatorStats;
@@ -312,6 +314,31 @@ struct DriverCtx {
   std::optional<common::SpillConfig> makeSpillConfig(
       int32_t operatorId,
       const std::string& rowBasedSpillMode = "disabled") const;
+
+  /// Late materialization state: shared HybridContainer from upstream operator
+  /// (e.g., HashProbe) to downstream operator (e.g., OrderBy) in the same
+  /// pipeline. This avoids redundant layout conversion when operators share
+  /// the same keys.
+  /// We store the table pointer to keep the HybridContainer alive until
+  /// downstream operators are done processing.
+  std::shared_ptr<BaseHashTable> lateMaterializationTable;
+
+  /// The row pointers from the upstream operator for late materialization.
+  /// These point into the HybridContainer's RowContainer (keys).
+  std::vector<char*> lateMaterializationRows;
+
+  /// Column projections for late materialization: maps from HybridContainer
+  /// column index (inputChannel) to output column index (outputChannel).
+  /// This is needed because HybridContainer has its own column layout.
+  std::vector<std::pair<column_index_t, column_index_t>>
+      lateMaterializationProjections;
+
+  /// Clears the late materialization state after it has been consumed.
+  void clearLateMaterializationState() {
+    lateMaterializationTable.reset();
+    lateMaterializationRows.clear();
+    lateMaterializationProjections.clear();
+  }
 };
 
 constexpr const char* kOpMethodNone = "";

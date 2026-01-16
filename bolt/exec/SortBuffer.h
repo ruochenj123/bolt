@@ -44,6 +44,8 @@
 #include "bolt/vector/BaseVector.h"
 namespace bytedance::bolt::exec {
 
+class BaseHashTable;  // Forward declaration for late materialization
+
 /// A utility class to accumulate data inside and output the sorted result.
 /// Spilling would be triggered if spilling is enabled and memory usage exceeds
 /// limit.
@@ -228,6 +230,16 @@ class SortBuffer {
   std::vector<IdentityProjection> payloadColumnMap_;
   std::vector<column_index_t> payloadChannels_;
   RowTypePtr payloadTypes_;
+
+  // For late materialization: use row pointers from upstream HashJoin directly
+  bool lateMaterializationActive_{false};
+  // Holds reference to the table to keep HybridContainer alive
+  std::shared_ptr<BaseHashTable> lateMaterializationTable_;
+  HybridContainer* lateMaterializationContainer_{nullptr};
+  std::vector<char*> lateMaterializationRows_;
+  // Column projections from HybridContainer to output
+  std::vector<std::pair<column_index_t, column_index_t>>
+      lateMaterializationProjections_;
 };
 
 } // namespace bytedance::bolt::exec

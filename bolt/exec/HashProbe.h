@@ -650,6 +650,11 @@ class HashProbe : public Operator {
 
   bool hitSampling_{false};
 
+  // Late materialization: pass row pointers to downstream operator (e.g., Sort)
+  // instead of extracting columns. This avoids redundant layout conversion
+  // when the downstream operator can directly use the HybridContainer.
+  bool lateMaterializationEnabled_{false};
+
   // for skew partition in HashBuild
   bool needLastProbeSideOutput() const;
 

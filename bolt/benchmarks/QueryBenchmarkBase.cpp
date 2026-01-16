@@ -29,6 +29,7 @@
  */
 
 #include "bolt/benchmarks/QueryBenchmarkBase.h"
+#include "bolt/core/QueryConfig.h"
 
 DEFINE_string(data_format, "parquet", "Data format");
 
@@ -85,6 +86,16 @@ DEFINE_bool(
     false,
     "Runs one warmup of the query before "
     "measured run. Use to run warm after clearing caches.");
+
+DEFINE_bool(
+    hybrid_join_enabled,
+    false,
+    "Enable hybrid join optimization");
+
+DEFINE_bool(
+    late_materialization_enabled,
+    false,
+    "Enable late materialization optimization for HashJoin->Sort pattern");
 
 DEFINE_int64(
     max_coalesced_bytes,
@@ -243,6 +254,13 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       params.planNode = tpchPlan.plan;
       params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
           std::to_string(FLAGS_split_preload_per_driver);
+      if (FLAGS_hybrid_join_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinEnabled] = "true";
+      }
+      if (FLAGS_late_materialization_enabled) {
+        params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
+            "true";
+      }
       const int numSplitsPerFile = FLAGS_num_splits_per_file;
 
       bool noMoreSplits = false;

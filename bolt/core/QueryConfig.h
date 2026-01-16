@@ -588,6 +588,12 @@ class QueryConfig {
 
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
+  /// If true, enable late materialization optimization for HashJoin->Sort
+  /// pattern when they share the same keys. This avoids redundant layout
+  /// conversion between operators.
+  static constexpr const char* kLateMaterializationEnabled =
+      "late_materialization_enabled";
+
   /**
    * LLVM JIT enabled
    * -1 : enable all jit (by default)
@@ -1011,6 +1017,13 @@ class QueryConfig {
 
   bool hybridSortEnabled() const {
     return get<bool>(kHybridSortEnabled, false);
+  }
+
+  /// Returns whether late materialization optimization is enabled.
+  /// When enabled, HashJoin->Sort with same keys can share HybridContainer
+  /// to avoid redundant layout conversion.
+  bool lateMaterializationEnabled() const {
+    return get<bool>(kLateMaterializationEnabled, false);
   }
 
   /// Returns 'is aggregation spilling enabled' flag. Must also check the

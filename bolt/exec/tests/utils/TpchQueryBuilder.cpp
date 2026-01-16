@@ -201,6 +201,8 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ21Plan();
     case 22:
       return getQ22Plan();
+    case 23:
+      return getQ23Plan();
     default:
       BOLT_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -2554,6 +2556,58 @@ TpchPlan TpchQueryBuilder::getIoMeterPlan(int columnPct) const {
   context.planName = "IoMeter";
   context.plan = std::move(plan);
   context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q23: HashJoin->Sort on same keys (late materialization test)
+// SELECT o_orderkey, o_orderdate
+// FROM lineitem JOIN orders ON l_orderkey = o_orderkey
+// ORDER BY o_orderkey
+// LIMIT 100
+// Note: Only build-side columns in output for simplest late-m demo
+TpchPlan TpchQueryBuilder::getQ23Plan() const {
+  std::vector<std::string> lineitemColumns = {"l_orderkey"};
+  std::vector<std::string> ordersColumns = {"o_orderkey", "o_orderdate"};
+
+  auto lineitemSelectedRowType = getRowType(kLineitem, lineitemColumns);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+  auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
+  const auto& ordersFileColumns = getFileColumnNames(kOrders);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemPlanNodeId;
+  core::PlanNodeId ordersPlanNodeId;
+
+  auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .filtersAsNode(filtersAsNode_)
+                    .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
+                    .captureScanNodeId(ordersPlanNodeId)
+                    .planNode();
+
+  // HashJoin on l_orderkey = o_orderkey, then Sort on o_orderkey (same key)
+  // Only build-side columns in output for late materialization
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(
+              kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+          .captureScanNodeId(lineitemPlanNodeId)
+          .hashJoin(
+              {"l_orderkey"},
+              {"o_orderkey"},
+              orders,
+              "",
+              {"o_orderkey", "o_orderdate"})
+          .orderBy({"o_orderkey"}, false)
+          .limit(0, 100, false)
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q23";
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
   context.dataFileFormat = format_;
   return context;
 }

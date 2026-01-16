@@ -30,6 +30,7 @@
 
 #include "SortBuffer.h"
 #include <algorithm>
+#include "HashTable.h"
 #include "Spiller.h"
 #include "bolt/exec/MemoryReclaimer.h"
 #include "bolt/exec/RowToColumnVector.h"
@@ -131,6 +132,41 @@ SortBuffer::SortBuffer(
 
 void SortBuffer::addInput(const VectorPtr& input) {
   BOLT_CHECK(!noMoreInput_);
+
+  // Check for late materialization state from upstream HashJoin
+  if (operatorCtx_ != nullptr) {
+    auto* driverCtx = operatorCtx_->driverCtx();
+    if (driverCtx->lateMaterializationTable != nullptr &&
+        !driverCtx->lateMaterializationRows.empty()) {
+      // Activate late materialization mode
+      if (!lateMaterializationActive_) {
+        lateMaterializationActive_ = true;
+        // Store the table shared_ptr to keep HybridContainer alive
+        lateMaterializationTable_ = driverCtx->lateMaterializationTable;
+        lateMaterializationContainer_ =
+            driverCtx->lateMaterializationTable->hybridData();
+        // Capture column projections from DriverCtx
+        lateMaterializationProjections_ =
+            driverCtx->lateMaterializationProjections;
+        LOG(INFO) << "SortBuffer: late materialization activated with "
+                  << driverCtx->lateMaterializationRows.size() << " rows, "
+                  << lateMaterializationProjections_.size() << " projections";
+      }
+      // Take ownership of row pointers
+      lateMaterializationRows_.insert(
+          lateMaterializationRows_.end(),
+          driverCtx->lateMaterializationRows.begin(),
+          driverCtx->lateMaterializationRows.end());
+      numInputRows_ += driverCtx->lateMaterializationRows.size();
+
+      // Clear the DriverCtx late-m state after consuming
+      driverCtx->clearLateMaterializationState();
+
+      // Skip normal input processing - we got data via late-m
+      return;
+    }
+  }
+
   ensureInputFits(input);
 
   SelectivityVector allRows(input->size());
@@ -200,6 +236,39 @@ void SortBuffer::noMoreInput() {
   if (numInputRows_ == 0) {
     return;
   }
+
+  // Late materialization path: sort row pointers directly
+  if (lateMaterializationActive_) {
+    BOLT_CHECK_NOT_NULL(lateMaterializationContainer_);
+    BOLT_CHECK_EQ(numInputRows_, lateMaterializationRows_.size());
+    LOG(INFO) << "SortBuffer: sorting " << numInputRows_
+              << " late-materialized rows";
+
+    // Use the RowContainer from HybridContainer for comparison
+    auto* rowContainer = lateMaterializationContainer_->getKeys();
+    BOLT_CHECK_NOT_NULL(rowContainer);
+
+    // sortedRows_ points to the late-m rows for output
+    sortedRows_.swap(lateMaterializationRows_);
+
+    MicrosecondTimer timer(&sortInSortTimeUs_);
+    // Sort using the HybridContainer's RowContainer for comparison
+    sorter_.sort(
+        sortedRows_.begin(),
+        sortedRows_.end(),
+        [rowContainer, this](const char* leftRow, const char* rightRow) {
+          for (vector_size_t index = 0; index < sortCompareFlags_.size();
+               ++index) {
+            if (auto result = rowContainer->compare(
+                    leftRow, rightRow, index, sortCompareFlags_[index])) {
+              return result < 0;
+            }
+          }
+          return false;
+        });
+    return;
+  }
+
   if (hybridSortEnabled_ && hybridData_ != nullptr) {
     hybridData_->coalesceBatches();
   }
@@ -515,6 +584,29 @@ void SortBuffer::prepareOutput(uint32_t maxOutputRows) {
 
 void SortBuffer::getOutputWithoutSpill() {
   BOLT_DCHECK_EQ(numInputRows_, sortedRows_.size());
+
+  // Late materialization path: extract from HybridContainer using projections
+  if (lateMaterializationActive_) {
+    BOLT_CHECK_NOT_NULL(lateMaterializationContainer_);
+    std::vector<HybridRowId> outputRowIds;
+    outputRowIds.resize(output_->size());
+    lateMaterializationContainer_->getRowIds(
+        sortedRows_.data() + numOutputRows_, output_->size(), outputRowIds);
+    // Use projections from DriverCtx: inputChannel is HybridContainer column,
+    // outputChannel is output_ column
+    for (const auto& [inputChannel, outputChannel] :
+         lateMaterializationProjections_) {
+      lateMaterializationContainer_->extractColumn(
+          sortedRows_.data() + numOutputRows_,
+          output_->size(),
+          inputChannel,
+          output_->childAt(outputChannel),
+          outputRowIds);
+    }
+    numOutputRows_ += output_->size();
+    return;
+  }
+
   if (hybridSortEnabled_) {
     std::vector<HybridRowId> outputRowIds;
     outputRowIds.resize(output_->size());

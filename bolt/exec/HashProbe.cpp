@@ -259,6 +259,28 @@ void HashProbe::initialize() {
   if (nullAware_) {
     filterTableResult_.resize(1);
   }
+
+  // Late materialization eligibility check:
+  // 1. Config enabled
+  // 2. Inner join only (for v1 simplicity)
+  // 3. No filter (filter requires materializing for evaluation)
+  // 4. All outputs from build-side only (no probe-side columns)
+  // 5. Hybrid join will be used (checked when table_ is available)
+  auto lateMConfig = operatorCtx_->driverCtx()->queryConfig().lateMaterializationEnabled();
+  LOG(WARNING) << "HashProbe " << planNodeId()
+               << " initialize: lateMaterializationEnabled=" << lateMConfig
+               << ", isInnerJoin=" << isInnerJoin(joinType_)
+               << ", hasFilter=" << (joinNode_->filter() != nullptr)
+               << ", projectedInputColumns.empty=" << projectedInputColumns_.empty()
+               << ", tableOutputProjections.size=" << tableOutputProjections_.size();
+  if (lateMConfig &&
+      isInnerJoin(joinType_) && !joinNode_->filter() &&
+      projectedInputColumns_.empty() && !tableOutputProjections_.empty()) {
+    // Will finalize in setHashTable when we know if hybrid join is used
+    lateMaterializationEnabled_ = true;
+    LOG(WARNING) << "HashProbe " << planNodeId()
+                 << " late materialization potentially enabled";
+  }
 }
 
 void HashProbe::initializeFilter(
@@ -435,6 +457,18 @@ void HashProbe::asyncWaitForHashTable() {
 
   table_ = std::move(hashBuildResult->table);
   BOLT_CHECK_NOT_NULL(table_);
+
+  // Finalize late materialization check: require hybrid join to be enabled
+  if (lateMaterializationEnabled_) {
+    if (table_->hybridData() == nullptr) {
+      lateMaterializationEnabled_ = false;
+      LOG(INFO) << "HashProbe " << planNodeId()
+                << " late materialization disabled: not hybrid join";
+    } else {
+      LOG(INFO) << "HashProbe " << planNodeId()
+                << " late materialization confirmed enabled";
+    }
+  }
 
   maybeSetupSpillInput(
       hashBuildResult->restoredPartitionId,
@@ -912,6 +946,43 @@ void HashProbe::fillOutput(vector_size_t size) {
   if (isLeftSemiProjectJoin(joinType_)) {
     fillLeftSemiProjectMatchColumn(size);
   } else {
+    // Late materialization: pass row pointers to downstream instead of
+    // extracting. The downstream operator (e.g., SortBuffer) can use these
+    // pointers directly to sort and then extract from HybridContainer.
+    if (lateMaterializationEnabled_ && table_->hybridData() != nullptr) {
+      auto* driverCtx = operatorCtx_->driverCtx();
+      // Store table shared_ptr to keep HybridContainer alive until downstream
+      // operators are done processing
+      driverCtx->lateMaterializationTable = table_;
+
+      // Append row pointers to DriverCtx (accumulate across batches)
+      auto& rows = driverCtx->lateMaterializationRows;
+      size_t prevSize = rows.size();
+      rows.resize(prevSize + size);
+      std::copy(
+          outputTableRows_.data(),
+          outputTableRows_.data() + size,
+          rows.data() + prevSize);
+
+      // Set column projections on first batch (from table column to output)
+      if (driverCtx->lateMaterializationProjections.empty()) {
+        for (const auto& proj : tableOutputProjections_) {
+          driverCtx->lateMaterializationProjections.emplace_back(
+              proj.inputChannel, proj.outputChannel);
+        }
+      }
+
+      // For late-m, we still need to produce output for correctness.
+      // But skip extractColumns since downstream will use late-m path.
+      // Just create empty vectors of the right size.
+      for (auto projection : tableOutputProjections_) {
+        auto& child = output_->childAt(projection.outputChannel);
+        child = BaseVector::createNullConstant(
+            outputType_->childAt(projection.outputChannel), size, pool());
+      }
+      return;
+    }
+
     bool wrapInDictionary = false;
     std::map<int64_t, int16_t> addrToIndex;
     // if size too small, no need to sample

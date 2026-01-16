@@ -1,0 +1,22 @@
+Late materialization
+
+Goal: in current workflow of bolt, even with hybrid enabled, there are multiple layout conversion between operators. For example, take simple pipeline HashJoin->Sort with same keys. When HashJoin finishes, the output needs to be converted into RowVectorPtr from RowContainer (or hybridContainer) and pass to Sort. While in Sort, the input needs to be converted again from RowVectorPtr into RowContainer/HybridCOntainer again. This is redundant, as these two operators can process on the same set of keys.
+
+Design: Maybe we can do late materialization for such kind of pattern. That is, instead of passing RowVector between operators, we can pass HybridContainer. Remember now HybridContainer contains everything, including keys (Stored in member variable of RowContainer) and coalesced batch of payloads. So the downstream operator can process directly on key parts of hybridcontainer, without redundant conversion.
+
+Let’s see a concrete example:
+
+HashJoin->Sort on the same keys. 
+1. In HashProbe, basically we can output a list of matched batches from Probe input (stored as RowVectorPtr), followed by the matched row pointers, pointing to the matched rows stored inside HybridContainer->keys_. At that point, what we have are 
+A. Probe side projection columns, stored in RowVectorPtr
+B. HybridContainer, including all keys and build side projection columns, which maps with keys by rowId stored inside keys
+C. A list of matched row pointers pointing to the rows stored inside keys
+
+2. Next, in Sort, the sort can be done directly on the input list of rows. After that, in output part, we can see the build side projection columns can still be retrieved correctly based on rowIds stored inside keys (based on current implementation with hybridJoinEnabled). However, the projection columns from probe side is messed up, as Sort reorder the rows so it is no longer one-to-one mapping. That indicate we also need to preallocate the rowId for Probe when we generate RowContainer/HybridContainer in HashBuild. In other words, we need to preallocate # of rowId slots based on the pattern of all operators.
+
+Demo start:
+Let’s start implement a simple version. 
+1. We just consider/detect the pattern of HashJoin->Sort on the same keys (We will generate a benchmark query to test)
+2. We preallocate the rowids for late materialization
+3. We add new methods to pass our new memory layout between operators, while do not give any side effect to existing workflow.
+4. We may need a configuration to enable this late-m feature.
