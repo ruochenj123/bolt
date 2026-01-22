@@ -360,12 +360,46 @@ queryCtx->setConfigOverrides({
 ### Current Limitations
 
 1. **Build-side only**: Currently only supports outputting columns from the build side of the join.
-2. **Single join key**: Optimized for cases where sort key matches join key.
-3. **No spill support**: Late-m path doesn't support spilling yet.
+2. **Single join**: Optimized for single HashJoin → Sort pattern. N-way joins not yet supported.
+3. **Same key assumption**: Sort key must match join key for maximum benefit.
+4. **No spill support**: Late-m path doesn't support spilling yet.
+
+### N-Way Join Generalization (In Progress)
+
+The N-way join generalization extends late materialization to support arbitrary chains of joins:
+
+```
+T1 JOIN T2 ON k1 → J1 JOIN T3 ON k2 → ... → Sort on any key
+```
+
+**Key Design Elements:**
+
+1. **PayloadRegistry**: Central registry tracking payload columns from all sources
+   - Each join registers build/probe sources with unique sourceId
+   - Stores `shared_ptr<BaseHashTable>` for build-side, `ProbePayloadContainer` for probe-side
+   
+2. **RowId Accumulation**: Each join output row accumulates rowIds from all sources:
+   - J1 output: rowId(T1), rowId(T2)
+   - J2 output: rowId(T1), rowId(T2), rowId(T3)
+   - Final Sort: has rowIds to extract from all original tables
+
+3. **Projection Mapping**: Maps (sourceId, sourceColumn) → outputColumn for final extraction
+
+**Implementation Files:**
+- `bolt/exec/PayloadRegistry.h/cpp`: Registry for tracking payload sources
+- `bolt/exec/RowContainer.h`: `HybridContainer::extractColumnByRowId()` for direct rowId-based extraction
+- `bolt/exec/RowContainer.h`: `ProbePayloadContainer` for probe-side payload storage
+
+**Test Queries (Q26-Q28):**
+- Q26: 2-way join, same join key as sort key
+- Q27: 3-way join (customer → orders → lineitem), different join keys
+- Q28: 2-way join, different join key vs sort key
+
+See [nway-late-materialization-design.md](nway-late-materialization-design.md) for full design details.
 
 ### Future Optimizations
 
-1. **Probe-side support**: Extend to handle probe-side columns in output.
+1. **Probe-side support**: Extend to handle probe-side columns in output. ✅ (via ProbePayloadContainer)
 2. **Multi-key support**: Handle cases with multiple join/sort keys.
 3. **Aggregation fusion**: Apply similar optimization to HashJoin → Aggregation patterns.
 4. **Automatic detection**: Planner-level detection of late-m opportunities.

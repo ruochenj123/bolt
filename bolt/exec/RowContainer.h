@@ -1890,6 +1890,16 @@ class HybridContainer {
         rows, numRows, columnIndex, 0, result, outputRowIds, exactSize);
   };
 
+  /// Extract a payload column directly using HybridRowIds.
+  /// This is used by PayloadRegistry for N-way join late materialization
+  /// where we already have the decoded rowIds and don't need to look them up
+  /// from row pointers.
+  void extractColumnByRowId(
+      const HybridRowId* rowIds,
+      int32_t numRows,
+      int32_t payloadColumnIndex,
+      VectorPtr& result);
+
   void extractColumn(
       const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
       folly::Range<const vector_size_t*> rowNumbers,

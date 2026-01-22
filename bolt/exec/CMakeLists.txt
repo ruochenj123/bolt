@@ -82,6 +82,7 @@ add_library(
   OutputBufferManager.cpp
   PartitionedOutput.cpp
   PartitionFunction.cpp
+  PayloadRegistry.cpp
   PlanNodeStats.cpp
   ProbeOperatorState.cpp
   PushBasedEvent.cpp
