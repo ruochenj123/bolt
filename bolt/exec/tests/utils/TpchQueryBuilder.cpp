@@ -203,6 +203,10 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ22Plan();
     case 23:
       return getQ23Plan();
+    case 24:
+      return getQ24Plan();
+    case 25:
+      return getQ25Plan();
     default:
       BOLT_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -2561,14 +2565,23 @@ TpchPlan TpchQueryBuilder::getIoMeterPlan(int columnPct) const {
 }
 
 // Q23: HashJoin->Sort on same keys (late materialization test)
-// SELECT o_orderkey, o_orderdate
+// SELECT o_orderkey, o_orderdate, o_totalprice, l_quantity, l_discount
 // FROM lineitem JOIN orders ON l_orderkey = o_orderkey
 // ORDER BY o_orderkey
-// LIMIT 100
-// Note: Only build-side columns in output for simplest late-m demo
+// Note: Contains both build-side and probe-side columns for late-m demo
 TpchPlan TpchQueryBuilder::getQ23Plan() const {
-  std::vector<std::string> lineitemColumns = {"l_orderkey"};
-  std::vector<std::string> ordersColumns = {"o_orderkey", "o_orderdate"};
+  // Probe-side columns (lineitem)
+  std::vector<std::string> lineitemColumns = {
+      "l_orderkey",
+      "l_quantity",   // probe-side payload
+      "l_discount"    // probe-side payload
+  };
+  // Build-side columns (orders)
+  std::vector<std::string> ordersColumns = {
+      "o_orderkey",
+      "o_orderdate",
+      "o_totalprice"
+  };
 
   auto lineitemSelectedRowType = getRowType(kLineitem, lineitemColumns);
   const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
@@ -2586,7 +2599,7 @@ TpchPlan TpchQueryBuilder::getQ23Plan() const {
                     .planNode();
 
   // HashJoin on l_orderkey = o_orderkey, then Sort on o_orderkey (same key)
-  // Only build-side columns in output for late materialization
+  // Output includes both build-side (orders) and probe-side (lineitem) columns
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
           .filtersAsNode(filtersAsNode_)
@@ -2598,13 +2611,158 @@ TpchPlan TpchQueryBuilder::getQ23Plan() const {
               {"o_orderkey"},
               orders,
               "",
-              {"o_orderkey", "o_orderdate"})
+              {"o_orderkey",      // build-side (sort key)
+               "o_orderdate",     // build-side
+               "o_totalprice",    // build-side
+               "l_quantity",      // probe-side
+               "l_discount"})     // probe-side
           .orderBy({"o_orderkey"}, false)
-          .limit(0, 100, false)
           .planNode();
 
   TpchPlan context;
   context.planName = "q23";
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q24: HashJoin->Sort with build-side only projections (late materialization test)
+// SELECT o_orderkey, o_orderdate, o_totalprice
+// FROM lineitem JOIN orders ON l_orderkey = o_orderkey
+// ORDER BY o_orderkey
+// Note: All projections are from build-side only (no probe-side columns)
+TpchPlan TpchQueryBuilder::getQ24Plan() const {
+  // Probe-side columns (lineitem) - only join key needed
+  std::vector<std::string> lineitemColumns = {
+      "l_orderkey"
+  };
+  // Build-side columns (orders) - include ALL columns for large payload test
+  // This tests hybrid sort benefit with large payload:
+  // - Sort key: o_orderkey (8 bytes)
+  // - Payload: ~100+ bytes (including o_comment ~50-80 bytes)
+  std::vector<std::string> ordersColumns = {
+      "o_orderkey",       // sort key (8 bytes)
+      "o_custkey",        // payload (8 bytes)
+      "o_orderstatus",    // payload (VARCHAR ~1 byte)
+      "o_totalprice",     // payload (8 bytes)
+      "o_orderdate",      // payload (4 bytes)
+      "o_orderpriority",  // payload (VARCHAR ~15 bytes)
+      "o_clerk",          // payload (VARCHAR ~15 bytes)
+      "o_shippriority",   // payload (4 bytes)
+      "o_comment"         // payload (VARCHAR ~50-80 bytes)
+  };
+
+  auto lineitemSelectedRowType = getRowType(kLineitem, lineitemColumns);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+  auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
+  const auto& ordersFileColumns = getFileColumnNames(kOrders);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemPlanNodeId;
+  core::PlanNodeId ordersPlanNodeId;
+
+  auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .filtersAsNode(filtersAsNode_)
+                    .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
+                    .captureScanNodeId(ordersPlanNodeId)
+                    .planNode();
+
+  // HashJoin on l_orderkey = o_orderkey, then Sort on o_orderkey (same key)
+  // Output includes ONLY build-side (orders) columns - no probe-side
+  // Large payload test: ~100+ bytes payload per row
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(
+              kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+          .captureScanNodeId(lineitemPlanNodeId)
+          .hashJoin(
+              {"l_orderkey"},
+              {"o_orderkey"},
+              orders,
+              "",
+              {"o_orderkey",      // sort key (8 bytes)
+               "o_custkey",       // payload (8 bytes)
+               "o_orderstatus",   // payload (VARCHAR)
+               "o_totalprice",    // payload (8 bytes)
+               "o_orderdate",     // payload (4 bytes)
+               "o_orderpriority", // payload (VARCHAR ~15 bytes)
+               "o_clerk",         // payload (VARCHAR ~15 bytes)
+               "o_shippriority",  // payload (4 bytes)
+               "o_comment"})      // payload (VARCHAR ~50-80 bytes)
+          .orderBy({"o_orderkey"}, false)
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q24";
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q25: Swapped join order version of Q23 - LINEITEM as build side (larger table)
+// SELECT o_orderkey, o_orderdate, o_totalprice, l_quantity, l_discount
+// FROM orders JOIN lineitem ON o_orderkey = l_orderkey
+// ORDER BY o_orderkey
+// Note: Same semantics as Q23, but with lineitem (180M rows) as build side
+// to test hybrid join benefits with larger build table
+TpchPlan TpchQueryBuilder::getQ25Plan() const {
+  // Build-side columns (lineitem) - now the larger table
+  std::vector<std::string> lineitemColumns = {
+      "l_orderkey",
+      "l_quantity",   // build-side payload
+      "l_discount"    // build-side payload
+  };
+  // Probe-side columns (orders) - now the smaller table
+  std::vector<std::string> ordersColumns = {
+      "o_orderkey",
+      "o_orderdate",
+      "o_totalprice"
+  };
+
+  auto lineitemSelectedRowType = getRowType(kLineitem, lineitemColumns);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+  auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
+  const auto& ordersFileColumns = getFileColumnNames(kOrders);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemPlanNodeId;
+  core::PlanNodeId ordersPlanNodeId;
+
+  // Build side: lineitem (180M rows at SF30)
+  auto lineitem = PlanBuilder(planNodeIdGenerator, pool_.get())
+                      .filtersAsNode(filtersAsNode_)
+                      .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+                      .captureScanNodeId(lineitemPlanNodeId)
+                      .planNode();
+
+  // HashJoin: orders (probe) x lineitem (build)
+  // Output same columns as Q23, just built differently
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(
+              kOrders, ordersSelectedRowType, ordersFileColumns)
+          .captureScanNodeId(ordersPlanNodeId)
+          .hashJoin(
+              {"o_orderkey"},
+              {"l_orderkey"},
+              lineitem,
+              "",
+              {"o_orderkey",      // probe-side (sort key)
+               "o_orderdate",     // probe-side
+               "o_totalprice",    // probe-side
+               "l_quantity",      // build-side
+               "l_discount"})     // build-side
+          .orderBy({"o_orderkey"}, false)
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q25";
   context.plan = std::move(plan);
   context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
   context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);

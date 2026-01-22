@@ -30,6 +30,7 @@
 
 #include "bolt/exec/HashBuild.h"
 #include <boost/sort/pdqsort/pdqsort.hpp>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -617,7 +618,12 @@ void HashBuild::addInput(RowVectorPtr input) {
   auto rows = table_->rows();
   auto nextOffset = rows->nextOffset();
 
+  auto addInputStart = std::chrono::steady_clock::now();
   if (hybridJoin_) {
+    // Get the current total row count BEFORE adding this batch.
+    // This gives us the global row offset for this batch.
+    auto baseRow = table_->hybridData()->getNumRows();
+    
     activeRows_.applyToSelected([&](auto rowIndex) {
       char* newRow = rows->newRow();
       if (nextOffset) {
@@ -629,16 +635,18 @@ void HashBuild::addInput(RowVectorPtr input) {
       for (auto i = 0; i < hashers.size(); ++i) {
         rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
       }
-      // Store RowId
-      auto baseRow = table_->hybridData()->getNumRows();
-      uint64_t encodedId = (static_cast<uint64_t>(driverId_)
-                            << 56) | // top 8 bits: driverId [0, 255]
-          (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+      // Store RowId: driverId(8 bits) | globalRowIndex(56 bits)
+      // globalRowIndex = baseRow + rowIndex (index within this batch)
+      uint64_t encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+          (static_cast<uint64_t>(baseRow + rowIndex) & ((1ULL << 56) - 1));
       rows->storeSingleRowId(encodedId, newRow);
     });
     auto payloadInput = wrapColumns(
         input->as<RowVector>(), dependentChannels_, dependentTypes_, pool());
     table_->hybridData()->addPayload(std::move(payloadInput));
+    auto addInputEnd = std::chrono::steady_clock::now();
+    auto addInputUs = std::chrono::duration_cast<std::chrono::microseconds>(addInputEnd - addInputStart).count();
+    addRuntimeStat("hybridAddInputUs", RuntimeCounter(addInputUs, RuntimeCounter::Unit::kNone));
   } else {
     activeRows_.applyToSelected([&](auto rowIndex) {
       char* newRow = rows->newRow();
@@ -655,6 +663,9 @@ void HashBuild::addInput(RowVectorPtr input) {
         rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
       }
     });
+    auto addInputEnd = std::chrono::steady_clock::now();
+    auto addInputUs = std::chrono::duration_cast<std::chrono::microseconds>(addInputEnd - addInputStart).count();
+    addRuntimeStat("baselineAddInputUs", RuntimeCounter(addInputUs, RuntimeCounter::Unit::kNone));
   }
   spillRowBasedInput();
 }
@@ -1000,7 +1011,11 @@ void HashBuild::noMoreInputInternal() {
   // peers. This handles both the normal path (from noMoreInput) and spill
   // restore path (from processSpillInput). Each driver does this independently.
   if (hybridJoin_ && table_->hybridData()) {
+    auto coalesceStart = std::chrono::steady_clock::now();
     table_->hybridData()->coalesceBatches();
+    auto coalesceEnd = std::chrono::steady_clock::now();
+    auto coalesceUs = std::chrono::duration_cast<std::chrono::microseconds>(coalesceEnd - coalesceStart).count();
+    addRuntimeStat("hybridCoalesceUs", RuntimeCounter(coalesceUs, RuntimeCounter::Unit::kNone));
   }
 
   if (spillEnabled()) {

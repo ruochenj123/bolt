@@ -120,6 +120,24 @@ void OrderBy::reclaim(
 
 void OrderBy::noMoreInput() {
   Operator::noMoreInput();
+
+  // Late materialization: check if upstream (HashProbe) passed row pointers
+  // via DriverCtx instead of normal pipeline.
+  auto* driverCtx = operatorCtx_->driverCtx();
+  if (driverCtx->lateMaterializationNoMoreInput &&
+      !driverCtx->lateMaterializationRows.empty()) {
+    sortBuffer_->setLateMaterializationData(
+        std::move(driverCtx->lateMaterializationTable),
+        std::move(driverCtx->lateMaterializationMatchContainer),
+        std::move(driverCtx->lateMaterializationProbePayload),
+        std::move(driverCtx->lateMaterializationRows),
+        std::move(driverCtx->lateMaterializationProjections),
+        driverCtx->lateMaterializationBuildRowIdColumn,
+        driverCtx->lateMaterializationProbeRowIdColumn);
+    // Clear the flag
+    driverCtx->lateMaterializationNoMoreInput = false;
+  }
+
   sortBuffer_->noMoreInput();
   maxOutputRows_ = outputBatchRows(sortBuffer_->estimateOutputRowSize());
   recordSpillStats();

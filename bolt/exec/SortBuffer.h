@@ -41,6 +41,7 @@
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/RowContainer.h"
 #include "bolt/exec/Spill.h"
+#include "bolt/exec/Driver.h"  // For DriverCtx::LateMProjection
 #include "bolt/vector/BaseVector.h"
 namespace bytedance::bolt::exec {
 
@@ -147,6 +148,26 @@ class SortBuffer {
     sorter_ = HybridSorter{algo};
   }
 
+  /// Sets late materialization data directly from OrderBy operator.
+  /// This is called when HashProbe passes row pointers via DriverCtx
+  /// instead of through the normal pipeline.
+  /// 
+  /// Design:
+  /// - matchContainer: RowContainer storing (sort_key, buildRowId, probeRowId)
+  /// - rows: char* pointers to matchContainer rows for sorting
+  /// - table: HashTable keeping build HybridContainer alive
+  /// - probePayload: ProbePayloadContainer storing probe columns (may be null for build-only)
+  /// - projections: includes both build (isProbe=false) and probe (isProbe=true) columns
+  /// - buildRowIdColumn/probeRowIdColumn: indices in matchContainer for row IDs
+  void setLateMaterializationData(
+      std::shared_ptr<BaseHashTable> table,
+      std::unique_ptr<RowContainer> matchContainer,
+      std::unique_ptr<ProbePayloadContainer> probePayload,
+      std::vector<char*>&& rows,
+      std::vector<DriverCtx::LateMProjection>&& projections,
+      column_index_t buildRowIdColumn,
+      column_index_t probeRowIdColumn);
+
  private:
   // Ensures there is sufficient memory reserved to process 'input'.
   void ensureInputFits(const VectorPtr& input);
@@ -237,9 +258,15 @@ class SortBuffer {
   std::shared_ptr<BaseHashTable> lateMaterializationTable_;
   HybridContainer* lateMaterializationContainer_{nullptr};
   std::vector<char*> lateMaterializationRows_;
-  // Column projections from HybridContainer to output
-  std::vector<std::pair<column_index_t, column_index_t>>
-      lateMaterializationProjections_;
+  // MatchContainer stores (sort_keys, buildRowId, probeRowId) for each join match
+  std::unique_ptr<RowContainer> lateMaterializationMatchContainer_;
+  // ProbePayloadContainer for probe-side columns (null if build-only)
+  std::unique_ptr<ProbePayloadContainer> lateMaterializationProbePayload_;
+  // Column projections: isProbe indicates source (build vs probe)
+  std::vector<DriverCtx::LateMProjection> lateMaterializationProjections_;
+  column_index_t lateMaterializationBuildRowIdColumn_{0};
+  column_index_t lateMaterializationProbeRowIdColumn_{0};
+  bool lateMaterializationHasProbe_{false};
 };
 
 } // namespace bytedance::bolt::exec

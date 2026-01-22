@@ -93,9 +93,24 @@ DEFINE_bool(
     "Enable hybrid join optimization");
 
 DEFINE_bool(
+    hybrid_sort_enabled,
+    false,
+    "Enable hybrid sort optimization");
+
+DEFINE_bool(
     late_materialization_enabled,
     false,
     "Enable late materialization optimization for HashJoin->Sort pattern");
+
+DEFINE_int32(
+    max_output_batch_rows,
+    10000,
+    "Maximum number of rows per output batch (default 10000)");
+
+DEFINE_int32(
+    preferred_output_batch_rows,
+    1024,
+    "Preferred number of rows per output batch (default 1024)");
 
 DEFINE_int64(
     max_coalesced_bytes,
@@ -257,9 +272,20 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       if (FLAGS_hybrid_join_enabled) {
         params.queryConfigs[core::QueryConfig::kHybridJoinEnabled] = "true";
       }
+      if (FLAGS_hybrid_sort_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridSortEnabled] = "true";
+      }
       if (FLAGS_late_materialization_enabled) {
         params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
             "true";
+      }
+      if (FLAGS_max_output_batch_rows != 10000) {
+        params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =
+            std::to_string(FLAGS_max_output_batch_rows);
+      }
+      if (FLAGS_preferred_output_batch_rows != 1024) {
+        params.queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] =
+            std::to_string(FLAGS_preferred_output_batch_rows);
       }
       const int numSplitsPerFile = FLAGS_num_splits_per_file;
 
