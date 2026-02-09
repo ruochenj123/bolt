@@ -213,6 +213,10 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ27Plan();
     case 28:
       return getQ28Plan();
+    case 29:
+      return getQ29Plan();
+    case 30:
+      return getQ30Plan();
     default:
       BOLT_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -2849,21 +2853,53 @@ TpchPlan TpchQueryBuilder::getQ26Plan() const {
 // Pattern: 3-way join with two different join keys, sort on customer key
 // This tests late-m across multiple joins with different keys.
 TpchPlan TpchQueryBuilder::getQ27Plan() const {
-  // Build-side 1: customer (3M rows at SF30)
+  // Q27: 3-way join with Pattern 1 (join result as build side)
+  // Similar to Q3/Q10: orders × customer → (result as BUILD) × lineitem → Sort
+  //
+  // Pattern: lineitem (probe) × (orders × customer) (build) → Sort by c_custkey
+  //
+  // This is the common TPC-H pattern where:
+  // 1. Smaller tables (customer) are build side of first join
+  // 2. First join result becomes build side for second join
+  // 3. Largest table (lineitem) is final probe side
+  //
+  // For late-m testing: Include many columns from customer (build side)
+  // to maximize benefit from deferred materialization
+  
+  // customer columns (smallest table, ~450K at SF3) - MANY COLUMNS for late-m benefit
   std::vector<std::string> customerColumns = {
-      "c_custkey",  // join key 1 and sort key
-      "c_name"      // payload
+      "c_custkey",     // join key 1 and sort key
+      "c_name",        // payload (VARCHAR)
+      "c_address",     // payload (VARCHAR) - large
+      "c_nationkey",   // payload (INTEGER)
+      "c_phone",       // payload (VARCHAR)
+      "c_acctbal",     // payload (DOUBLE)
+      "c_mktsegment",  // payload (VARCHAR)
+      "c_comment"      // payload (VARCHAR) - large
   };
-  // Probe/Build 2: orders (30M rows at SF30)
+  // orders columns (medium table, ~4.5M at SF3)
   std::vector<std::string> ordersColumns = {
       "o_custkey",     // join key 1 (with customer)
       "o_orderkey",    // join key 2 (with lineitem)
       "o_totalprice"   // payload
   };
-  // Probe-side 2: lineitem (180M rows at SF30)
+  // lineitem columns (largest table, ~18M at SF3) - MANY COLUMNS for late-m benefit
   std::vector<std::string> lineitemColumns = {
-      "l_orderkey",    // join key 2
-      "l_quantity"     // payload
+      "l_orderkey",       // join key 2
+      "l_partkey",        // payload (BIGINT)
+      "l_suppkey",        // payload (BIGINT)
+      "l_linenumber",     // payload (BIGINT)
+      "l_quantity",       // payload (DOUBLE)
+      "l_extendedprice",  // payload (DOUBLE)
+      "l_discount",       // payload (DOUBLE)
+      "l_tax",            // payload (DOUBLE)
+      "l_returnflag",     // payload (VARCHAR)
+      "l_linestatus",     // payload (VARCHAR)
+      "l_shipdate",       // payload (DATE)
+      "l_commitdate",     // payload (DATE)
+      "l_receiptdate",    // payload (DATE)
+      "l_shipinstruct",   // payload (VARCHAR)
+      "l_shipmode"        // payload (VARCHAR)
   };
 
   auto customerSelectedRowType = getRowType(kCustomer, customerColumns);
@@ -2878,29 +2914,20 @@ TpchPlan TpchQueryBuilder::getQ27Plan() const {
   core::PlanNodeId ordersPlanNodeId;
   core::PlanNodeId lineitemPlanNodeId;
 
-  // Build side 1: customer
+  // Build side for first join: customer (smallest)
   auto customer = PlanBuilder(planNodeIdGenerator, pool_.get())
                       .filtersAsNode(filtersAsNode_)
                       .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
                       .captureScanNodeId(customerPlanNodeId)
                       .planNode();
 
-  // Build side 2: lineitem (for second join)
-  auto lineitem = PlanBuilder(planNodeIdGenerator, pool_.get())
-                      .filtersAsNode(filtersAsNode_)
-                      .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
-                      .captureScanNodeId(lineitemPlanNodeId)
-                      .planNode();
-
-  // Join 1: orders (probe) x customer (build) on o_custkey = c_custkey
-  // Join 2: result x lineitem (build) on o_orderkey = l_orderkey
-  // Then Sort on c_custkey
-  auto plan =
+  // First join: orders (probe) × customer (build)
+  // Result becomes BUILD side for second join
+  auto ordersJoinCustomer =
       PlanBuilder(planNodeIdGenerator, pool_.get())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
           .captureScanNodeId(ordersPlanNodeId)
-          // First join: orders x customer
           .hashJoin(
               {"o_custkey"},
               {"c_custkey"},
@@ -2908,18 +2935,52 @@ TpchPlan TpchQueryBuilder::getQ27Plan() const {
               "",
               {"c_custkey",      // from customer (sort key)
                "c_name",         // from customer (payload)
-               "o_orderkey",     // from orders (join key for next)
+               "c_address",      // from customer (payload)
+               "c_nationkey",    // from customer (payload)
+               "c_phone",        // from customer (payload)
+               "c_acctbal",      // from customer (payload)
+               "c_mktsegment",   // from customer (payload)
+               "c_comment",      // from customer (payload)
+               "o_orderkey",     // from orders (join key for next join)
                "o_totalprice"})  // from orders (payload)
-          // Second join: (orders x customer) x lineitem
+          .planNode();
+
+  // Second join: lineitem (probe) × (orders×customer) (build)
+  // Then Sort by c_custkey
+  // Output: 8 customer cols + 1 orders col + 14 lineitem cols = 23 columns
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+          .captureScanNodeId(lineitemPlanNodeId)
           .hashJoin(
-              {"o_orderkey"},
               {"l_orderkey"},
-              lineitem,
+              {"o_orderkey"},
+              ordersJoinCustomer,  // <-- Join result as BUILD side
               "",
-              {"c_custkey",      // from customer (sort key)
-               "c_name",         // from customer (payload)
-               "o_totalprice",   // from orders (payload)
-               "l_quantity"})    // from lineitem (payload)
+              {"c_custkey",        // from customer (sort key)
+               "c_name",           // from customer (payload)
+               "c_address",        // from customer (payload)
+               "c_nationkey",      // from customer (payload)
+               "c_phone",          // from customer (payload)
+               "c_acctbal",        // from customer (payload)
+               "c_mktsegment",     // from customer (payload)
+               "c_comment",        // from customer (payload)
+               "o_totalprice",     // from orders (payload)
+               "l_partkey",        // from lineitem (payload)
+               "l_suppkey",        // from lineitem (payload)
+               "l_linenumber",     // from lineitem (payload)
+               "l_quantity",       // from lineitem (payload)
+               "l_extendedprice",  // from lineitem (payload)
+               "l_discount",       // from lineitem (payload)
+               "l_tax",            // from lineitem (payload)
+               "l_returnflag",     // from lineitem (payload)
+               "l_linestatus",     // from lineitem (payload)
+               "l_shipdate",       // from lineitem (payload)
+               "l_commitdate",     // from lineitem (payload)
+               "l_receiptdate",    // from lineitem (payload)
+               "l_shipinstruct",   // from lineitem (payload)
+               "l_shipmode"})      // from lineitem (payload)
           .orderBy({"c_custkey"}, false)
           .planNode();
 
@@ -2993,6 +3054,218 @@ TpchPlan TpchQueryBuilder::getQ28Plan() const {
   context.plan = std::move(plan);
   context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
   context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q29: Ideal query for late materialization testing
+// SELECT many columns from orders and lineitem
+// FROM orders JOIN lineitem ON o_orderkey = l_orderkey
+// ORDER BY o_orderkey
+// 
+// Key characteristics for late-m optimization:
+// 1. Sort key (o_orderkey) is on BUILD side (orders)
+// 2. Sort key == Join key (ideal for late-m)
+// 3. Many large payload columns (make late-m savings significant)
+// 4. 1:N join (each order has multiple lineitem rows)
+TpchPlan TpchQueryBuilder::getQ29Plan() const {
+  // Build-side columns (orders) - include many columns to maximize late-m benefit
+  std::vector<std::string> ordersColumns = {
+      "o_orderkey",       // join key + sort key
+      "o_custkey",
+      "o_orderstatus",
+      "o_totalprice",
+      "o_orderdate",
+      "o_orderpriority",
+      "o_clerk",
+      "o_shippriority",
+      "o_comment"         // large VARCHAR column
+  };
+  
+  // Probe-side columns (lineitem) - include many columns
+  std::vector<std::string> lineitemColumns = {
+      "l_orderkey",       // join key
+      "l_partkey",
+      "l_suppkey",
+      "l_linenumber",
+      "l_quantity",
+      "l_extendedprice",
+      "l_discount",
+      "l_tax",
+      "l_returnflag",
+      "l_linestatus",
+      "l_shipdate",
+      "l_commitdate",
+      "l_receiptdate",
+      "l_shipinstruct",
+      "l_shipmode",
+      "l_comment"         // large VARCHAR column
+  };
+
+  auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
+  const auto& ordersFileColumns = getFileColumnNames(kOrders);
+  auto lineitemSelectedRowType = getRowType(kLineitem, lineitemColumns);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId ordersPlanNodeId;
+  core::PlanNodeId lineitemPlanNodeId;
+
+  // Build side: orders (has the sort key o_orderkey)
+  auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .filtersAsNode(filtersAsNode_)
+                    .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
+                    .captureScanNodeId(ordersPlanNodeId)
+                    .planNode();
+
+  // HashJoin: lineitem (probe) x orders (build)
+  // Sort by o_orderkey (build-side key = join key)
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+          .captureScanNodeId(lineitemPlanNodeId)
+          .hashJoin(
+              {"l_orderkey"},              // probe key
+              {"o_orderkey"},              // build key
+              orders,
+              "",                          // no filter
+              {"o_orderkey",               // build-side (sort key!)
+               "o_custkey",
+               "o_orderstatus",
+               "o_totalprice",
+               "o_orderdate",
+               "o_orderpriority",
+               "o_clerk",
+               "o_shippriority",
+               "o_comment",
+               "l_orderkey",               // probe-side
+               "l_partkey",
+               "l_suppkey",
+               "l_linenumber",
+               "l_quantity",
+               "l_extendedprice",
+               "l_discount",
+               "l_tax",
+               "l_returnflag",
+               "l_linestatus",
+               "l_shipdate",
+               "l_commitdate",
+               "l_receiptdate",
+               "l_shipinstruct",
+               "l_shipmode",
+               "l_comment"})
+          .orderBy({"o_orderkey"}, false)  // Sort by build-side key
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q29";
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q30: N-way join WITHOUT Sort (for testing N-way late-m correctness)
+// SELECT c_custkey, c_name, o_orderkey, o_totalprice, l_linenumber, l_quantity
+// FROM customer JOIN orders ON c_custkey = o_custkey
+//              JOIN lineitem ON o_orderkey = l_orderkey
+// (No ORDER BY - results directly from join)
+// 
+// This query tests:
+// 1. N-way join (2 joins) without Sort downstream
+// 2. 1:N expansion (each customer has multiple orders, each order has multiple lines)
+// 3. Keys from different sources (c_custkey vs o_orderkey)
+//
+// Pattern:
+// - Join 1: customer (build) x orders (probe) on c_custkey = o_custkey
+// - Join 2: (c x o) result x lineitem (build) on o_orderkey = l_orderkey
+// - No Sort - directly produce output
+TpchPlan TpchQueryBuilder::getQ30Plan() const {
+  // Build-side 1: customer 
+  std::vector<std::string> customerColumns = {
+      "c_custkey",     // join key 1
+      "c_name"         // payload
+  };
+  // Probe side 1 / Probe side 2: orders
+  std::vector<std::string> ordersColumns = {
+      "o_custkey",     // join key 1 (with customer)
+      "o_orderkey",    // join key 2 (with lineitem)
+      "o_totalprice"   // payload
+  };
+  // Build-side 2: lineitem
+  std::vector<std::string> lineitemColumns = {
+      "l_orderkey",    // join key 2
+      "l_linenumber",  // payload
+      "l_quantity"     // payload
+  };
+
+  auto customerSelectedRowType = getRowType(kCustomer, customerColumns);
+  const auto& customerFileColumns = getFileColumnNames(kCustomer);
+  auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
+  const auto& ordersFileColumns = getFileColumnNames(kOrders);
+  auto lineitemSelectedRowType = getRowType(kLineitem, lineitemColumns);
+  const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId customerPlanNodeId;
+  core::PlanNodeId ordersPlanNodeId;
+  core::PlanNodeId lineitemPlanNodeId;
+
+  // Build side 1: customer
+  auto customer = PlanBuilder(planNodeIdGenerator, pool_.get())
+                      .filtersAsNode(filtersAsNode_)
+                      .tableScan(kCustomer, customerSelectedRowType, customerFileColumns)
+                      .captureScanNodeId(customerPlanNodeId)
+                      .planNode();
+
+  // Build side 2: lineitem
+  auto lineitem = PlanBuilder(planNodeIdGenerator, pool_.get())
+                      .filtersAsNode(filtersAsNode_)
+                      .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+                      .captureScanNodeId(lineitemPlanNodeId)
+                      .planNode();
+
+  // Join 1: orders (probe) x customer (build) on o_custkey = c_custkey
+  // Join 2: result x lineitem (build) on o_orderkey = l_orderkey
+  // NO Sort - directly output join results
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
+          .captureScanNodeId(ordersPlanNodeId)
+          // First join: orders x customer
+          .hashJoin(
+              {"o_custkey"},
+              {"c_custkey"},
+              customer,
+              "",
+              {"c_custkey",      // from customer
+               "c_name",         // from customer (payload)
+               "o_orderkey",     // from orders (join key for next)
+               "o_totalprice"})  // from orders (payload)
+          // Second join: (orders x customer) x lineitem
+          .hashJoin(
+              {"o_orderkey"},
+              {"l_orderkey"},
+              lineitem,
+              "",
+              {"c_custkey",      // from customer
+               "c_name",         // from customer (payload)
+               "o_orderkey",     // from orders
+               "o_totalprice",   // from orders (payload)
+               "l_linenumber",   // from lineitem (payload)
+               "l_quantity"})    // from lineitem (payload)
+          // NO orderBy - direct output
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q30";
+  context.plan = std::move(plan);
+  context.dataFiles[customerPlanNodeId] = getTableFilePaths(kCustomer);
+  context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
   context.dataFileFormat = format_;
   return context;
 }

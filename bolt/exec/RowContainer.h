@@ -31,7 +31,6 @@
 #pragma once
 
 #include <folly/CPortability.h>
-#include <future>
 #include "bolt/common/memory/HashStringAllocator.h"
 #include "bolt/core/PlanNode.h"
 #include "bolt/exec/ContainerRowSerde.h"
@@ -1795,8 +1794,6 @@ struct RowFormatInfo {
 
 /// Hybrid container
 
-// RowId for hybrid storage: containerId identifies the driver/container,
-// rowId_ is the global row index within that container's coalesced payload.
 struct HybridRowId {
   uint8_t containerId_;
   uint64_t rowId_;
@@ -1889,16 +1886,6 @@ class HybridContainer {
     extractColumn(
         rows, numRows, columnIndex, 0, result, outputRowIds, exactSize);
   };
-
-  /// Extract a payload column directly using HybridRowIds.
-  /// This is used by PayloadRegistry for N-way join late materialization
-  /// where we already have the decoded rowIds and don't need to look them up
-  /// from row pointers.
-  void extractColumnByRowId(
-      const HybridRowId* rowIds,
-      int32_t numRows,
-      int32_t payloadColumnIndex,
-      VectorPtr& result);
 
   void extractColumn(
       const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
@@ -2037,128 +2024,37 @@ class HybridContainer {
     return out;
   }
 
-  // Build batch offsets lazily for multi-batch extraction without coalescing.
-  // Returns cumulative offsets: [0, batch0.size, batch0+batch1.size, ...]
-  const std::vector<uint64_t>& getBatchOffsets() {
-    if (batchOffsets_.empty() && !owningInputs_.empty()) {
-      batchOffsets_.reserve(owningInputs_.size() + 1);
-      uint64_t offset = 0;
-      batchOffsets_.push_back(0);
-      for (const auto& batch : owningInputs_) {
-        offset += batch->size();
-        batchOffsets_.push_back(offset);
-      }
-    }
-    return batchOffsets_;
-  }
-
-  // Decode rowId to (batchIndex, localOffset).
-  // The rowId is encoded as: (batchId << 32) | batchOffset
-  // This provides O(1) decoding without binary search.
-  static std::pair<uint32_t, uint32_t> decodeBatchAndLocal(uint64_t encodedRowId) {
-    uint32_t batchIdx = static_cast<uint32_t>(encodedRowId >> 32);
-    uint32_t localOffset = static_cast<uint32_t>(encodedRowId & 0xFFFFFFFF);
-    return {batchIdx, localOffset};
-  }
-
-  // Check if data is coalesced (single batch)
-  bool isCoalesced() const {
-    return owningInputs_.size() <= 1;
-  }
-
-  // Flatten each batch in place without coalescing.
-  // This ensures all vectors are flat for direct access while avoiding
-  // the O(n) copy overhead of coalesceBatches.
-  void flattenBatches() {
-    if (payloadTypes_.empty() || owningInputs_.empty()) {
-      return;
-    }
-    auto* pool = keys_->pool();
-    for (auto& batch : owningInputs_) {
-      for (size_t col = 0; col < payloadTypes_.size(); ++col) {
-        auto& child = batch->childAt(col);
-        if (child->encoding() != VectorEncoding::Simple::FLAT) {
-          auto flat = BaseVector::create(child->type(), child->size(), pool);
-          flat->copy(child.get(), 0, 0, child->size());
-          child = std::move(flat);
-        }
-      }
-    }
-  }
-
   // Coalesce all payload batches into a single batch to improve locality.
-  // Optimized version: single-pass copy directly to destination.
   void coalesceBatches() {
     // Only skip if no payload columns or no batches to coalesce.
+    // Always flatten even for single batch, as input may be dictionary-encoded
+    // or other non-flat encodings. Extraction expects FlatVectors.
     if (payloadTypes_.empty() || owningInputs_.empty()) {
       return;
     }
-    // Single batch - just ensure it's flat
-    if (owningInputs_.size() == 1) {
-      auto* pool = keys_->pool();
-      auto& batch = owningInputs_[0];
-      bool needsFlatten = false;
-      for (size_t col = 0; col < payloadTypes_.size(); ++col) {
-        if (batch->childAt(col)->encoding() != VectorEncoding::Simple::FLAT) {
-          needsFlatten = true;
-          break;
-        }
-      }
-      if (!needsFlatten) {
-        return; // Already single flat batch
-      }
-      // Flatten single batch in place
-      for (size_t col = 0; col < payloadTypes_.size(); ++col) {
-        auto& child = batch->childAt(col);
-        if (child->encoding() != VectorEncoding::Simple::FLAT) {
-          auto flat = BaseVector::create(child->type(), child->size(), pool);
-          flat->copy(child.get(), 0, 0, child->size());
-          child = std::move(flat);
-        }
-      }
-      return;
-    }
 
-    auto startTime = std::chrono::steady_clock::now();
-    
     auto* pool = keys_->pool();
     const auto totalRows = totalRows_;
     const auto numPayloadCols = payloadTypes_.size();
-    const auto numBatches = owningInputs_.size();
 
-    // Single-pass: directly coalesce all batches into destination vectors
-    // No separate flatten phase - copy() handles all encodings
     std::vector<VectorPtr> newChildren;
-    newChildren.resize(numPayloadCols);
+    newChildren.reserve(numPayloadCols);
     std::vector<std::string> payloadNames;
     payloadNames.reserve(numPayloadCols);
     for (int32_t col = 0; col < numPayloadCols; ++col) {
       payloadNames.push_back(fmt::format("c{}", col));
     }
-
-    // Parallelize column coalescing using std::async
-    // Each column can be processed independently
-    std::vector<std::future<VectorPtr>> futures;
-    futures.reserve(numPayloadCols);
-    
+    // Flatten each payload column into a single FlatVector.
     for (int32_t col = 0; col < numPayloadCols; ++col) {
-      futures.push_back(std::async(std::launch::async, [&, col]() {
-        auto flat = BaseVector::create(payloadTypes_[col], totalRows, pool);
-        vector_size_t offset = 0;
-        for (const auto& batch : owningInputs_) {
-          auto* child = batch->childAt(col).get();
-          const auto batchSize = batch->size();
-          // copy() handles dictionary, constant, and other encodings automatically
-          flat->copy(child, offset, 0, batchSize);
-          offset += batchSize;
-        }
-        return flat;
-      }));
-    }
-    
-    // Wait for all columns to complete
-    for (int32_t col = 0; col < numPayloadCols; ++col) {
-      newChildren[col] = futures[col].get();
+      auto flat = BaseVector::create(payloadTypes_[col], totalRows, pool);
+      vector_size_t offset = 0;
+      for (const auto& batch : owningInputs_) {
+        auto* child = batch->childAt(col).get();
+        const auto batchSize = batch->size();
+        flat->copy(child, offset, 0, batchSize);
+        offset += batchSize;
+      }
+      newChildren.push_back(std::move(flat));
     }
 
     // Rebuild owningInputs_ with a single RowVector.
@@ -2171,21 +2067,15 @@ class HybridContainer {
         std::move(newChildren)));
 
     totalBatches_ = 1;
-    
-    auto endTime = std::chrono::steady_clock::now();
-    auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-    VLOG(1) << "HybridContainer::coalesceBatches: " << numBatches << " batches, "
-            << totalRows << " rows, " << numPayloadCols << " cols, "
-            << "total=" << totalMs << "ms (parallel)";
   }
 
  private:
-  // Get the single container's first batch (only valid when
-  // isSingleContainer() and isCoalesced()). Validates that the single
-  // container is actually this container.
+  // Get the single container's coalesced data (only valid when
+  // isSingleContainer()). Validates that the single container is actually this
+  // container.
   RowVector* getSingleContainerData() const {
     BOLT_DCHECK_EQ(allContainers_.size(), 1);
-    BOLT_DCHECK_GE(owningInputs_.size(), 1);
+    BOLT_DCHECK_EQ(owningInputs_.size(), 1);
     BOLT_DCHECK_NOT_NULL(owningInputs_[0]);
     auto it = allContainers_.begin();
     // Validate that the single container is self
@@ -2251,49 +2141,24 @@ class HybridContainer {
 
     // Fast path for single container (spilling, sort) - avoids map lookups
     if (isSingleContainer()) {
-      // Check if data is coalesced (single batch) or multi-batch
-      if (isCoalesced()) {
-        // Coalesced: direct indexing into single batch
-        if (isNullable_[columnIndex]) {
-          extractPayloadWithNullsSingleContainer<T, useRowNumbers>(
-              rows,
-              rowNumbers,
-              numRows,
-              columnIndex,
-              resultOffset,
-              flatResult,
-              outputRowIds);
-        } else {
-          extractPayloadNoNullsSingleContainer<T, useRowNumbers>(
-              rows,
-              rowNumbers,
-              numRows,
-              columnIndex,
-              resultOffset,
-              flatResult,
-              outputRowIds);
-        }
+      if (isNullable_[columnIndex]) {
+        extractPayloadWithNullsSingleContainer<T, useRowNumbers>(
+            rows,
+            rowNumbers,
+            numRows,
+            columnIndex,
+            resultOffset,
+            flatResult,
+            outputRowIds);
       } else {
-        // Multi-batch: use batch offsets to find correct batch
-        if (isNullable_[columnIndex]) {
-          extractPayloadWithNullsMultiBatch<T, useRowNumbers>(
-              rows,
-              rowNumbers,
-              numRows,
-              columnIndex,
-              resultOffset,
-              flatResult,
-              outputRowIds);
-        } else {
-          extractPayloadNoNullsMultiBatch<T, useRowNumbers>(
-              rows,
-              rowNumbers,
-              numRows,
-              columnIndex,
-              resultOffset,
-              flatResult,
-              outputRowIds);
-        }
+        extractPayloadNoNullsSingleContainer<T, useRowNumbers>(
+            rows,
+            rowNumbers,
+            numRows,
+            columnIndex,
+            resultOffset,
+            flatResult,
+            outputRowIds);
       }
       return;
     }
@@ -2560,270 +2425,6 @@ class HybridContainer {
     }
   }
 
-  // ========== Multi-batch extraction (without coalescing) ==========
-  // Batch-sorted extraction: sort indices by batchId for sequential reads,
-  // then scatter results to output positions.
-  // The rowId encoding: (batchId << 32) | batchOffset
-
-  template <typename T, bool useRowNumbers>
-  void extractPayloadWithNullsMultiBatch(
-      const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
-      folly::Range<const vector_size_t*> rowNumbers,
-      int32_t numRows,
-      int32_t columnIndex,
-      int32_t resultOffset,
-      FlatVector<T>* FOLLY_NONNULL result,
-      std::vector<HybridRowId>& outputRowIds) {
-    auto maxRows = numRows + resultOffset;
-    BOLT_DCHECK_LE(maxRows, result->size());
-
-    BufferPtr& nullBuffer = result->mutableNulls(maxRows);
-    auto nulls = nullBuffer->asMutable<uint64_t>();
-    BufferPtr valuesBuffer = result->mutableValues(maxRows);
-    auto values = valuesBuffer->asMutableRange<T>();
-    auto* rowIdPtr = outputRowIds.data();
-
-    const auto numBatches = owningInputs_.size();
-
-    // Build counting sort permutation by batchId for sequential batch access
-    std::vector<uint32_t> batchCount(numBatches + 1, 0);
-    for (int32_t i = 0; i < numRows; ++i) {
-      auto [batchIdx, _] = decodeBatchAndLocal(rowIdPtr[i].rowId_);
-      ++batchCount[batchIdx + 1];
-    }
-    // Prefix sum
-    for (size_t b = 1; b <= numBatches; ++b) {
-      batchCount[b] += batchCount[b - 1];
-    }
-    // Build permutation (indices sorted by batchId)
-    std::vector<int32_t> perm(numRows);
-    std::vector<uint32_t> writePos = batchCount; // copy for writing
-    for (int32_t i = 0; i < numRows; ++i) {
-      auto [batchIdx, _] = decodeBatchAndLocal(rowIdPtr[i].rowId_);
-      perm[writePos[batchIdx]++] = i;
-    }
-
-    // Process batch by batch (sequential reads within each batch)
-    constexpr uint32_t kPrefetchDist = 16;
-    // Set to false to disable prefetch for benchmarking
-    constexpr bool kEnablePrefetch = true;
-
-    for (size_t b = 0; b < numBatches; ++b) {
-      const auto batchStart = batchCount[b];
-      const auto batchEnd = batchCount[b + 1];
-      if (batchStart == batchEnd) continue;
-
-      auto* flatChild = owningInputs_[b]->childAt(columnIndex)
-                            ->template as<FlatVector<T>>();
-      const T* rawValues = flatChild->rawValues();
-      const uint64_t* rawNulls = flatChild->rawNulls();
-
-      uint32_t p = batchStart;
-      // Main loop with 4-way unrolled prefetch
-      for (; p + 3 < batchEnd; p += 4) {
-        // Prefetch next 4 records at distance
-        if constexpr (kEnablePrefetch) {
-          const uint32_t pf = p + kPrefetchDist;
-          if (FOLLY_LIKELY(pf + 3 < batchEnd)) {
-            auto [_, off0] = decodeBatchAndLocal(rowIdPtr[perm[pf]].rowId_);
-            auto [_1, off1] = decodeBatchAndLocal(rowIdPtr[perm[pf + 1]].rowId_);
-            auto [_2, off2] = decodeBatchAndLocal(rowIdPtr[perm[pf + 2]].rowId_);
-            auto [_3, off3] = decodeBatchAndLocal(rowIdPtr[perm[pf + 3]].rowId_);
-            __builtin_prefetch(rawValues + off0, 0, 1);
-            __builtin_prefetch(rawValues + off1, 0, 1);
-            __builtin_prefetch(rawValues + off2, 0, 1);
-            __builtin_prefetch(rawValues + off3, 0, 1);
-          }
-        }
-
-        // Process 4 rows
-        for (uint32_t u = 0; u < 4; ++u) {
-          const int32_t origIdx = perm[p + u];
-          const char* row;
-          if constexpr (useRowNumbers) {
-            auto rowNumber = rowNumbers[origIdx];
-            row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
-          } else {
-            row = rows[origIdx];
-          }
-
-          const auto resultIndex = resultOffset + origIdx;
-          if (row == nullptr) {
-            bits::setNull(nulls, resultIndex, true);
-            continue;
-          }
-
-          auto [_, localOffset] = decodeBatchAndLocal(rowIdPtr[origIdx].rowId_);
-          if (rawNulls != nullptr && bits::isBitNull(rawNulls, localOffset)) {
-            bits::setNull(nulls, resultIndex, true);
-            continue;
-          }
-
-          bits::setNull(nulls, resultIndex, false);
-          if constexpr (std::is_same_v<T, StringView>) {
-            result->set(resultIndex, rawValues[localOffset]);
-          } else {
-            values[resultIndex] = rawValues[localOffset];
-          }
-        }
-      }
-
-      // Tail loop
-      for (; p < batchEnd; ++p) {
-        const int32_t origIdx = perm[p];
-        const char* row;
-        if constexpr (useRowNumbers) {
-          auto rowNumber = rowNumbers[origIdx];
-          row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
-        } else {
-          row = rows[origIdx];
-        }
-
-        const auto resultIndex = resultOffset + origIdx;
-        if (row == nullptr) {
-          bits::setNull(nulls, resultIndex, true);
-          continue;
-        }
-
-        auto [_, localOffset] = decodeBatchAndLocal(rowIdPtr[origIdx].rowId_);
-        if (rawNulls != nullptr && bits::isBitNull(rawNulls, localOffset)) {
-          bits::setNull(nulls, resultIndex, true);
-          continue;
-        }
-
-        bits::setNull(nulls, resultIndex, false);
-        if constexpr (std::is_same_v<T, StringView>) {
-          result->set(resultIndex, rawValues[localOffset]);
-        } else {
-          values[resultIndex] = rawValues[localOffset];
-        }
-      }
-    }
-  }
-
-  template <typename T, bool useRowNumbers>
-  void extractPayloadNoNullsMultiBatch(
-      const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
-      folly::Range<const vector_size_t*> rowNumbers,
-      int32_t numRows,
-      int32_t columnIndex,
-      int32_t resultOffset,
-      FlatVector<T>* FOLLY_NONNULL result,
-      std::vector<HybridRowId>& outputRowIds) {
-    auto maxRows = numRows + resultOffset;
-    BOLT_DCHECK_LE(maxRows, result->size());
-
-    BufferPtr valuesBuffer = result->mutableValues(maxRows);
-    auto values = valuesBuffer->asMutableRange<T>();
-    auto* rowIdPtr = outputRowIds.data();
-
-    const auto numBatches = owningInputs_.size();
-
-    // Build counting sort permutation by batchId for sequential batch access
-    std::vector<uint32_t> batchCount(numBatches + 1, 0);
-    for (int32_t i = 0; i < numRows; ++i) {
-      auto [batchIdx, _] = decodeBatchAndLocal(rowIdPtr[i].rowId_);
-      ++batchCount[batchIdx + 1];
-    }
-    // Prefix sum
-    for (size_t b = 1; b <= numBatches; ++b) {
-      batchCount[b] += batchCount[b - 1];
-    }
-    // Build permutation (indices sorted by batchId)
-    std::vector<int32_t> perm(numRows);
-    std::vector<uint32_t> writePos = batchCount; // copy for writing
-    for (int32_t i = 0; i < numRows; ++i) {
-      auto [batchIdx, _] = decodeBatchAndLocal(rowIdPtr[i].rowId_);
-      perm[writePos[batchIdx]++] = i;
-    }
-
-    // Process batch by batch (sequential reads within each batch)
-    constexpr uint32_t kPrefetchDist = 16;
-    // Set to false to disable prefetch for benchmarking
-    constexpr bool kEnablePrefetch = true;
-
-    for (size_t b = 0; b < numBatches; ++b) {
-      const auto batchStart = batchCount[b];
-      const auto batchEnd = batchCount[b + 1];
-      if (batchStart == batchEnd) continue;
-
-      auto* flatChild = owningInputs_[b]->childAt(columnIndex)
-                            ->template as<FlatVector<T>>();
-      const T* rawValues = flatChild->rawValues();
-
-      uint32_t p = batchStart;
-      // Main loop with 4-way unrolled prefetch
-      for (; p + 3 < batchEnd; p += 4) {
-        // Prefetch next 4 records at distance
-        if constexpr (kEnablePrefetch) {
-          const uint32_t pf = p + kPrefetchDist;
-          if (FOLLY_LIKELY(pf + 3 < batchEnd)) {
-            auto [_, off0] = decodeBatchAndLocal(rowIdPtr[perm[pf]].rowId_);
-            auto [_1, off1] = decodeBatchAndLocal(rowIdPtr[perm[pf + 1]].rowId_);
-            auto [_2, off2] = decodeBatchAndLocal(rowIdPtr[perm[pf + 2]].rowId_);
-            auto [_3, off3] = decodeBatchAndLocal(rowIdPtr[perm[pf + 3]].rowId_);
-            __builtin_prefetch(rawValues + off0, 0, 1);
-            __builtin_prefetch(rawValues + off1, 0, 1);
-            __builtin_prefetch(rawValues + off2, 0, 1);
-            __builtin_prefetch(rawValues + off3, 0, 1);
-          }
-        }
-
-        // Process 4 rows
-        for (uint32_t u = 0; u < 4; ++u) {
-          const int32_t origIdx = perm[p + u];
-          const char* row;
-          if constexpr (useRowNumbers) {
-            auto rowNumber = rowNumbers[origIdx];
-            row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
-          } else {
-            row = rows[origIdx];
-          }
-
-          const auto resultIndex = resultOffset + origIdx;
-          if (row == nullptr) {
-            result->setNull(resultIndex, true);
-            continue;
-          }
-
-          result->setNull(resultIndex, false);
-          auto [_, localOffset] = decodeBatchAndLocal(rowIdPtr[origIdx].rowId_);
-          if constexpr (std::is_same_v<T, StringView>) {
-            result->set(resultIndex, rawValues[localOffset]);
-          } else {
-            values[resultIndex] = rawValues[localOffset];
-          }
-        }
-      }
-
-      // Tail loop
-      for (; p < batchEnd; ++p) {
-        const int32_t origIdx = perm[p];
-        const char* row;
-        if constexpr (useRowNumbers) {
-          auto rowNumber = rowNumbers[origIdx];
-          row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
-        } else {
-          row = rows[origIdx];
-        }
-
-        const auto resultIndex = resultOffset + origIdx;
-        if (row == nullptr) {
-          result->setNull(resultIndex, true);
-          continue;
-        }
-
-        result->setNull(resultIndex, false);
-        auto [_, localOffset] = decodeBatchAndLocal(rowIdPtr[origIdx].rowId_);
-        if constexpr (std::is_same_v<T, StringView>) {
-          result->set(resultIndex, rawValues[localOffset]);
-        } else {
-          values[resultIndex] = rawValues[localOffset];
-        }
-      }
-    }
-  }
-
   // ========== End single-container fast path implementations ==========
 
   template <typename T, bool useRowNumbers>
@@ -3031,7 +2632,6 @@ class HybridContainer {
       BOLT_CHECK_NOT_NULL(flatChild);
       rawValuesByContainer[entry.first] = flatChild->rawValues();
     }
-
     // cached for load
     int32_t curCid = -1;
     const T* curRaw = nullptr;
@@ -3220,11 +2820,6 @@ class HybridContainer {
   // Controls whether to reorder rows by containerId during extraction.
   // Default true for better cache locality. Can be disabled for testing.
   bool reorderEnabled_{true};
-
-  // Batch offsets for multi-batch extraction without coalescing.
-  // Lazily built on first call to getBatchOffsets().
-  // Format: [0, batch0.size, batch0+batch1.size, ...]
-  mutable std::vector<uint64_t> batchOffsets_;
 };
 
 template <>
@@ -3304,130 +2899,5 @@ inline void HybridContainer::extractNulls(
     }
   }
 }
-
-/// ProbePayloadContainer: Simple container for probe-side payload columns
-/// in late materialization. Similar to HybridContainer but simplified:
-/// - Single container (no containerId needed)
-/// - Direct rowId access after coalescing
-/// - No RowContainer dependency for rowId storage
-class ProbePayloadContainer {
- public:
-  explicit ProbePayloadContainer(
-      const std::vector<TypePtr>& payloadTypes,
-      memory::MemoryPool* pool)
-      : payloadTypes_(payloadTypes), pool_(pool) {}
-
-  /// Add a batch of probe payload columns
-  void addBatch(RowVectorPtr batch) {
-    BOLT_CHECK_EQ(batch->childrenSize(), payloadTypes_.size());
-    totalRows_ += batch->size();
-    batches_.push_back(std::move(batch));
-  }
-
-  /// Coalesce all batches into a single flat array for O(1) extraction
-  /// Optimized: single-pass copy without separate flatten phase
-  void coalesceBatches() {
-    if (payloadTypes_.empty() || batches_.empty()) {
-      return;
-    }
-    // Already coalesced
-    if (batches_.size() == 1 && coalesced_) {
-      return;
-    }
-
-    const auto numCols = payloadTypes_.size();
-    
-    // Single batch - just ensure it's flat
-    if (batches_.size() == 1) {
-      auto& batch = batches_[0];
-      for (size_t col = 0; col < numCols; ++col) {
-        auto& child = batch->childAt(col);
-        if (child->encoding() != VectorEncoding::Simple::FLAT) {
-          auto flat = BaseVector::create(child->type(), child->size(), pool_);
-          flat->copy(child.get(), 0, 0, child->size());
-          child = std::move(flat);
-        }
-      }
-      coalesced_ = true;
-      return;
-    }
-
-    // Multiple batches: single-pass coalesce (copy handles all encodings)
-    std::vector<VectorPtr> coalescedCols;
-    coalescedCols.reserve(numCols);
-    std::vector<std::string> names;
-    names.reserve(numCols);
-
-    for (size_t col = 0; col < numCols; ++col) {
-      names.push_back(fmt::format("p{}", col));
-      auto flat = BaseVector::create(payloadTypes_[col], totalRows_, pool_);
-      vector_size_t offset = 0;
-      for (const auto& batch : batches_) {
-        const auto batchSize = batch->size();
-        // copy() handles dictionary, constant, and other encodings automatically
-        flat->copy(batch->childAt(col).get(), offset, 0, batchSize);
-        offset += batchSize;
-      }
-      coalescedCols.push_back(std::move(flat));
-    }
-
-    // Replace batches with single coalesced batch
-    batches_.clear();
-    batches_.push_back(std::make_shared<RowVector>(
-        pool_,
-        ROW(std::move(names), std::vector<TypePtr>(payloadTypes_)),
-        BufferPtr(nullptr),
-        totalRows_,
-        std::move(coalescedCols)));
-    coalesced_ = true;
-  }
-
-  /// Extract a column using direct rowIds (array indices after coalescing)
-  /// @param rowIds Array of row indices into the coalesced data
-  /// @param numRows Number of rows to extract
-  /// @param columnIndex Which column to extract
-  /// @param result Output vector (will be populated)
-  void extractColumn(
-      const uint64_t* rowIds,
-      int32_t numRows,
-      int32_t columnIndex,
-      const VectorPtr& result) {
-    BOLT_CHECK(coalesced_, "Must call coalesceBatches() before extraction");
-    BOLT_CHECK_EQ(batches_.size(), 1);
-    BOLT_CHECK_LT(columnIndex, static_cast<int32_t>(payloadTypes_.size()));
-
-    result->resize(numRows);
-    auto* srcVector = batches_[0]->childAt(columnIndex).get();
-    
-    // Use element-by-element copy which works for all types
-    for (int32_t i = 0; i < numRows; ++i) {
-      const auto rowId = rowIds[i];
-      result->copy(srcVector, i, rowId, 1);
-    }
-  }
-
-  uint64_t getNumRows() const {
-    return totalRows_;
-  }
-
-  size_t getNumBatches() const {
-    return batches_.size();
-  }
-
-  bool isCoalesced() const {
-    return coalesced_;
-  }
-
-  const std::vector<TypePtr>& payloadTypes() const {
-    return payloadTypes_;
-  }
-
- private:
-  std::vector<TypePtr> payloadTypes_;
-  memory::MemoryPool* pool_;
-  std::vector<RowVectorPtr> batches_;
-  uint64_t totalRows_{0};
-  bool coalesced_{false};
-};
 
 } // namespace bytedance::bolt::exec

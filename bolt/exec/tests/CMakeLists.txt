@@ -398,6 +398,19 @@ target_link_libraries(
   bolt_spiller_aggregate_benchmark_base
 )
 
+add_executable(bolt_hybrid_late_m_benchmark HybridLateMBenchmark.cpp)
+target_link_libraries(
+  bolt_hybrid_late_m_benchmark
+  bolt_exec
+  bolt_exec_test_lib
+  bolt_tpch_connector
+  bolt_functions_prestosql_aggregate
+  bolt_functions_prestosql
+  Folly::folly
+  gflags::gflags
+  glog::glog
+)
+
 add_executable(cpr_http_client_test CprHttpClientTest.cpp)
 add_test(
   NAME cpr_http_client_test

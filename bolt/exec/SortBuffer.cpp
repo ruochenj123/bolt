@@ -30,7 +30,6 @@
 
 #include "SortBuffer.h"
 #include <algorithm>
-#include "HashTable.h"
 #include "Spiller.h"
 #include "bolt/exec/MemoryReclaimer.h"
 #include "bolt/exec/RowToColumnVector.h"
@@ -130,75 +129,26 @@ SortBuffer::SortBuffer(
       ROW(std::move(sortedSpillColumnNames), std::move(sortedSpillColumnTypes));
 }
 
-void SortBuffer::setLateMaterializationData(
-    std::shared_ptr<BaseHashTable> table,
-    std::unique_ptr<RowContainer> matchContainer,
-    std::unique_ptr<ProbePayloadContainer> probePayload,
-    std::vector<char*>&& rows,
-    std::vector<DriverCtx::LateMProjection>&& projections,
-    column_index_t buildRowIdColumn,
-    column_index_t probeRowIdColumn) {
-  BOLT_CHECK(!lateMaterializationActive_, "Late materialization already active");
-  BOLT_CHECK_NOT_NULL(table);
-  BOLT_CHECK_NOT_NULL(table->hybridData());
-  BOLT_CHECK_NOT_NULL(matchContainer);
-  
-  lateMaterializationActive_ = true;
-  lateMaterializationTable_ = std::move(table);
-  lateMaterializationContainer_ = lateMaterializationTable_->hybridData();
-  lateMaterializationMatchContainer_ = std::move(matchContainer);
-  lateMaterializationProbePayload_ = std::move(probePayload);
-  lateMaterializationRows_ = std::move(rows);
-  lateMaterializationProjections_ = std::move(projections);
-  lateMaterializationBuildRowIdColumn_ = buildRowIdColumn;
-  lateMaterializationProbeRowIdColumn_ = probeRowIdColumn;
-  numInputRows_ = lateMaterializationRows_.size();
-  lateMaterializationHasProbe_ = (lateMaterializationProbePayload_ != nullptr);
-
-  // Estimate output row size based on output type for batch sizing
-  uint64_t rowSize = 0;
-  for (const auto& type : input_->children()) {
-    rowSize += type->isFixedWidth() ? type->cppSizeInBytes() : 20; // estimate 20 bytes for variable-width
-  }
-  estimatedOutputRowSize_ = rowSize;
-
-  LOG(INFO) << "SortBuffer: late materialization set with " << numInputRows_
-            << " matches, " << lateMaterializationProjections_.size()
-            << " projections, hasProbe=" << lateMaterializationHasProbe_
-            << ", probePayload=" << (lateMaterializationProbePayload_ 
-                ? lateMaterializationProbePayload_->getNumRows() : 0) << " rows"
-            << ", buildRowIdCol=" << buildRowIdColumn
-            << ", probeRowIdCol=" << probeRowIdColumn
-            << ", estimatedRowSize=" << rowSize;
-}
-
 void SortBuffer::addInput(const VectorPtr& input) {
   BOLT_CHECK(!noMoreInput_);
-
-  // Late materialization is now handled via setLateMaterializationData()
-  // called from OrderBy::noMoreInput(), not through addInput().
-
   ensureInputFits(input);
 
   SelectivityVector allRows(input->size());
   std::vector<char*> rows(input->size());
-  
   for (int row = 0; row < input->size(); ++row) {
     rows[row] = data_->newRow();
   }
-  
   auto* inputRow = input->as<RowVector>();
+  MicrosecondTimer timer(&sortColToRowTimeUs_);
   if (hybridSortEnabled_) {
-    // Global index encoding: driverId(8 bits) | globalRowIndex(56 bits)
-    // driverId is always 0 for Sort (single container)
-    auto baseRow = hybridData_->getNumRows();
-    
+    auto currentRows = hybridData_->getNumRows();
     for (int row = 0; row < input->size(); ++row) {
-      uint64_t encodedId = (static_cast<uint64_t>(0) << 56) |
-          (static_cast<uint64_t>(baseRow + row) & ((1ULL << 56) - 1));
+      // Store RowId
+      uint64_t encodedId = (static_cast<uint64_t>(0)
+                            << 56) | // top 8 bits: driverId, always 0 for Sort
+          (static_cast<uint64_t>(row + currentRows) & ((1ULL << 56) - 1));
       data_->storeSingleRowId(encodedId, rows[row]);
     }
-    
     // Store key columns
     for (const auto& columnProjection : keyColumnMap_) {
       DecodedVector decoded(
@@ -213,13 +163,17 @@ void SortBuffer::addInput(const VectorPtr& input) {
           rows,
           columnProjection.inputChannel);
     }
-    
-    // Store payload columns (wrapped, not decoded - they remain in columnar format)
+    // Gather payload columns
+    std::vector<std::unique_ptr<DecodedVector>> decoders;
+    decoders.reserve(payloadColumnMap_.size());
+    for (const auto& columnProjection : payloadColumnMap_) {
+      decoders.emplace_back(std::make_unique<DecodedVector>(
+          *inputRow->childAt(columnProjection.outputChannel), allRows));
+    }
     auto payloadInput = wrapColumns(
         input->as<RowVector>(), payloadChannels_, payloadTypes_, pool());
     hybridData_->addPayload(std::move(payloadInput));
   } else {
-    // Baseline path - store all columns to RowContainer
     for (const auto& columnProjection : columnMap_) {
       DecodedVector decoded(
           *inputRow->childAt(columnProjection.outputChannel), allRows);
@@ -246,80 +200,6 @@ void SortBuffer::noMoreInput() {
   if (numInputRows_ == 0) {
     return;
   }
-
-  // Late materialization path: sort row pointers directly
-  if (lateMaterializationActive_) {
-    BOLT_CHECK_EQ(numInputRows_, lateMaterializationRows_.size());
-    LOG(INFO) << "SortBuffer: sorting " << numInputRows_
-              << " late-materialized rows, hasProbe=" << lateMaterializationHasProbe_;
-
-    // Get the RowContainer to use for comparison:
-    // - With probe support: use lateMaterializationMatchContainer_ (stores sort keys + rowIds)
-    // - Without probe support: use lateMaterializationContainer_->getKeys() (build-side keys)
-    RowContainer* rowContainer = nullptr;
-    if (lateMaterializationHasProbe_ && lateMaterializationMatchContainer_) {
-      rowContainer = lateMaterializationMatchContainer_.get();
-    } else {
-      BOLT_CHECK_NOT_NULL(lateMaterializationContainer_);
-      rowContainer = lateMaterializationContainer_->getKeys();
-    }
-    BOLT_CHECK_NOT_NULL(rowContainer);
-
-    // sortedRows_ points to the late-m rows for output
-    sortedRows_.swap(lateMaterializationRows_);
-
-    MicrosecondTimer timer(&sortInSortTimeUs_);
-
-#ifdef ENABLE_BOLT_JIT
-    // Try to use JIT-compiled comparison for late-m path too
-    if (cmp_ == nullptr && operatorCtx_ &&
-        operatorCtx_->driverCtx()->queryConfig().enableJitRowCmpRow()) {
-      // For probe-side, only compare sort key columns (not rowId columns)
-      auto numSortKeys = lateMaterializationHasProbe_ 
-          ? lateMaterializationBuildRowIdColumn_  // sort keys are before buildRowIdColumn
-          : rowContainer->keyTypes().size();
-      std::vector<TypePtr> sortKeyTypes(
-          rowContainer->keyTypes().begin(),
-          rowContainer->keyTypes().begin() + numSortKeys);
-      if (rowContainer->JITable(sortKeyTypes)) {
-        auto [jitMod, rowRowCmpfn] = rowContainer->codegenCompare(
-            sortKeyTypes,
-            sortCompareFlags_,
-            bytedance::bolt::jit::CmpType::SORT_LESS,
-            true);
-        jitModule_ = std::move(jitMod);
-        cmp_ = (RowRowCompare)jitModule_->getFuncPtr(rowRowCmpfn);
-      }
-    }
-    if (cmp_) {
-      sorter_.sort(sortedRows_.begin(), sortedRows_.end(), cmp_);
-    } else {
-#endif
-      // Fallback: Sort using the RowContainer for comparison
-      // Only compare sort key columns (not rowId columns)
-      auto numSortKeys = lateMaterializationHasProbe_ 
-          ? lateMaterializationBuildRowIdColumn_  // sort keys are before buildRowIdColumn
-          : sortCompareFlags_.size();
-      sorter_.sort(
-          sortedRows_.begin(),
-          sortedRows_.end(),
-          [rowContainer, numSortKeys, this](const char* leftRow, const char* rightRow) {
-            for (vector_size_t index = 0; index < numSortKeys; ++index) {
-              if (auto result = rowContainer->compare(
-                      leftRow, rightRow, index, sortCompareFlags_[index])) {
-                return result < 0;
-              }
-            }
-            return false;
-          });
-#ifdef ENABLE_BOLT_JIT
-    }
-#endif
-    return;
-  }
-
-  // Coalesce all payload batches into a single contiguous batch for efficient
-  // random access during sorted extraction with prefetching.
   if (hybridSortEnabled_ && hybridData_ != nullptr) {
     hybridData_->coalesceBatches();
   }
@@ -406,6 +286,7 @@ RowVectorPtr SortBuffer::getOutput(uint32_t maxOutputRows) {
   // auto guard = folly::makeGuard([this, oldNonReclaimableSection]() {
   // *nonReclaimableSection_ = oldNonReclaimableSection; });
   // *nonReclaimableSection_ = true;
+  MicrosecondTimer timer(&sortOutputTimeUs_);
   if (spiller_ != nullptr) {
     getOutputWithSpill();
   } else {
@@ -634,82 +515,6 @@ void SortBuffer::prepareOutput(uint32_t maxOutputRows) {
 
 void SortBuffer::getOutputWithoutSpill() {
   BOLT_DCHECK_EQ(numInputRows_, sortedRows_.size());
-
-  // Late materialization path with MatchContainer (supports both probe+build and build-only)
-  // When lateMaterializationMatchContainer_ is present, sortedRows_ contains match row
-  // pointers that store (sort_keys, buildRowId, probeRowId). We extract columns using
-  // buildRowId for build-side columns and probeRowId for probe-side columns.
-  if (lateMaterializationActive_ && lateMaterializationMatchContainer_) {
-    BOLT_CHECK_NOT_NULL(lateMaterializationContainer_);
-    // probePayload may be null if there are no probe columns (build-only case like Q24)
-    if (lateMaterializationHasProbe_) {
-      BOLT_CHECK_NOT_NULL(lateMaterializationProbePayload_);
-      BOLT_CHECK(lateMaterializationProbePayload_->isCoalesced());
-    }
-    
-    const auto batchSize = output_->size();
-    const char** matchRows = const_cast<const char**>(sortedRows_.data() + numOutputRows_);
-    
-    // Get column offsets from match container
-    auto buildRowIdOffset = lateMaterializationMatchContainer_->columnAt(
-        lateMaterializationBuildRowIdColumn_).offset();
-    
-    // Extract buildRowIds from match rows
-    std::vector<HybridRowId> buildRowIds(batchSize);
-    // Probe rowIds are direct indices into coalesced probe payload (O(1) access)
-    std::vector<uint64_t> probeRowIds;
-    if (lateMaterializationHasProbe_) {
-      probeRowIds.resize(batchSize);
-      auto probeRowIdOffset = lateMaterializationMatchContainer_->columnAt(
-          lateMaterializationProbeRowIdColumn_).offset();
-      for (vector_size_t i = 0; i < batchSize; ++i) {
-        const char* matchRow = matchRows[i];
-        uint64_t encodedBuildId = RowContainer::valueAt<uint64_t>(matchRow, buildRowIdOffset);
-        uint64_t probeRowId = RowContainer::valueAt<uint64_t>(matchRow, probeRowIdOffset);
-        
-        // Decode buildRowId: driverId(8) | batchId(24) | rowInBatch(32)
-        uint8_t buildDriverId = encodedBuildId >> 56;
-        uint64_t buildRowIdVal = encodedBuildId & ((1ULL << 56) - 1);
-        buildRowIds[i] = {buildDriverId, buildRowIdVal};
-        probeRowIds[i] = probeRowId;  // Direct index into coalesced probe payload
-      }
-    } else {
-      // Build-only case: only extract buildRowIds
-      for (vector_size_t i = 0; i < batchSize; ++i) {
-        const char* matchRow = matchRows[i];
-        uint64_t encodedBuildId = RowContainer::valueAt<uint64_t>(matchRow, buildRowIdOffset);
-        
-        // Decode buildRowId: driverId(8) | batchId(24) | rowInBatch(32)
-        uint8_t buildDriverId = encodedBuildId >> 56;
-        uint64_t buildRowIdVal = encodedBuildId & ((1ULL << 56) - 1);
-        buildRowIds[i] = {buildDriverId, buildRowIdVal};
-      }
-    }
-    
-    // Extract columns using projections
-    for (const auto& proj : lateMaterializationProjections_) {
-      if (proj.isProbe) {
-        // Probe-side column: O(1) extraction from coalesced probe payload
-        BOLT_CHECK(lateMaterializationHasProbe_);
-        lateMaterializationProbePayload_->extractColumn(
-            probeRowIds.data(),
-            batchSize,
-            proj.inputChannel,  // column index in probe payload
-            output_->childAt(proj.outputChannel));
-      } else {
-        // Build-side column: extract from buildContainer using buildRowId
-        lateMaterializationContainer_->extractColumn(
-            matchRows,
-            batchSize,
-            proj.inputChannel,  // column in build HybridContainer
-            output_->childAt(proj.outputChannel),
-            buildRowIds);
-      }
-    }
-    numOutputRows_ += batchSize;
-    return;
-  }
-
   if (hybridSortEnabled_) {
     std::vector<HybridRowId> outputRowIds;
     outputRowIds.resize(output_->size());

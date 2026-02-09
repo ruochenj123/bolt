@@ -40,7 +40,8 @@ using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::connector::tpch;
 
 namespace {
-const std::string kTpchConnectorId = "test-tpch";
+// Use kBoltTpchConnectorId to get prefixed column names (c_*, o_*, l_*)
+const std::string kTpchConnectorId = kBoltTpchConnectorId;
 
 void registerConnectors() {
   auto tpchConnector =
@@ -67,7 +68,8 @@ void runQ23(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
                     .tpchTableScan(
                         tpch::Table::TBL_ORDERS,
                         {"o_orderkey", "o_orderdate", "o_totalprice"},
-                        scaleFactor)
+                        scaleFactor,
+                        kTpchConnectorId)
                     .capturePlanNodeId(ordersScanId)
                     .planNode();
 
@@ -77,7 +79,8 @@ void runQ23(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
           .tpchTableScan(
               tpch::Table::TBL_LINEITEM,
               {"l_orderkey", "l_quantity", "l_discount"},
-              scaleFactor)
+              scaleFactor,
+              kTpchConnectorId)
           .capturePlanNodeId(lineitemScanId)
           .hashJoin(
               {"l_orderkey"},
@@ -136,7 +139,8 @@ void runQ24(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
                     .tpchTableScan(
                         tpch::Table::TBL_ORDERS,
                         {"o_orderkey", "o_orderdate", "o_totalprice"},
-                        scaleFactor)
+                        scaleFactor,
+                        kTpchConnectorId)
                     .capturePlanNodeId(ordersScanId)
                     .planNode();
 
@@ -146,7 +150,8 @@ void runQ24(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
           .tpchTableScan(
               tpch::Table::TBL_LINEITEM,
               {"l_orderkey"},
-              scaleFactor)
+              scaleFactor,
+              kTpchConnectorId)
           .capturePlanNodeId(lineitemScanId)
           .hashJoin(
               {"l_orderkey"},
@@ -207,7 +212,8 @@ void runQ27(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
                           tpch::Table::TBL_CUSTOMER,
                           {"c_custkey", "c_name", "c_address", "c_nationkey", 
                            "c_phone", "c_acctbal", "c_mktsegment", "c_comment"},
-                          scaleFactor)
+                          scaleFactor,
+                          kTpchConnectorId)
                       .capturePlanNodeId(customerScanId)
                       .planNode();
 
@@ -218,7 +224,8 @@ void runQ27(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
           .tpchTableScan(
               tpch::Table::TBL_ORDERS,
               {"o_custkey", "o_orderkey", "o_totalprice"},
-              scaleFactor)
+              scaleFactor,
+              kTpchConnectorId)
           .capturePlanNodeId(ordersScanId)
           .hashJoin(
               {"o_custkey"},
@@ -240,7 +247,8 @@ void runQ27(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
                "l_quantity", "l_extendedprice", "l_discount", "l_tax",
                "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate",
                "l_receiptdate", "l_shipinstruct", "l_shipmode"},
-              scaleFactor)
+              scaleFactor,
+              kTpchConnectorId)
           .capturePlanNodeId(lineitemScanId)
           .hashJoin(
               {"l_orderkey"},

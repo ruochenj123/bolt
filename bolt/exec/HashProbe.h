@@ -650,24 +650,6 @@ class HashProbe : public Operator {
 
   bool hitSampling_{false};
 
-  // Late materialization: pass row pointers to downstream operator (e.g., Sort)
-  // instead of extracting columns. This avoids redundant layout conversion
-  // when the downstream operator can directly use the HybridContainer.
-  bool lateMaterializationEnabled_{false};
-
-  // For late-m with probe-side columns:
-  // - probePayloadContainer_: coalesced probe input batches for O(1) extraction
-  // - matchRowContainer_: stores (sort_key, buildRowId, probeRowId) for each match
-  // - probeRowIdCounter_: running count of probe rows for generating probeRowId
-  std::unique_ptr<ProbePayloadContainer> probePayloadContainer_;
-  std::unique_ptr<RowContainer> matchRowContainer_;
-  uint64_t probeRowIdCounter_{0};
-  // Column indices in matchRowContainer_ for the two rowId columns
-  column_index_t buildRowIdColumn_{0};
-  column_index_t probeRowIdColumn_{0};
-  // Which output columns come from probe side (for projection setup)
-  std::vector<column_index_t> probeOutputChannels_;
-
   // for skew partition in HashBuild
   bool needLastProbeSideOutput() const;
 

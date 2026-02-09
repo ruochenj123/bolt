@@ -29,7 +29,6 @@
  */
 
 #include "bolt/exec/HashProbe.h"
-#include <chrono>
 #include <common/time/Timer.h>
 #include <core/PlanNode.h>
 #include <core/QueryConfig.h>
@@ -260,26 +259,6 @@ void HashProbe::initialize() {
   if (nullAware_) {
     filterTableResult_.resize(1);
   }
-
-  // Late materialization eligibility check:
-  // 1. Config enabled
-  // 2. Inner join only (for v1 simplicity)
-  // 3. No filter (filter requires materializing for evaluation)
-  // 4. Has build-side output columns (tableOutputProjections_ not empty)
-  // 5. Hybrid join will be used (checked when table_ is available)
-  // Note: Now supports both build-side only AND probe+build combinations
-  auto lateMConfig = operatorCtx_->driverCtx()->queryConfig().lateMaterializationEnabled();
-  if (lateMConfig &&
-      isInnerJoin(joinType_) && !joinNode_->filter() &&
-      !tableOutputProjections_.empty()) {
-    // Will finalize in setHashTable when we know if hybrid join is used
-    lateMaterializationEnabled_ = true;
-    
-    // Track which output channels come from probe side
-    for (const auto& proj : projectedInputColumns_) {
-      probeOutputChannels_.push_back(proj.outputChannel);
-    }
-  }
 }
 
 void HashProbe::initializeFilter(
@@ -456,54 +435,6 @@ void HashProbe::asyncWaitForHashTable() {
 
   table_ = std::move(hashBuildResult->table);
   BOLT_CHECK_NOT_NULL(table_);
-
-  // Finalize late materialization check: require hybrid join to be enabled
-  if (lateMaterializationEnabled_) {
-    if (table_->hybridData() == nullptr) {
-      lateMaterializationEnabled_ = false;
-      LOG(INFO) << "HashProbe " << planNodeId()
-                << " late materialization disabled: not hybrid join";
-    } else {
-      LOG(INFO) << "HashProbe " << planNodeId()
-                << " late materialization confirmed enabled"
-                << ", hasProbeColumns=" << !probeOutputChannels_.empty();
-      
-      // Initialize Match RowContainer: schema is [sort_key_cols..., buildRowId, probeRowId]
-      // The sort key columns are copied from build-side RowContainer
-      auto* buildKeys = table_->hybridData()->getKeys();
-      const auto& sortKeyTypes = buildKeys->keyTypes();
-      // keyTypes() returns only join key columns (rowId is a dependent column)
-      const auto numSortKeys = sortKeyTypes.size();
-      
-      std::vector<TypePtr> matchKeyTypes;
-      matchKeyTypes.reserve(numSortKeys + 2);
-      for (size_t i = 0; i < numSortKeys; ++i) {
-        matchKeyTypes.push_back(sortKeyTypes[i]);
-      }
-      // Add buildRowId and probeRowId columns (always BIGINT)
-      matchKeyTypes.push_back(BIGINT());  // buildRowId
-      matchKeyTypes.push_back(BIGINT());  // probeRowId
-      
-      buildRowIdColumn_ = numSortKeys;
-      probeRowIdColumn_ = numSortKeys + 1;
-      
-      matchRowContainer_ = std::make_unique<RowContainer>(
-          matchKeyTypes,
-          std::vector<TypePtr>{},  // no non-key columns
-          pool());
-      
-      // Initialize ProbePayloadContainer with probe column types
-      if (!probeOutputChannels_.empty()) {
-        std::vector<TypePtr> probePayloadTypes;
-        probePayloadTypes.reserve(projectedInputColumns_.size());
-        for (const auto& proj : projectedInputColumns_) {
-          probePayloadTypes.push_back(probeType_->childAt(proj.inputChannel));
-        }
-        probePayloadContainer_ = std::make_unique<ProbePayloadContainer>(
-            probePayloadTypes, pool());
-      }
-    }
-  }
 
   maybeSetupSpillInput(
       hashBuildResult->restoredPartitionId,
@@ -884,29 +815,6 @@ void HashProbe::addInput(RowVectorPtr input) {
     table_->joinProbe(*lookup_);
   }
   results_.reset(*lookup_);
-  
-  // Late materialization: accumulate probe batches and track global row IDs
-  // Note: We only reach here if probing will happen. For inner join, outputRowMapping_
-  // indexes into the full input_ batch, so we must accumulate the full batch and
-  // update probeRowIdCounter_ by the full batch size.
-  if (lateMaterializationEnabled_ && !probeOutputChannels_.empty()) {
-    // Store probe payload columns in probePayloadContainer_
-    std::vector<VectorPtr> probePayloadColumns;
-    for (const auto& proj : projectedInputColumns_) {
-      probePayloadColumns.push_back(input_->childAt(proj.inputChannel));
-    }
-    std::vector<TypePtr> types;
-    for (const auto& col : probePayloadColumns) {
-      types.push_back(col->type());
-    }
-    auto probePayloadInput = std::make_shared<RowVector>(
-        pool(), 
-        ROW(std::vector<std::string>(probePayloadColumns.size(), ""), std::move(types)),
-        nullptr,
-        input_->size(),
-        std::move(probePayloadColumns));
-    probePayloadContainer_->addBatch(std::move(probePayloadInput));
-  }
 }
 
 void HashProbe::prepareOutput(vector_size_t size) {
@@ -1004,71 +912,6 @@ void HashProbe::fillOutput(vector_size_t size) {
   if (isLeftSemiProjectJoin(joinType_)) {
     fillLeftSemiProjectMatchColumn(size);
   } else {
-    // Late materialization: populate Match RowContainer with (sort_key, buildRowId, probeRowId)
-    // instead of extracting columns. Supports both build-only and build+probe columns.
-    if (lateMaterializationEnabled_ && matchRowContainer_ != nullptr) {
-      auto* buildHybrid = table_->hybridData();
-      BOLT_CHECK_NOT_NULL(buildHybrid);
-      auto* buildKeys = buildHybrid->getKeys();
-      
-      // Number of sort key columns (Match schema: [sort_keys..., buildRowId, probeRowId])
-      const auto numSortKeys = buildRowIdColumn_;  // buildRowIdColumn_ is the index after sort keys
-      
-      // Get column offsets for storing in Match RowContainer
-      const auto buildRowIdDstOffset = matchRowContainer_->columnAt(buildRowIdColumn_).offset();
-      const auto probeRowIdDstOffset = matchRowContainer_->columnAt(probeRowIdColumn_).offset();
-      
-      // Get buildRowId source offset from build RowContainer (last key column)
-      const auto buildRowIdSrcOffset = buildKeys->columnAt(numSortKeys).offset();
-      
-      auto* rawMapping = outputRowMapping_->as<vector_size_t>();
-      
-      for (vector_size_t i = 0; i < size; ++i) {
-        char* matchRow = matchRowContainer_->newRow();
-        matchRowContainer_->initializeFields(matchRow);
-        
-        const char* buildRow = outputTableRows_[i];
-        
-        // Copy sort key columns from build row to match row
-        for (column_index_t col = 0; col < numSortKeys; ++col) {
-          auto srcOffset = buildKeys->columnAt(col).offset();
-          auto dstOffset = matchRowContainer_->columnAt(col).offset();
-          int64_t value = RowContainer::valueAt<int64_t>(buildRow, srcOffset);
-          RowContainer::valueAt<int64_t>(matchRow, dstOffset) = value;
-        }
-        
-        // Copy buildRowId from build row
-        uint64_t buildRowId = RowContainer::valueAt<uint64_t>(buildRow, buildRowIdSrcOffset);
-        RowContainer::valueAt<uint64_t>(matchRow, buildRowIdDstOffset) = buildRowId;
-        
-        // Calculate and store probeRowId = base + index within current batch
-        uint64_t probeRowId = probeRowIdCounter_ + rawMapping[i];
-        RowContainer::valueAt<uint64_t>(matchRow, probeRowIdDstOffset) = probeRowId;
-      }
-      
-      // Set projections on first batch
-      auto* driverCtx = operatorCtx_->driverCtx();
-      if (driverCtx->lateMaterializationProjections.empty()) {
-        // Build-side projections (from build HybridContainer payload)
-        for (const auto& proj : tableOutputProjections_) {
-          driverCtx->lateMaterializationProjections.emplace_back(
-              DriverCtx::LateMProjection{false, proj.inputChannel, proj.outputChannel});
-        }
-        // Probe-side projections (from probe batch)
-        // inputChannel is the sequential index in probeBatch (0, 1, 2, ...)
-        // outputChannel is the column index in join output
-        column_index_t probeBatchIdx = 0;
-        for (const auto& proj : projectedInputColumns_) {
-          driverCtx->lateMaterializationProjections.emplace_back(
-              DriverCtx::LateMProjection{true, probeBatchIdx++, proj.outputChannel});
-        }
-      }
-      
-      // Signal no output - data accumulated in matchRowContainer_
-      output_ = nullptr;
-      return;
-    }
-
     bool wrapInDictionary = false;
     std::map<int64_t, int16_t> addrToIndex;
     // if size too small, no need to sample
@@ -1291,43 +1134,6 @@ RowVectorPtr HashProbe::getOutput() {
         prepareForSpillRestore();
         asyncWaitForHashTable();
       } else {
-        // Signal to downstream that late-m data is complete
-        if (lateMaterializationEnabled_) {
-          auto* driverCtx = operatorCtx_->driverCtx();
-          driverCtx->lateMaterializationNoMoreInput = true;
-          
-          // Transfer containers and data to DriverCtx for downstream processing
-          if (matchRowContainer_ != nullptr) {
-            // Keep table alive for build-side extraction
-            driverCtx->lateMaterializationTable = table_;
-            
-            // Transfer Match RowContainer to get row pointers
-            RowContainerIterator iter;
-            auto& rows = driverCtx->lateMaterializationRows;
-            auto numMatches = matchRowContainer_->numRows();
-            rows.resize(numMatches);
-            matchRowContainer_->listRows(&iter, numMatches, RowContainer::kUnlimited, rows.data());
-            
-            // Coalesce probe batches before transfer for O(1) extraction
-            if (probePayloadContainer_) {
-              probePayloadContainer_->coalesceBatches();
-            }
-            
-            // Store match container info for downstream
-            driverCtx->lateMaterializationMatchContainer = std::move(matchRowContainer_);
-            driverCtx->lateMaterializationProbePayload = std::move(probePayloadContainer_);
-            driverCtx->lateMaterializationBuildRowIdColumn = buildRowIdColumn_;
-            driverCtx->lateMaterializationProbeRowIdColumn = probeRowIdColumn_;
-            
-            LOG(INFO) << "HashProbe " << planNodeId() 
-                      << " late-m transfer: " << numMatches << " matches"
-                      << ", probePayload coalesced to " 
-                      << (driverCtx->lateMaterializationProbePayload 
-                          ? driverCtx->lateMaterializationProbePayload->getNumRows() : 0) << " rows"
-                      << ", buildRowIdCol=" << buildRowIdColumn_
-                      << ", probeRowIdCol=" << probeRowIdColumn_;
-          }
-        }
         setState(ProbeOperatorState::kFinish);
         resetHashTable();
       }
@@ -1416,10 +1222,6 @@ RowVectorPtr HashProbe::getOutput() {
           !includingMiss_ && joinNode_->filter()) {
         mergeAndSpillProbeMatchFlags();
       }
-      // Update probeRowIdCounter for late materialization before clearing input
-      if (lateMaterializationEnabled_ && !probeOutputChannels_.empty()) {
-        probeRowIdCounter_ += input_->size();
-      }
       input_ = nullptr;
       return nullptr;
     }
@@ -1446,12 +1248,6 @@ RowVectorPtr HashProbe::getOutput() {
     }
 
     fillOutput(numOut);
-
-    // Late materialization: fillOutput sets output_ to nullptr and stores
-    // row pointers in DriverCtx. Continue processing to accumulate all rows.
-    if (lateMaterializationEnabled_ && output_ == nullptr) {
-      continue;
-    }
 
     if (isLeftSemiOrAntiJoinNoFilter || emptyBuildSide) {
       input_ = nullptr;

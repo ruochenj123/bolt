@@ -46,14 +46,10 @@
 #include "bolt/exec/TraceConfig.h"
 namespace bytedance::bolt::exec {
 
-class BaseHashTable;  // Forward declaration for late materialization
-class ProbePayloadContainer;  // Forward declaration for probe-side late materialization
 class Driver;
 class ExchangeClient;
-class HybridContainer;  // Forward declaration for late materialization
 class LocalExchangeQueue;
 class Operator;
-class RowContainer;  // Forward declaration for late materialization
 struct OperatorStats;
 class Task;
 
@@ -316,57 +312,6 @@ struct DriverCtx {
   std::optional<common::SpillConfig> makeSpillConfig(
       int32_t operatorId,
       const std::string& rowBasedSpillMode = "disabled") const;
-
-  /// Late materialization state: shared HybridContainer from upstream operator
-  /// (e.g., HashProbe) to downstream operator (e.g., OrderBy) in the same
-  /// pipeline. This avoids redundant layout conversion when operators share
-  /// the same keys.
-
-  /// Projection descriptor for late materialization.
-  /// Maps a source column to an output column, with source indicator.
-  struct LateMProjection {
-    bool isProbe;              // true=probe-side, false=build-side
-    column_index_t inputChannel;   // column index in source container
-    column_index_t outputChannel;  // column index in output
-  };
-
-  /// Build-side: We store the table pointer to keep the HybridContainer alive
-  /// until downstream operators are done processing.
-  std::shared_ptr<BaseHashTable> lateMaterializationTable;
-
-  /// Probe-side: coalesced probe input columns for O(1) extraction by probeRowId.
-  std::unique_ptr<ProbePayloadContainer> lateMaterializationProbePayload;
-
-  /// Match RowContainer: stores (sort_key, buildRowId, probeRowId) for each match.
-  /// This is what SortBuffer sorts. The buildRowId and probeRowId are used to
-  /// extract payload columns from their respective HybridContainers.
-  std::unique_ptr<RowContainer> lateMaterializationMatchContainer;
-
-  /// The row pointers from the Match RowContainer for sorting.
-  std::vector<char*> lateMaterializationRows;
-
-  /// Column projections for late materialization with source indicator.
-  std::vector<LateMProjection> lateMaterializationProjections;
-
-  /// Column indices in Match RowContainer for buildRowId and probeRowId.
-  /// These are set by HashProbe when creating the Match RowContainer.
-  column_index_t lateMaterializationBuildRowIdColumn{0};
-  column_index_t lateMaterializationProbeRowIdColumn{0};
-
-  /// Flag indicating that the upstream operator (HashProbe) has finished
-  /// producing late materialization data. Downstream operator (OrderBy)
-  /// should finalize processing when this is true.
-  bool lateMaterializationNoMoreInput{false};
-
-  /// Clears the late materialization state after it has been consumed.
-  void clearLateMaterializationState() {
-    lateMaterializationTable.reset();
-    lateMaterializationProbePayload.reset();
-    lateMaterializationMatchContainer.reset();
-    lateMaterializationRows.clear();
-    lateMaterializationProjections.clear();
-    lateMaterializationNoMoreInput = false;
-  }
 };
 
 constexpr const char* kOpMethodNone = "";

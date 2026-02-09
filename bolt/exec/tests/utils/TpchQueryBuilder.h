@@ -136,6 +136,8 @@ class TpchQueryBuilder {
   TpchPlan getQ26Plan() const;  // 2-way: orders JOIN lineitem -> Sort (same join key as sort key)
   TpchPlan getQ27Plan() const;  // 3-way: customer JOIN orders JOIN lineitem -> Sort
   TpchPlan getQ28Plan() const;  // 2-way: different join keys vs sort key
+  TpchPlan getQ29Plan() const;  // Ideal late-m: sort key = join key, large payloads
+  TpchPlan getQ30Plan() const;  // N-way join WITHOUT Sort (for testing N-way late-m correctness)
 
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {

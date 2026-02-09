@@ -148,3 +148,16 @@ target_link_libraries(
   ${FOLLY_BENCHMARK}
   gflags::gflags
 )
+
+add_executable(bolt_hybrid_late_m_benchmark HybridLateMBenchmark.cpp)
+target_link_libraries(
+  bolt_hybrid_late_m_benchmark
+  bolt_exec
+  bolt_exec_test_lib
+  bolt_tpch_connector
+  bolt_aggregates
+  bolt_functions_prestosql
+  Folly::folly
+  gflags::gflags
+  glog::glog
+)

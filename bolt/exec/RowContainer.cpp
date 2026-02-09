@@ -1559,40 +1559,6 @@ int32_t HybridContainer::fixedSizeAt(column_index_t column) const {
   return typeKindSize(types_[column]->kind());
 }
 
-void HybridContainer::extractColumnByRowId(
-    const HybridRowId* rowIds,
-    int32_t numRows,
-    int32_t payloadColumnIndex,
-    VectorPtr& result) {
-  BOLT_CHECK_GE(payloadColumnIndex, 0);
-  BOLT_CHECK_LT(payloadColumnIndex, payloadTypes_.size());
-  BOLT_CHECK(!owningInputs_.empty(), "No payload data stored");
-  
-  // Ensure data is coalesced for efficient extraction
-  if (!isCoalesced()) {
-    const_cast<HybridContainer*>(this)->coalesceBatches();
-  }
-  
-  auto* pool = keys_->pool();
-  const auto& type = payloadTypes_[payloadColumnIndex];
-  
-  if (!result) {
-    result = BaseVector::create(type, numRows, pool);
-  } else if (result->size() < numRows) {
-    result->resize(numRows);
-  }
-  
-  auto& srcBatch = owningInputs_[0];
-  auto* srcColumn = srcBatch->childAt(payloadColumnIndex).get();
-  
-  // Use element-by-element copy which works for all types
-  for (int32_t i = 0; i < numRows; ++i) {
-    // Decode rowId: containerId is ignored (single container after coalesce)
-    const uint64_t localRowId = rowIds[i].rowId_;
-    result->copy(srcColumn, i, localRowId, 1);
-  }
-}
-
 } // namespace bytedance::bolt::exec
 
 extern "C" {
