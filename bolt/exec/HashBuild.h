@@ -162,6 +162,11 @@ class HashBuild final : public Operator {
   // process which will be set by the join probe side.
   void postHashBuildProcess();
 
+  // N-way late materialization: process input via DriverCtx data instead of
+  // RowVector children. Extracts keys from columnSourceMap and stores upstream
+  // references for deferred extraction.
+  void addInputLateMaterialization();
+
   bool spillEnabled() const {
     return spillConfig_.has_value();
   }
@@ -453,6 +458,24 @@ class HashBuild final : public Operator {
   bool hybridJoin_{false};
   int driverId_;
   std::unique_ptr<HybridContainer> hybridData_;
+
+  // === N-way Late Materialization Support ===
+
+  /// True if this HashBuild receives input from upstream HashProbe (N-way path)
+  /// False if input comes from TableScan (base table path)
+  bool isNWayLateMEnabled_{false};
+
+  /// Reusable buffer for extracted keys in N-way path (avoids per-batch allocation)
+  RowVectorPtr extractedKeys_;
+
+  /// Populates the initial ColumnSourceMap for base table (first join level).
+  /// Maps key channels to HYBRID_KEY and dependent channels to HYBRID_PAYLOAD.
+  /// Key = inputChannel (which equals storageChannel for base table)
+  void populateBaseTableSourceMap();
+
+  /// Updates the ColumnSourceMap for N-way path.
+  /// Transforms inputChannel → storageChannel mapping for extracted keys.
+  void updateSourceMapForNWay();
 };
 
 inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {

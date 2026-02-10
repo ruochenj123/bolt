@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include <memory>
+#include <unordered_map>
 #include <folly/CPortability.h>
 #include "bolt/common/memory/HashStringAllocator.h"
 #include "bolt/core/PlanNode.h"
@@ -1799,6 +1801,73 @@ struct HybridRowId {
   uint64_t rowId_;
 };
 
+// Forward declarations for late materialization
+class HybridContainer;
+class ProbePayloadContainer;
+
+/// Describes where a column's data lives for late materialization.
+/// Each output column maps to exactly ONE source location.
+struct ColumnSource {
+  enum Type {
+    HYBRID_KEY,      // From HybridContainer's keys_ (RowContainer)
+    HYBRID_PAYLOAD,  // From HybridContainer's owningInputs_ (columnar batches)
+    PROBE_PAYLOAD,   // From ProbePayloadContainer (columnar batches)
+    CURRENT_PROBE    // From current probe input (not stored, just dictionary wrap)
+  };
+
+  Type type;
+  int32_t columnIndex;  // Column index within the source container
+
+  // Direct pointer to source container.
+  // For multi-driver scenarios:
+  // - HybridContainer uses allContainers_ internally for payload extraction
+  // - ProbePayloadContainer uses allContainers_ similarly
+  // driverId is decoded from rowIds at extraction time, not stored here.
+  void* containerPtr = nullptr;  // HybridContainer* or ProbePayloadContainer*
+
+  ColumnSource() = default;
+
+  ColumnSource(Type t, int32_t colIdx, HybridContainer* hc)
+      : type(t), columnIndex(colIdx), containerPtr(hc) {}
+
+  ColumnSource(Type t, int32_t colIdx, ProbePayloadContainer* ppc)
+      : type(t), columnIndex(colIdx), containerPtr(ppc) {}
+
+  HybridContainer* hybridContainer() const {
+    return static_cast<HybridContainer*>(containerPtr);
+  }
+
+  ProbePayloadContainer* probePayloadContainer() const {
+    return static_cast<ProbePayloadContainer*>(containerPtr);
+  }
+};
+
+/// Maps output channel index → where to extract the data
+/// Passed through DriverCtx from operator to operator
+using ColumnSourceMap = std::unordered_map<int32_t, ColumnSource>;
+
+/// Holds pre-computed row references at each depth level for N-way extraction.
+/// Level 0 = current hash table, Level 1 = upstream, Level 2 = further upstream, etc.
+///
+/// Data flow for N-way joins (e.g., T0 JOIN T1 as J0, then J0 JOIN T2 as J1):
+/// - Level 0: J1's HybridContainer, buildRowPtrs point into J1's rows
+/// - Level 1: J0's HybridContainer, buildRowPtrs point into J0's rows
+///            probeRowIds point to T2's probe data (captured during J1 execution)
+/// - Level 2: No HybridContainer (leaf level)
+///            probeRowIds point to T1's probe data (captured during J0 execution)
+///
+/// Key insight: levels[N].probeRowIds → ProbePayloadContainer at levels[N-1]
+struct LevelRowRefs {
+  std::vector<char*> buildRowPtrs;      // Row pointers for HYBRID sources at this level
+  std::vector<uint64_t> probeRowIds;    // Row IDs pointing to probe data from PREVIOUS level's join
+  HybridContainer* hybridContainer;     // The HybridContainer at this level (may be null for leaf)
+  ProbePayloadContainer* probePayloadContainer;  // ProbePayloadContainer at this level (if any)
+
+  LevelRowRefs() : hybridContainer(nullptr), probePayloadContainer(nullptr) {}
+  LevelRowRefs(std::vector<char*> ptrs, std::vector<uint64_t> ids, HybridContainer* hc, ProbePayloadContainer* ppc = nullptr)
+      : buildRowPtrs(std::move(ptrs)), probeRowIds(std::move(ids)), hybridContainer(hc), probePayloadContainer(ppc) {}
+};
+
 class HybridContainer {
  public:
   HybridContainer(
@@ -1921,6 +1990,11 @@ class HybridContainer {
   bool isKey(int32_t columnIndex) const {
     return columnIndex < numKeys_;
   }
+
+  int32_t numKeys() const {
+    return numKeys_;
+  }
+
   RowContainer* getKeys() const {
     return keys_;
   }
@@ -1960,6 +2034,12 @@ class HybridContainer {
     return allContainers_.size() == 1;
   }
 
+  /// Get all containers map (keyed by containerId/driverId).
+  /// Used for looking up the correct container when extracting upstream refs.
+  const std::unordered_map<uint8_t, HybridContainer*>& getAllContainers() const {
+    return allContainers_;
+  }
+
   // Controls whether to reorder rows by containerId during extraction.
   // Can be disabled for testing to get deterministic output order.
   void setReorderEnabled(bool enabled) {
@@ -1974,6 +2054,122 @@ class HybridContainer {
   // Sorting is used when: reorder is enabled AND there are multiple containers.
   bool shouldUseSorting() const {
     return reorderEnabled_ && !isSingleContainer();
+  }
+
+  // === N-Way Late Materialization Support ===
+
+  /// Append upstream references for a batch of rows.
+  /// Called by HashBuild when N-way late-m is enabled.
+  /// @param buildRowPtrs Direct pointers to upstream build rows
+  /// @param probeRowIds Encoded (driverId << 56 | index) for probe side
+  void appendUpstreamRefs(
+      const std::vector<char*>& buildRowPtrs,
+      const std::vector<uint64_t>& probeRowIds) {
+    upstreamBuildRowPtrs_.insert(
+        upstreamBuildRowPtrs_.end(), buildRowPtrs.begin(), buildRowPtrs.end());
+    upstreamProbeRowIds_.insert(
+        upstreamProbeRowIds_.end(), probeRowIds.begin(), probeRowIds.end());
+  }
+
+  /// Check if this container has upstream refs (i.e., is an intermediate join result)
+  bool hasUpstreamRefs() const {
+    return !upstreamBuildRowPtrs_.empty();
+  }
+
+  /// Get upstream build row pointer for extraction
+  char* getUpstreamBuildRowPtr(size_t localIndex) const {
+    BOLT_CHECK_LT(localIndex, upstreamBuildRowPtrs_.size());
+    return upstreamBuildRowPtrs_[localIndex];
+  }
+
+  /// Get upstream probe rowId for extraction
+  uint64_t getUpstreamProbeRowId(size_t localIndex) const {
+    BOLT_CHECK_LT(localIndex, upstreamProbeRowIds_.size());
+    return upstreamProbeRowIds_[localIndex];
+  }
+
+  /// Set shared ownership of upstream build containers (for cross-driver access)
+  void setUpstreamBuildContainers(
+      const std::unordered_map<uint8_t, std::shared_ptr<HybridContainer>>& containers) {
+    upstreamBuildContainers_ = containers;
+  }
+
+  /// Get upstream build containers map
+  const std::unordered_map<uint8_t, std::shared_ptr<HybridContainer>>&
+  getUpstreamBuildContainers() const {
+    return upstreamBuildContainers_;
+  }
+
+  /// Set shared ownership of upstream probe payloads
+  void setUpstreamProbePayloads(
+      const std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>& payloads) {
+    upstreamProbePayloads_ = payloads;
+  }
+
+  /// Get upstream probe payloads map
+  const std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>&
+  getUpstreamProbePayloads() const {
+    return upstreamProbePayloads_;
+  }
+
+  /// Set the column source map (stores where each output column comes from)
+  void setColumnSourceMap(const ColumnSourceMap& sourceMap) {
+    columnSourceMap_ = sourceMap;
+  }
+
+  /// Get the column source map
+  const ColumnSourceMap& getColumnSourceMap() const {
+    return columnSourceMap_;
+  }
+
+  /// Get mutable column source map (for updating during build)
+  ColumnSourceMap& mutableColumnSourceMap() {
+    return columnSourceMap_;
+  }
+
+  /// Get hybridRowId from a row pointer
+  uint64_t getHybridRowId(char* row) const {
+    return keys_->valueAt<uint64_t>(row, rowIdColumnOffset_);
+  }
+
+  /// Check if payload batches have been coalesced
+  bool isCoalesced() const {
+    return owningInputs_.size() <= 1;
+  }
+
+  /// Get the coalesced batch (for payload extraction)
+  RowVectorPtr getCoalescedBatch() const {
+    BOLT_CHECK(isCoalesced(), "Must call coalesceBatches() first");
+    if (owningInputs_.empty()) {
+      return nullptr;
+    }
+    return owningInputs_[0];
+  }
+
+  /// Get payload types
+  const std::vector<TypePtr>& payloadTypes() const {
+    return payloadTypes_;
+  }
+
+  /// Clear a specific payload column to free memory.
+  /// Called when a payload column has been extracted as a key for the next join,
+  /// so storing it further is redundant.
+  /// Must be called after coalesceBatches() (owningInputs_.size() == 1).
+  /// @param payloadColumnIndex Index within payload columns (0-based, not global)
+  void clearPayloadColumn(int32_t payloadColumnIndex) {
+    BOLT_CHECK(
+        owningInputs_.size() <= 1,
+        "Must call coalesceBatches() before clearPayloadColumn()");
+    if (owningInputs_.empty() || payloadColumnIndex < 0 ||
+        payloadColumnIndex >= static_cast<int32_t>(payloadTypes_.size())) {
+      return;
+    }
+    auto& batch = owningInputs_[0];
+    if (batch && payloadColumnIndex < batch->childrenSize()) {
+      // Replace with null constant to free memory
+      batch->childAt(payloadColumnIndex) = BaseVector::createNullConstant(
+          payloadTypes_[payloadColumnIndex], batch->size(), keys_->pool());
+    }
   }
 
   // Reorder rows and rowIds by containerId to improve locality for extraction.
@@ -2068,6 +2264,31 @@ class HybridContainer {
 
     totalBatches_ = 1;
   }
+
+  /// Extracts columns from upstream sources using ColumnSourceMap.
+  /// Supports N-way joins by pre-computing row references at each depth level.
+  ///
+  /// For a join chain like T1 ⋈ T2 → J1, J1 ⋈ T3 → J2:
+  /// - Level 0: J2's row pointers (current level)
+  /// - Level 1: J1's row pointers (from upstreamBuildRowPtrs_)
+  /// - Level 2: T1/T2's row pointers (from J1's upstreamBuildRowPtrs_)
+  ///
+  /// The function pre-computes all levels, maps each source to its level,
+  /// then extracts using the correct level's pointers.
+  ///
+  /// @param channels The input channels to extract (keys in sourceMap)
+  /// @param currentBuildRowPtrs Row pointers into the current hash table
+  /// @param currentHybrid The current level's HybridContainer (for traversing upstream chain)
+  /// @param currentProbePayload The current level's ProbePayloadContainer (for PROBE_PAYLOAD extraction)
+  /// @param sourceMap The ColumnSourceMap mapping channels to their sources
+  /// @param result Pre-allocated RowVector to populate with extracted columns
+  static void extractColumnsFromUpstream(
+      const std::vector<column_index_t>& channels,
+      const std::vector<char*>& currentBuildRowPtrs,
+      HybridContainer* currentHybrid,
+      ProbePayloadContainer* currentProbePayload,
+      const ColumnSourceMap& sourceMap,
+      const RowVectorPtr& result);
 
  private:
   // Get the single container's coalesced data (only valid when
@@ -2820,7 +3041,691 @@ class HybridContainer {
   // Controls whether to reorder rows by containerId during extraction.
   // Default true for better cache locality. Can be disabled for testing.
   bool reorderEnabled_{true};
+
+  // === N-Way Late Materialization Support ===
+  // Upstream row pointers for N-way join chain.
+  // "Upstream" refers to the previous join in the pipeline (child node in the plan tree).
+  // Data flows: upstream join → current join's build side.
+  std::vector<char*> upstreamBuildRowPtrs_;    // Direct pointers to upstream join's build rows
+  std::vector<uint64_t> upstreamProbeRowIds_;  // Encoded (driverId << 56 | rowIndex)
+
+  // Column source metadata: output channel → where to extract the data
+  // Stored here so it's shared across drivers after JoinBridge merge
+  ColumnSourceMap columnSourceMap_;
+
+  // Cross-driver container access (after merge via JoinBridge)
+  std::unordered_map<uint8_t, std::shared_ptr<HybridContainer>> upstreamBuildContainers_;
+  std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>> upstreamProbePayloads_;
 };
+
+/// Container for probe-side payload columns during late materialization.
+/// Stores columnar batches from the probe side that are deferred for extraction.
+class ProbePayloadContainer {
+ public:
+  ProbePayloadContainer(memory::MemoryPool* pool) : pool_(pool) {}
+
+  /// Add a batch of probe payload columns.
+  void addBatch(const RowVectorPtr& batch) {
+    if (batch && batch->size() > 0) {
+      batches_.push_back(batch);
+      totalRows_ += batch->size();
+      ++totalBatches_;
+    }
+  }
+
+  /// Get number of rows stored.
+  uint64_t numRows() const {
+    return totalRows_;
+  }
+
+  /// Get number of batches stored.
+  uint32_t numBatches() const {
+    return totalBatches_;
+  }
+
+  /// Check if batches have been coalesced.
+  bool isCoalesced() const {
+    return coalesced_;
+  }
+
+  /// Get the coalesced batch (after coalesceBatches() called).
+  RowVectorPtr getCoalescedBatch() const {
+    BOLT_CHECK(coalesced_, "Must call coalesceBatches() first");
+    BOLT_CHECK(!batches_.empty(), "No batches to coalesce");
+    return batches_[0];
+  }
+
+  /// Coalesce all batches into a single flat batch for efficient extraction.
+  void coalesceBatches() {
+    if (coalesced_ || batches_.empty()) {
+      coalesced_ = true;
+      return;
+    }
+
+    // Single batch: just need to flatten if not already flat
+    if (batches_.size() == 1) {
+      auto& batch = batches_[0];
+      bool needsFlatten = false;
+      for (int32_t i = 0; i < batch->childrenSize(); ++i) {
+        if (batch->childAt(i)->encoding() != VectorEncoding::Simple::FLAT) {
+          needsFlatten = true;
+          break;
+        }
+      }
+      if (needsFlatten) {
+        std::vector<VectorPtr> flatChildren;
+        flatChildren.reserve(batch->childrenSize());
+        for (int32_t i = 0; i < batch->childrenSize(); ++i) {
+          auto flat = BaseVector::create(batch->childAt(i)->type(), batch->size(), pool_);
+          flat->copy(batch->childAt(i).get(), 0, 0, batch->size());
+          flatChildren.push_back(std::move(flat));
+        }
+        batches_[0] = std::make_shared<RowVector>(
+            pool_,
+            batch->type(),
+            BufferPtr(nullptr),
+            batch->size(),
+            std::move(flatChildren));
+      }
+      coalesced_ = true;
+      return;
+    }
+
+    // Multiple batches: coalesce into one
+    auto& firstBatch = batches_[0];
+    const auto numCols = firstBatch->childrenSize();
+    std::vector<VectorPtr> newChildren;
+    newChildren.reserve(numCols);
+
+    for (int32_t col = 0; col < numCols; ++col) {
+      auto flat = BaseVector::create(firstBatch->childAt(col)->type(), totalRows_, pool_);
+      vector_size_t offset = 0;
+      for (const auto& batch : batches_) {
+        auto* child = batch->childAt(col).get();
+        const auto batchSize = batch->size();
+        flat->copy(child, offset, 0, batchSize);
+        offset += batchSize;
+      }
+      newChildren.push_back(std::move(flat));
+    }
+
+    batches_.clear();
+    batches_.push_back(std::make_shared<RowVector>(
+        pool_,
+        firstBatch->type(),
+        BufferPtr(nullptr),
+        totalRows_,
+        std::move(newChildren)));
+    totalBatches_ = 1;
+    coalesced_ = true;
+  }
+
+  /// Clear all stored batches.
+  void clear() {
+    batches_.clear();
+    totalRows_ = 0;
+    totalBatches_ = 0;
+    coalesced_ = false;
+  }
+
+  /// Set container ID for this driver's container.
+  void setId(uint8_t id) {
+    id_ = id;
+  }
+
+  uint8_t getId() const {
+    return id_;
+  }
+
+  /// Set all containers map (after merge via JoinBridge).
+  /// This enables multi-driver extraction where driverId is decoded from rowIds.
+  void setAllContainers(
+      std::unordered_map<uint8_t, ProbePayloadContainer*>& containers) {
+    allContainers_ = containers;
+    maxContainerId_ = 0;
+    for (const auto& [cid, _] : allContainers_) {
+      maxContainerId_ = std::max<uint8_t>(maxContainerId_, cid);
+    }
+  }
+
+  /// Get all containers map.
+  const std::unordered_map<uint8_t, ProbePayloadContainer*>& getAllContainers() const {
+    return allContainers_;
+  }
+
+  /// Check if this is the only container (fast path for single-driver).
+  bool isSingleContainer() const {
+    return allContainers_.size() == 1;
+  }
+
+  uint8_t getMaxContainerId() const {
+    return maxContainerId_;
+  }
+
+  /// Clear a specific column to free memory.
+  /// Called when the column has been extracted as a key for the next join.
+  /// @param columnIndex Index within the batch's columns (0-based)
+  void clearColumn(int32_t columnIndex) {
+    if (batches_.empty() || columnIndex < 0) {
+      return;
+    }
+    for (auto& batch : batches_) {
+      if (batch && columnIndex < batch->childrenSize()) {
+        // Create a null constant vector of the same type and size
+        auto nullVector = BaseVector::createNullConstant(
+            batch->childAt(columnIndex)->type(), batch->size(), pool_);
+        batch->childAt(columnIndex) = nullVector;
+      }
+    }
+  }
+
+  /// Extract a column from probe payload using encoded rowIds.
+  /// rowIds are encoded as (driverId << 56 | localRowIndex).
+  /// Uses allContainers_ to access the correct driver's data.
+  void extractColumn(
+      const std::vector<uint64_t>& rowIds,
+      int32_t columnIndex,
+      const VectorPtr& result);
+
+ private:
+  // Get the single container's coalesced data (only valid when isSingleContainer())
+  RowVector* getSingleContainerData() const {
+    BOLT_DCHECK_EQ(allContainers_.size(), 1);
+    auto* container = allContainers_.begin()->second;
+    BOLT_DCHECK(!container->batches_.empty());
+    BOLT_DCHECK_NOT_NULL(container->batches_[0]);
+    return container->batches_[0].get();
+  }
+
+  // ========== Single-container fast path with 4-way prefetch ==========
+
+  template <typename T>
+  void extractColumnWithNullsSingleContainer(
+      const std::vector<uint64_t>& rowIds,
+      int32_t columnIndex,
+      FlatVector<T>* FOLLY_NONNULL result);
+
+  template <typename T>
+  void extractColumnNoNullsSingleContainer(
+      const std::vector<uint64_t>& rowIds,
+      int32_t columnIndex,
+      FlatVector<T>* FOLLY_NONNULL result);
+
+  // ========== Multi-container path with 4-way prefetch ==========
+
+  template <typename T>
+  void extractColumnWithNullsMultiContainer(
+      const std::vector<uint64_t>& rowIds,
+      int32_t columnIndex,
+      FlatVector<T>* FOLLY_NONNULL result);
+
+  template <typename T>
+  void extractColumnNoNullsMultiContainer(
+      const std::vector<uint64_t>& rowIds,
+      int32_t columnIndex,
+      FlatVector<T>* FOLLY_NONNULL result);
+
+  template <TypeKind Kind>
+  void extractColumnTyped(
+      const std::vector<uint64_t>& rowIds,
+      int32_t columnIndex,
+      const VectorPtr& result);
+
+  memory::MemoryPool* pool_;
+  std::vector<RowVectorPtr> batches_;
+  uint64_t totalRows_ = 0;
+  uint32_t totalBatches_ = 0;
+  bool coalesced_ = false;
+
+  // Container ID for this driver
+  uint8_t id_{0};
+
+  // All containers by driverId (set after JoinBridge merge)
+  std::unordered_map<uint8_t, ProbePayloadContainer*> allContainers_;
+  uint8_t maxContainerId_{0};
+};
+
+// ========== ProbePayloadContainer template implementations ==========
+
+template <typename T>
+void ProbePayloadContainer::extractColumnWithNullsSingleContainer(
+    const std::vector<uint64_t>& rowIds,
+    int32_t columnIndex,
+    FlatVector<T>* FOLLY_NONNULL result) {
+  const int32_t numRows = rowIds.size();
+  result->resize(numRows);
+
+  BufferPtr& nullBuffer = result->mutableNulls(numRows);
+  auto nulls = nullBuffer->asMutable<uint64_t>();
+  BufferPtr valuesBuffer = result->mutableValues(numRows);
+  auto values = valuesBuffer->asMutableRange<T>();
+
+  auto* flatChild = getSingleContainerData()
+                        ->childAt(columnIndex)
+                        ->template as<FlatVector<T>>();
+  BOLT_CHECK_NOT_NULL(flatChild);
+  const T* rawValues = flatChild->rawValues();
+  const uint64_t* rawNulls = flatChild->rawNulls();
+
+  constexpr vector_size_t kPrefetchDist = 16;
+  int32_t i = 0;
+
+  // ---- Main loop: process 4 rows per iteration ----
+  for (; i + 3 < numRows; i += 4) {
+    // ---- Prefetch next 4 records at distance ----
+    const int32_t p = i + kPrefetchDist;
+    if (FOLLY_LIKELY(p + 3 < numRows)) {
+      __builtin_prefetch(rawValues + (rowIds[p] & ((1ULL << 56) - 1)), 0, 1);
+      __builtin_prefetch(rawValues + (rowIds[p + 1] & ((1ULL << 56) - 1)), 0, 1);
+      __builtin_prefetch(rawValues + (rowIds[p + 2] & ((1ULL << 56) - 1)), 0, 1);
+      __builtin_prefetch(rawValues + (rowIds[p + 3] & ((1ULL << 56) - 1)), 0, 1);
+    }
+
+    // ---- Process 4 rows ----
+    for (int32_t u = 0; u < 4; ++u) {
+      const int32_t idx = i + u;
+      const auto localIdx = static_cast<vector_size_t>(rowIds[idx] & ((1ULL << 56) - 1));
+
+      if (rawNulls != nullptr && bits::isBitNull(rawNulls, localIdx)) {
+        bits::setNull(nulls, idx, true);
+        continue;
+      }
+
+      bits::setNull(nulls, idx, false);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(idx, rawValues[localIdx]);
+      } else {
+        values[idx] = rawValues[localIdx];
+      }
+    }
+  }
+
+  // ---- Tail loop ----
+  for (; i < numRows; ++i) {
+    const auto localIdx = static_cast<vector_size_t>(rowIds[i] & ((1ULL << 56) - 1));
+
+    if (rawNulls != nullptr && bits::isBitNull(rawNulls, localIdx)) {
+      bits::setNull(nulls, i, true);
+      continue;
+    }
+
+    bits::setNull(nulls, i, false);
+    if constexpr (std::is_same_v<T, StringView>) {
+      result->set(i, rawValues[localIdx]);
+    } else {
+      values[i] = rawValues[localIdx];
+    }
+  }
+}
+
+template <typename T>
+void ProbePayloadContainer::extractColumnNoNullsSingleContainer(
+    const std::vector<uint64_t>& rowIds,
+    int32_t columnIndex,
+    FlatVector<T>* FOLLY_NONNULL result) {
+  const int32_t numRows = rowIds.size();
+  result->resize(numRows);
+
+  BufferPtr valuesBuffer = result->mutableValues(numRows);
+  auto values = valuesBuffer->asMutableRange<T>();
+
+  auto* flatChild = getSingleContainerData()
+                        ->childAt(columnIndex)
+                        ->template as<FlatVector<T>>();
+  BOLT_CHECK_NOT_NULL(flatChild);
+  const T* rawValues = flatChild->rawValues();
+
+  constexpr vector_size_t kPrefetchDist = 16;
+  int32_t i = 0;
+
+  // ---- Main loop: process 4 rows per iteration ----
+  for (; i + 3 < numRows; i += 4) {
+    // ---- Prefetch next 4 records at distance ----
+    const int32_t p = i + kPrefetchDist;
+    if (FOLLY_LIKELY(p + 3 < numRows)) {
+      __builtin_prefetch(rawValues + (rowIds[p] & ((1ULL << 56) - 1)), 0, 1);
+      __builtin_prefetch(rawValues + (rowIds[p + 1] & ((1ULL << 56) - 1)), 0, 1);
+      __builtin_prefetch(rawValues + (rowIds[p + 2] & ((1ULL << 56) - 1)), 0, 1);
+      __builtin_prefetch(rawValues + (rowIds[p + 3] & ((1ULL << 56) - 1)), 0, 1);
+    }
+
+    // ---- Process 4 rows ----
+    for (int32_t u = 0; u < 4; ++u) {
+      const int32_t idx = i + u;
+      const auto localIdx = static_cast<vector_size_t>(rowIds[idx] & ((1ULL << 56) - 1));
+
+      result->setNull(idx, false);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(idx, rawValues[localIdx]);
+      } else {
+        values[idx] = rawValues[localIdx];
+      }
+    }
+  }
+
+  // ---- Tail loop ----
+  for (; i < numRows; ++i) {
+    const auto localIdx = static_cast<vector_size_t>(rowIds[i] & ((1ULL << 56) - 1));
+    result->setNull(i, false);
+    if constexpr (std::is_same_v<T, StringView>) {
+      result->set(i, rawValues[localIdx]);
+    } else {
+      values[i] = rawValues[localIdx];
+    }
+  }
+}
+
+template <typename T>
+void ProbePayloadContainer::extractColumnWithNullsMultiContainer(
+    const std::vector<uint64_t>& rowIds,
+    int32_t columnIndex,
+    FlatVector<T>* FOLLY_NONNULL result) {
+  const int32_t numRows = rowIds.size();
+  result->resize(numRows);
+
+  BufferPtr& nullBuffer = result->mutableNulls(numRows);
+  auto nulls = nullBuffer->asMutable<uint64_t>();
+  BufferPtr valuesBuffer = result->mutableValues(numRows);
+  auto values = valuesBuffer->asMutableRange<T>();
+
+  // Build lookup tables for each container
+  std::vector<const T*> rawValuesByContainer(maxContainerId_ + 1, nullptr);
+  std::vector<const uint64_t*> rawNullsByContainer(maxContainerId_ + 1, nullptr);
+  for (const auto& [cid, container] : allContainers_) {
+    if (container->batches_.empty()) {
+      continue;
+    }
+    auto* flatChild = container->batches_[0]
+                          ->childAt(columnIndex)
+                          ->template as<FlatVector<T>>();
+    BOLT_CHECK_NOT_NULL(flatChild);
+    rawValuesByContainer[cid] = flatChild->rawValues();
+    rawNullsByContainer[cid] = flatChild->rawNulls();
+  }
+
+  constexpr vector_size_t kPrefetchDist = 16;
+  int32_t curCid = -1;
+  const T* curRaw = nullptr;
+  const uint64_t* curNulls = nullptr;
+
+  int32_t pfCid = -1;
+  const T* pfRaw = nullptr;
+
+  if (FOLLY_LIKELY(numRows > 0)) {
+    curCid = static_cast<uint8_t>(rowIds[0] >> 56);
+    curRaw = rawValuesByContainer[curCid];
+    curNulls = rawNullsByContainer[curCid];
+    if (kPrefetchDist < numRows) {
+      pfCid = static_cast<uint8_t>(rowIds[kPrefetchDist] >> 56);
+      pfRaw = rawValuesByContainer[pfCid];
+    }
+  }
+
+  int32_t i = 0;
+
+  // ---- Main loop: process 4 rows per iteration ----
+  for (; i + 3 < numRows; i += 4) {
+    const int32_t p = i + kPrefetchDist;
+    if (FOLLY_LIKELY(p + 3 < numRows)) {
+      // Prefetch with container switching
+      for (int32_t pf = 0; pf < 4; ++pf) {
+        const auto& rid = rowIds[p + pf];
+        uint8_t driverId = static_cast<uint8_t>(rid >> 56);
+        if (FOLLY_UNLIKELY(driverId != pfCid)) {
+          pfCid = driverId;
+          pfRaw = rawValuesByContainer[pfCid];
+        }
+        if (pfRaw) {
+          __builtin_prefetch(pfRaw + (rid & ((1ULL << 56) - 1)), 0, 1);
+        }
+      }
+    }
+
+    // ---- Process 4 rows ----
+    for (int32_t u = 0; u < 4; ++u) {
+      const int32_t idx = i + u;
+      const auto& rid = rowIds[idx];
+      uint8_t driverId = static_cast<uint8_t>(rid >> 56);
+      uint64_t localIdx = rid & ((1ULL << 56) - 1);
+
+      if (FOLLY_UNLIKELY(driverId != curCid)) {
+        curCid = driverId;
+        curRaw = rawValuesByContainer[curCid];
+        curNulls = rawNullsByContainer[curCid];
+      }
+
+      if (curRaw == nullptr || (curNulls != nullptr && bits::isBitNull(curNulls, localIdx))) {
+        bits::setNull(nulls, idx, true);
+        continue;
+      }
+
+      bits::setNull(nulls, idx, false);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(idx, curRaw[localIdx]);
+      } else {
+        values[idx] = curRaw[localIdx];
+      }
+    }
+  }
+
+  // ---- Tail loop ----
+  for (; i < numRows; ++i) {
+    const auto& rid = rowIds[i];
+    uint8_t driverId = static_cast<uint8_t>(rid >> 56);
+    uint64_t localIdx = rid & ((1ULL << 56) - 1);
+
+    if (FOLLY_UNLIKELY(driverId != curCid)) {
+      curCid = driverId;
+      curRaw = rawValuesByContainer[curCid];
+      curNulls = rawNullsByContainer[curCid];
+    }
+
+    if (curRaw == nullptr || (curNulls != nullptr && bits::isBitNull(curNulls, localIdx))) {
+      bits::setNull(nulls, i, true);
+      continue;
+    }
+
+    bits::setNull(nulls, i, false);
+    if constexpr (std::is_same_v<T, StringView>) {
+      result->set(i, curRaw[localIdx]);
+    } else {
+      values[i] = curRaw[localIdx];
+    }
+  }
+}
+
+template <typename T>
+void ProbePayloadContainer::extractColumnNoNullsMultiContainer(
+    const std::vector<uint64_t>& rowIds,
+    int32_t columnIndex,
+    FlatVector<T>* FOLLY_NONNULL result) {
+  const int32_t numRows = rowIds.size();
+  result->resize(numRows);
+
+  BufferPtr valuesBuffer = result->mutableValues(numRows);
+  auto values = valuesBuffer->asMutableRange<T>();
+
+  // Build lookup table for each container
+  std::vector<const T*> rawValuesByContainer(maxContainerId_ + 1, nullptr);
+  for (const auto& [cid, container] : allContainers_) {
+    if (container->batches_.empty()) {
+      continue;
+    }
+    auto* flatChild = container->batches_[0]
+                          ->childAt(columnIndex)
+                          ->template as<FlatVector<T>>();
+    BOLT_CHECK_NOT_NULL(flatChild);
+    rawValuesByContainer[cid] = flatChild->rawValues();
+  }
+
+  constexpr vector_size_t kPrefetchDist = 16;
+  int32_t curCid = -1;
+  const T* curRaw = nullptr;
+
+  int32_t pfCid = -1;
+  const T* pfRaw = nullptr;
+
+  if (FOLLY_LIKELY(numRows > 0)) {
+    curCid = static_cast<uint8_t>(rowIds[0] >> 56);
+    curRaw = rawValuesByContainer[curCid];
+    if (kPrefetchDist < numRows) {
+      pfCid = static_cast<uint8_t>(rowIds[kPrefetchDist] >> 56);
+      pfRaw = rawValuesByContainer[pfCid];
+    }
+  }
+
+  int32_t i = 0;
+
+  // ---- Main loop: process 4 rows per iteration ----
+  for (; i + 3 < numRows; i += 4) {
+    const int32_t p = i + kPrefetchDist;
+    if (FOLLY_LIKELY(p + 3 < numRows)) {
+      for (int32_t pf = 0; pf < 4; ++pf) {
+        const auto& rid = rowIds[p + pf];
+        uint8_t driverId = static_cast<uint8_t>(rid >> 56);
+        if (FOLLY_UNLIKELY(driverId != pfCid)) {
+          pfCid = driverId;
+          pfRaw = rawValuesByContainer[pfCid];
+        }
+        if (pfRaw) {
+          __builtin_prefetch(pfRaw + (rid & ((1ULL << 56) - 1)), 0, 1);
+        }
+      }
+    }
+
+    // ---- Process 4 rows ----
+    for (int32_t u = 0; u < 4; ++u) {
+      const int32_t idx = i + u;
+      const auto& rid = rowIds[idx];
+      uint8_t driverId = static_cast<uint8_t>(rid >> 56);
+      uint64_t localIdx = rid & ((1ULL << 56) - 1);
+
+      if (FOLLY_UNLIKELY(driverId != curCid)) {
+        curCid = driverId;
+        curRaw = rawValuesByContainer[curCid];
+      }
+
+      result->setNull(idx, false);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(idx, curRaw[localIdx]);
+      } else {
+        values[idx] = curRaw[localIdx];
+      }
+    }
+  }
+
+  // ---- Tail loop ----
+  for (; i < numRows; ++i) {
+    const auto& rid = rowIds[i];
+    uint8_t driverId = static_cast<uint8_t>(rid >> 56);
+    uint64_t localIdx = rid & ((1ULL << 56) - 1);
+
+    if (FOLLY_UNLIKELY(driverId != curCid)) {
+      curCid = driverId;
+      curRaw = rawValuesByContainer[curCid];
+    }
+
+    result->setNull(i, false);
+    if constexpr (std::is_same_v<T, StringView>) {
+      result->set(i, curRaw[localIdx]);
+    } else {
+      values[i] = curRaw[localIdx];
+    }
+  }
+}
+
+template <TypeKind Kind>
+void ProbePayloadContainer::extractColumnTyped(
+    const std::vector<uint64_t>& rowIds,
+    int32_t columnIndex,
+    const VectorPtr& result) {
+  using T = typename KindToFlatVector<Kind>::HashRowType;
+  auto* flatResult = result->as<FlatVector<T>>();
+
+  // Determine if this column is nullable by checking any container
+  bool isNullable = false;
+  for (const auto& [_, container] : allContainers_) {
+    if (!container->batches_.empty()) {
+      auto* child = container->batches_[0]->childAt(columnIndex).get();
+      if (child->mayHaveNulls()) {
+        isNullable = true;
+        break;
+      }
+    }
+  }
+
+  if (isSingleContainer()) {
+    if (isNullable) {
+      extractColumnWithNullsSingleContainer<T>(rowIds, columnIndex, flatResult);
+    } else {
+      extractColumnNoNullsSingleContainer<T>(rowIds, columnIndex, flatResult);
+    }
+  } else {
+    if (isNullable) {
+      extractColumnWithNullsMultiContainer<T>(rowIds, columnIndex, flatResult);
+    } else {
+      extractColumnNoNullsMultiContainer<T>(rowIds, columnIndex, flatResult);
+    }
+  }
+}
+
+/// Specialization for OPAQUE type - not supported in ProbePayloadContainer
+template <>
+inline void ProbePayloadContainer::extractColumnTyped<TypeKind::OPAQUE>(
+    const std::vector<uint64_t>& /*rowIds*/,
+    int32_t /*columnIndex*/,
+    const VectorPtr& /*result*/) {
+  BOLT_UNSUPPORTED("ProbePayloadContainer doesn't support OPAQUE payload types.");
+}
+
+/// Implementation of ProbePayloadContainer::extractColumn
+/// Extracts a column from probe payload using encoded rowIds.
+inline void ProbePayloadContainer::extractColumn(
+    const std::vector<uint64_t>& rowIds,
+    int32_t columnIndex,
+    const VectorPtr& result) {
+  const int32_t numRows = rowIds.size();
+  if (numRows == 0) {
+    return;
+  }
+
+  // Ensure all containers are coalesced
+  for (auto& [_, container] : allContainers_) {
+    if (!container->isCoalesced()) {
+      container->coalesceBatches();
+    }
+  }
+
+  // Handle empty containers
+  if (allContainers_.empty()) {
+    result->resize(numRows);
+    for (int32_t i = 0; i < numRows; ++i) {
+      result->setNull(i, true);
+    }
+    return;
+  }
+
+  // Check if single container is empty
+  if (isSingleContainer()) {
+    auto* container = allContainers_.begin()->second;
+    if (container->batches_.empty()) {
+      result->resize(numRows);
+      for (int32_t i = 0; i < numRows; ++i) {
+        result->setNull(i, true);
+      }
+      return;
+    }
+  }
+
+  // Dispatch to typed extraction
+  // Note: Complex types (ARRAY, MAP, ROW) not supported for now
+  BOLT_DYNAMIC_TYPE_DISPATCH_ALL(
+      extractColumnTyped,
+      result->typeKind(),
+      rowIds,
+      columnIndex,
+      result);
+}
 
 template <>
 inline void HybridContainer::extractPayloadTyped<TypeKind::OPAQUE>(
@@ -2895,6 +3800,252 @@ inline void HybridContainer::extractNulls(
       const auto* nulls = rawNullsByContainer[rec.containerId_];
       if (nulls != nullptr && bits::isBitNull(nulls, rec.rowId_)) {
         bits::setBit(rawResult, i, true);
+      }
+    }
+  }
+}
+
+inline void HybridContainer::extractColumnsFromUpstream(
+    const std::vector<column_index_t>& channels,
+    const std::vector<char*>& currentBuildRowPtrs,
+    HybridContainer* currentHybrid,
+    ProbePayloadContainer* currentProbePayload,
+    const ColumnSourceMap& sourceMap,
+    const RowVectorPtr& result) {
+  const int32_t numRows = currentBuildRowPtrs.size();
+  if (numRows == 0) {
+    return;
+  }
+
+  BOLT_CHECK_EQ(
+      result->size(),
+      numRows,
+      "Result vector size {} doesn't match numRows {}",
+      result->size(),
+      numRows);
+  BOLT_CHECK_EQ(
+      result->childrenSize(),
+      channels.size(),
+      "Result children count {} doesn't match channels count {}",
+      result->childrenSize(),
+      channels.size());
+
+  // ========== Phase 1: Pre-compute all depth levels ==========
+  // Build the chain of row references by traversing upstreamBuildRowPtrs_.
+  // Level 0 = current hash table, Level 1 = one upstream, Level 2 = two upstream, etc.
+  //
+  // Data layout:
+  // - levels[0]: current HybridContainer, current ProbePayloadContainer
+  //   - buildRowPtrs: input parameter (points into current HybridContainer)
+  //   - probeRowIds: empty (will be filled from Level 1's extraction)
+  // - levels[N] (N > 0):
+  //   - buildRowPtrs: points into levels[N-1].hybridContainer's upstream
+  //   - probeRowIds: indices into levels[N-1].probePayloadContainer
+  //   - hybridContainer: the upstream HybridContainer
+  //   - probePayloadContainer: upstream's ProbePayloadContainer (for level N+1's extraction)
+  std::vector<LevelRowRefs> levels;
+
+  // Level 0: current level
+  levels.emplace_back(currentBuildRowPtrs, std::vector<uint64_t>{}, currentHybrid, currentProbePayload);
+
+  // Traverse the upstream chain
+  HybridContainer* levelHybrid = currentHybrid;
+  while (levelHybrid && levelHybrid->hasUpstreamRefs()) {
+    // Get local indices from current level's row pointers
+    std::vector<HybridRowId> localRowIds;
+    levelHybrid->getRowIds(
+        levels.back().buildRowPtrs.data(),
+        numRows,
+        localRowIds);
+
+    // Build next level's pointers from upstreamBuildRowPtrs_/upstreamProbeRowIds_
+    // IMPORTANT: After table merge, rows may come from different drivers.
+    // Each driver's container stores its own upstreamBuildRowPtrs_.
+    // We must use containerId_ to look up the correct container.
+    LevelRowRefs nextLevel;
+    nextLevel.buildRowPtrs.resize(numRows);
+    nextLevel.probeRowIds.resize(numRows);
+
+    // Get all containers at current level for proper lookup by containerId
+    const auto& allContainers = levelHybrid->getAllContainers();
+
+    for (int32_t i = 0; i < numRows; ++i) {
+      uint8_t containerId = localRowIds[i].containerId_;
+      size_t localIdx = localRowIds[i].rowId_;
+
+      // Find the container that owns this row
+      HybridContainer* owningContainer = allContainers.at(containerId);
+      nextLevel.buildRowPtrs[i] = owningContainer->getUpstreamBuildRowPtr(localIdx);
+      nextLevel.probeRowIds[i] = owningContainer->getUpstreamProbeRowId(localIdx);
+    }
+
+    // Get upstream HybridContainer for next iteration
+    // Note: upstreamBuildContainers_ contains all upstream containers by driverId
+    // For now, we get the container from the first entry (all point to same merged table)
+    HybridContainer* upstreamHybrid = nullptr;
+    const auto& upstreamContainers = levelHybrid->getUpstreamBuildContainers();
+    if (!upstreamContainers.empty()) {
+      upstreamHybrid = upstreamContainers.begin()->second.get();
+    }
+    nextLevel.hybridContainer = upstreamHybrid;
+
+    // Get upstream ProbePayloadContainer for next level's probe data extraction
+    // Similar to HybridContainer, all drivers share the same upstream after merge
+    ProbePayloadContainer* upstreamProbePayload = nullptr;
+    const auto& upstreamProbePayloads = levelHybrid->getUpstreamProbePayloads();
+    if (!upstreamProbePayloads.empty()) {
+      upstreamProbePayload = upstreamProbePayloads.begin()->second.get();
+    }
+    nextLevel.probePayloadContainer = upstreamProbePayload;
+
+    levels.push_back(std::move(nextLevel));
+    levelHybrid = upstreamHybrid;
+  }
+
+  // ========== Phase 2: Map each source to its level ==========
+  // Build mappings from containerPtr → level index for fast lookup.
+  // IMPORTANT: Register ALL containers at each level, not just one.
+  // After merge, each driver has its own container object, but ColumnSourceMap
+  // was created with the caller's driver's pointers. We must handle any driver.
+  std::unordered_map<void*, size_t> hybridContainerToLevel;
+  std::unordered_map<void*, size_t> probeContainerToLevel;
+
+  // Level 0: register currentHybrid and all its peer containers
+  if (currentHybrid) {
+    hybridContainerToLevel[currentHybrid] = 0;
+    for (const auto& [cid, container] : currentHybrid->getAllContainers()) {
+      hybridContainerToLevel[container] = 0;
+    }
+  }
+  if (currentProbePayload) {
+    probeContainerToLevel[currentProbePayload] = 0;
+    for (const auto& [cid, container] : currentProbePayload->getAllContainers()) {
+      probeContainerToLevel[container] = 0;
+    }
+  }
+
+  // Level 1+: register all upstream containers
+  for (size_t lvl = 1; lvl < levels.size(); ++lvl) {
+    if (levels[lvl].hybridContainer) {
+      // Register this container and all its peers
+      hybridContainerToLevel[levels[lvl].hybridContainer] = lvl;
+      for (const auto& [cid, container] : levels[lvl].hybridContainer->getAllContainers()) {
+        hybridContainerToLevel[container] = lvl;
+      }
+    }
+    if (levels[lvl].probePayloadContainer) {
+      probeContainerToLevel[levels[lvl].probePayloadContainer] = lvl;
+      for (const auto& [cid, container] : levels[lvl].probePayloadContainer->getAllContainers()) {
+        probeContainerToLevel[container] = lvl;
+      }
+    }
+  }
+
+  // ========== Phase 3: Extract each column using appropriate level ==========
+  // Cache for rowIds per HybridContainer to avoid redundant getRowIds() calls
+  std::unordered_map<HybridContainer*, std::vector<HybridRowId>> rowIdCache;
+
+  for (size_t i = 0; i < channels.size(); ++i) {
+    int32_t channel = channels[i];
+    auto it = sourceMap.find(channel);
+    BOLT_CHECK(
+        it != sourceMap.end(),
+        "Channel {} not found in ColumnSourceMap",
+        channel);
+
+    const ColumnSource& source = it->second;
+    auto& columnVector = result->childAt(i);
+
+    switch (source.type) {
+      case ColumnSource::Type::HYBRID_KEY: {
+        // Find the level for this source's container
+        auto* hybridContainer = source.hybridContainer();
+        auto levelIt = hybridContainerToLevel.find(hybridContainer);
+
+        // Get the row pointers for this level
+        const std::vector<char*>* levelBuildPtrs = &currentBuildRowPtrs;
+        if (levelIt != hybridContainerToLevel.end()) {
+          levelBuildPtrs = &levels[levelIt->second].buildRowPtrs;
+        }
+
+        // Extract keys using the correct level's row pointers
+        hybridContainer->getKeys()->extractColumn(
+            levelBuildPtrs->data(),
+            numRows,
+            source.columnIndex,
+            columnVector);
+        break;
+      }
+      case ColumnSource::Type::HYBRID_PAYLOAD: {
+        auto* hybridContainer = source.hybridContainer();
+        auto levelIt = hybridContainerToLevel.find(hybridContainer);
+
+        // Get the row pointers for this level
+        const std::vector<char*>* levelBuildPtrs = &currentBuildRowPtrs;
+        size_t level = 0;
+        if (levelIt != hybridContainerToLevel.end()) {
+          level = levelIt->second;
+          levelBuildPtrs = &levels[level].buildRowPtrs;
+        }
+
+        // Check if we already computed rowIds for this container
+        auto cacheIt = rowIdCache.find(hybridContainer);
+        if (cacheIt == rowIdCache.end()) {
+          std::vector<HybridRowId> outputRowIds;
+          hybridContainer->getRowIds(
+              levelBuildPtrs->data(),
+              numRows,
+              outputRowIds);
+          cacheIt = rowIdCache.emplace(hybridContainer, std::move(outputRowIds)).first;
+        }
+
+        // Extract payload using the correct level's row pointers
+        folly::Range<const vector_size_t*> emptyRange;
+        hybridContainer->extractPayload(
+            levelBuildPtrs->data(),
+            emptyRange,
+            numRows,
+            source.columnIndex,
+            0, // resultOffset
+            columnVector,
+            cacheIt->second,
+            false); // exactSize
+        break;
+      }
+      case ColumnSource::Type::PROBE_PAYLOAD: {
+        // For PROBE_PAYLOAD, find which level contains this ProbePayloadContainer
+        auto* probeContainer = source.probePayloadContainer();
+        auto levelIt = probeContainerToLevel.find(probeContainer);
+
+        if (levelIt != probeContainerToLevel.end()) {
+          // The probeRowIds that point to this container are at level+1
+          size_t containerLevel = levelIt->second;
+          size_t rowIdLevel = containerLevel + 1;
+
+          if (rowIdLevel < levels.size() && !levels[rowIdLevel].probeRowIds.empty()) {
+            probeContainer->extractColumn(
+                levels[rowIdLevel].probeRowIds,
+                source.columnIndex,
+                columnVector);
+          }
+        } else {
+          // Fallback: if container not found in level map, try using first available probeRowIds
+          // This handles cases where the container wasn't explicitly tracked
+          for (size_t lvl = 1; lvl < levels.size(); ++lvl) {
+            if (!levels[lvl].probeRowIds.empty()) {
+              probeContainer->extractColumn(
+                  levels[lvl].probeRowIds,
+                  source.columnIndex,
+                  columnVector);
+              break;
+            }
+          }
+        }
+        break;
+      }
+      case ColumnSource::Type::CURRENT_PROBE: {
+        // CURRENT_PROBE is handled separately by the caller
+        BOLT_UNREACHABLE("CURRENT_PROBE should be handled separately");
       }
     }
   }

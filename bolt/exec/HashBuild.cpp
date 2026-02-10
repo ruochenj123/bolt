@@ -148,10 +148,16 @@ HashBuild::HashBuild(
   std::vector<std::string> dependentNames;
   std::vector<TypePtr> dependentTypes;
 
+  // Detect N-way late materialization: if columnSourceMap is non-empty,
+  // input comes from upstream HashProbe rather than TableScan
+  isNWayLateMEnabled_ = driverCtx->buildSideLateMEnabled &&
+      !driverCtx->columnSourceMap.empty();
+
   hybridJoin_ = operatorCtx_->driverCtx()->queryConfig().hybridJoinEnabled() &&
       numDependents > 0 && !joinNode_->isLeftSemiFilterJoin() &&
       !joinNode_->isLeftSemiProjectJoin() && !joinNode_->isAntiJoin();
 
+  // For N-way late-m, we need dependentChannels_ for mapping but don't store payloads
   if (!dropDuplicates_ && numDependents > 0) {
     // Number of join keys (numKeys) may be less then number of input columns
     // (inputType->size()). In this case numDependents is negative and cannot be
@@ -159,21 +165,28 @@ HashBuild::HashBuild(
     // keys with the same build side key: SELECT * FROM t LEFT JOIN u ON t.k1 =
     // u.k AND t.k2 = u.k.
     dependentChannels_.reserve(numDependents);
-    decoders_.reserve(numDependents);
-    dependentNames.reserve(numDependents);
-    dependentTypes.reserve(numDependents);
+    if (!isNWayLateMEnabled_) {
+      decoders_.reserve(numDependents);
+      dependentNames.reserve(numDependents);
+      dependentTypes.reserve(numDependents);
+    }
   }
   if (!dropDuplicates_) {
     // For left semi and anti join with no extra filter, hash table does not
     // store dependent columns.
     for (auto i = 0; i < inputType->size(); ++i) {
       if (keyChannelMap_.find(i) == keyChannelMap_.end()) {
+        // Always track dependent channels for inputChannel -> storageChannel mapping
         dependentChannels_.emplace_back(i);
-        decoders_.emplace_back(std::make_unique<DecodedVector>());
-        names.emplace_back(inputType->nameOf(i));
-        types.emplace_back(inputType->childAt(i));
-        dependentNames.emplace_back(inputType->nameOf(i));
-        dependentTypes.emplace_back(inputType->childAt(i));
+        
+        // For N-way late-m, we don't store payloads - skip adding to tableType_
+        if (!isNWayLateMEnabled_) {
+          decoders_.emplace_back(std::make_unique<DecodedVector>());
+          names.emplace_back(inputType->nameOf(i));
+          types.emplace_back(inputType->childAt(i));
+          dependentNames.emplace_back(inputType->nameOf(i));
+          dependentTypes.emplace_back(inputType->childAt(i));
+        }
       }
     }
   }
@@ -286,6 +299,18 @@ void HashBuild::setupTable() {
     // testing.
     table_->hybridData()->setReorderEnabled(
         queryConfig.hybridJoinReorderEnabled());
+
+    // For N-way late-m: setup one-time metadata in HybridContainer
+    if (isNWayLateMEnabled_) {
+      auto* driverCtx = operatorCtx_->driverCtx();
+      // Store upstream container references (one-time, not per-batch)
+      table_->hybridData()->setUpstreamBuildContainers(
+          driverCtx->buildSideLateMUpstreamBuildContainers);
+      table_->hybridData()->setUpstreamProbePayloads(
+          driverCtx->buildSideLateMUpstreamProbePayloads);
+      // Copy initial columnSourceMap (will be updated per batch for key extraction)
+      table_->hybridData()->mutableColumnSourceMap() = driverCtx->columnSourceMap;
+    }
   }
 }
 
@@ -499,10 +524,19 @@ void HashBuild::addInput(RowVectorPtr input) {
 
   TestValue::adjust("bytedance::bolt::exec::HashBuild::addInput", this);
 
+  auto& hashers = table_->hashers();
+  auto* driverCtx = operatorCtx_->driverCtx();
+
+  // Check for N-way late materialization path FIRST
+  // In late-m mode, input RowVector is minimal/empty - we use DriverCtx data instead
+  if (isNWayLateMEnabled_ && !driverCtx->buildSideLateMBuildRowPtrs.empty()) {
+    addInputLateMaterialization();
+    return;
+  }
+
+  // Normal path: use input RowVector directly
   activeRows_.resize(input->size());
   activeRows_.setAll();
-
-  auto& hashers = table_->hashers();
 
   for (auto i = 0; i < hashers.size(); ++i) {
     auto key = input->childAt(hashers[i]->channel())->loadedVector();
@@ -657,6 +691,97 @@ void HashBuild::addInput(RowVectorPtr input) {
     });
   }
   spillRowBasedInput();
+}
+
+void HashBuild::addInputLateMaterialization() {
+  // N-way late-m path: input comes from upstream HashProbe
+  // Extract only key columns from upstream sources via DriverCtx
+
+  auto* driverCtx = operatorCtx_->driverCtx();
+  const int32_t numRows = driverCtx->buildSideLateMBuildRowPtrs.size();
+  if (numRows == 0) {
+    driverCtx->clearBatchState();
+    return;
+  }
+
+  auto& hashers = table_->hashers();
+
+  // Reuse or create extractedKeys_ buffer
+  if (!extractedKeys_ || extractedKeys_->size() < numRows) {
+    // Build the key type for extraction (first N columns of tableType_)
+    std::vector<std::string> keyNames;
+    std::vector<TypePtr> keyTypes;
+    std::vector<VectorPtr> keyVectors;
+    keyNames.reserve(keyChannels_.size());
+    keyTypes.reserve(keyChannels_.size());
+    keyVectors.reserve(keyChannels_.size());
+    for (size_t i = 0; i < keyChannels_.size(); ++i) {
+      keyNames.push_back(tableType_->nameOf(i));
+      keyTypes.push_back(tableType_->childAt(i));
+      keyVectors.push_back(BaseVector::create(keyTypes.back(), numRows, pool()));
+    }
+    auto keyType = ROW(std::move(keyNames), std::move(keyTypes));
+    extractedKeys_ = std::make_shared<RowVector>(
+        pool(), keyType, nullptr, numRows, std::move(keyVectors));
+  } else {
+    // Resize existing vectors if needed
+    extractedKeys_->resize(numRows);
+  }
+
+  // In HashBuild, we don't have a ProbePayloadContainer yet (it's created during probe)
+  HybridContainer::extractColumnsFromUpstream(
+      keyChannels_,
+      driverCtx->buildSideLateMBuildRowPtrs,
+      table_->hybridData(),
+      nullptr, // currentProbePayload - not available in HashBuild
+      driverCtx->columnSourceMap,
+      extractedKeys_);
+
+  // Resize activeRows for extracted keys
+  activeRows_.resize(numRows);
+  activeRows_.setAll();
+
+  // Decode extracted keys for hashers
+  for (auto i = 0; i < hashers.size(); ++i) {
+    auto key = extractedKeys_->childAt(i)->loadedVector();
+    hashers[i]->decode(*key, activeRows_);
+  }
+
+  // Store keys in RowContainer with hybridRowId
+  auto rows = table_->rows();
+  auto nextOffset = rows->nextOffset();
+  auto baseRow = table_->hybridData()->getNumRows();
+
+  for (int32_t rowIndex = 0; rowIndex < numRows; ++rowIndex) {
+    char* newRow = rows->newRow();
+    if (nextOffset) {
+      *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
+    }
+
+    // Store key columns
+    for (auto i = 0; i < hashers.size(); ++i) {
+      rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
+    }
+
+    // Store hybridRowId
+    uint64_t encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+        (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+    rows->storeSingleRowId(encodedId, newRow);
+  }
+
+  // Store upstream refs for later extraction
+  table_->hybridData()->appendUpstreamRefs(
+      driverCtx->buildSideLateMBuildRowPtrs,
+      driverCtx->buildSideLateMProbeRowIds);
+
+  // Note: updateSourceMapForNWay() is called in noMoreInput, not here,
+  // because we need all batches to use the original upstream columnSourceMap
+
+  // Clear batch-level state
+  driverCtx->clearBatchState();
+
+  // No payload to add for N-way path (payloads stay in upstream containers)
+  // No spill support for late-m
 }
 
 bool HashBuild::ensureInputFits(RowVectorPtr& input, SpilledRows spilledRows) {
@@ -996,6 +1121,17 @@ void HashBuild::noMoreInput() {
 }
 
 void HashBuild::noMoreInputInternal() {
+  auto* driverCtx = operatorCtx_->driverCtx();
+
+  // For late-m: populate/update ColumnSourceMap once after all batches
+  if (driverCtx->buildSideLateMEnabled) {
+    if (isNWayLateMEnabled_) {
+      updateSourceMapForNWay();
+    } else {
+      populateBaseTableSourceMap();
+    }
+  }
+
   // Coalesce batches in this driver's HybridContainer before merging with
   // peers. This handles both the normal path (from noMoreInput) and spill
   // restore path (from processSpillInput). Each driver does this independently.
@@ -1756,6 +1892,112 @@ bool HashBuild::calculateJoinBits(
 void HashBuild::recordHashBuildSpillStats() {
   common::HashBuildSpillStats stats{spillLevel_, useAdaptiveHashBuild_};
   Operator::recordHashBuildSpillStats(stats);
+}
+
+// === N-way Late Materialization Support ===
+
+void HashBuild::populateBaseTableSourceMap() {
+  auto* driverCtx = operatorCtx_->driverCtx();
+  auto* hybridData = table_->hybridData();
+
+  // Base table: Key columnSourceMap by storageChannel (what HashProbe uses).
+  // storageChannel for keys: 0..numKeys-1
+  // storageChannel for payloads: numKeys..numKeys+numPayloads-1
+  // (This matches how HashProbe's tableOutputProjections_ indexes into tableType)
+
+  // Map key channels: storageChannel -> {HYBRID_KEY, columnIndex=storageChannel}
+  for (size_t i = 0; i < keyChannels_.size(); ++i) {
+    int32_t storageChannel = static_cast<int32_t>(i);
+    driverCtx->columnSourceMap[storageChannel] = ColumnSource{
+        ColumnSource::Type::HYBRID_KEY,
+        storageChannel,  // columnIndex within keys_ = storageChannel for keys
+        hybridData};
+  }
+
+  // Map dependent channels: storageChannel -> {HYBRID_PAYLOAD, columnIndex=payloadIndex}
+  for (size_t i = 0; i < dependentChannels_.size(); ++i) {
+    int32_t storageChannel = static_cast<int32_t>(keyChannels_.size() + i);
+    driverCtx->columnSourceMap[storageChannel] = ColumnSource{
+        ColumnSource::Type::HYBRID_PAYLOAD,
+        static_cast<int32_t>(i),  // columnIndex within owningInputs_ (0-based payload index)
+        hybridData};
+  }
+}
+
+void HashBuild::updateSourceMapForNWay() {
+  auto* driverCtx = operatorCtx_->driverCtx();
+  auto* hybridData = table_->hybridData();
+
+  // N-way path: Build a new columnSourceMap keyed by storageChannel.
+  // This is what HashProbe will use to extract columns.
+  //
+  // For key columns (storageChannel 0..k-1):
+  //   - Data lives in OUR keys_ RowContainer
+  //   - columnIndex = storageChannel (position in keys_)
+  //
+  // For payload columns (storageChannel k..k+p-1):
+  //   - Data lives in UPSTREAM containers (we don't store payloads)
+  //   - Need to look up the original source from inputChannel-keyed map
+  //   - The original source's columnIndex is already correct
+
+  // First, build a mapping from inputChannel -> old ColumnSource
+  // (the current driverCtx->columnSourceMap is keyed by inputChannel from upstream)
+  auto& inputChannelMap = driverCtx->columnSourceMap;
+
+  // Create new map keyed by storageChannel
+  ColumnSourceMap storageChannelMap;
+
+  // Map key columns: our keys_ container
+  // Also, if the key came from an upstream payload (HYBRID_PAYLOAD or PROBE_PAYLOAD),
+  // clear that payload column to free memory (the data is now in our keys_)
+  for (size_t i = 0; i < keyChannels_.size(); ++i) {
+    int32_t inputChannel = keyChannels_[i];
+    int32_t storageChannel = static_cast<int32_t>(i);
+    
+    // Check if this key was extracted from an upstream payload
+    auto it = inputChannelMap.find(inputChannel);
+    if (it != inputChannelMap.end()) {
+      if (it->second.type == ColumnSource::Type::HYBRID_PAYLOAD) {
+        // Clear the payload column in upstream HybridContainer to free memory
+        // The upstream container should have called coalesceBatches() already
+        auto* upstreamContainer = it->second.hybridContainer();
+        upstreamContainer->clearPayloadColumn(it->second.columnIndex);
+      } else if (it->second.type == ColumnSource::Type::PROBE_PAYLOAD) {
+        // Clear the payload column in upstream ProbePayloadContainer to free memory
+        auto* probeContainer = it->second.probePayloadContainer();
+        probeContainer->clearColumn(it->second.columnIndex);
+      }
+      // Note: HYBRID_KEY columns cannot be cleared (RowContainer doesn't support it)
+    }
+    
+    storageChannelMap[storageChannel] = ColumnSource{
+        ColumnSource::Type::HYBRID_KEY,
+        storageChannel,  // columnIndex in our keys_
+        hybridData};
+  }
+
+  // Map payload columns: find original source by inputChannel, remap to storageChannel
+  // dependentChannels_[i] = inputChannel for payload i
+  // storageChannel for payload i = keyChannels_.size() + i
+  for (size_t i = 0; i < dependentChannels_.size(); ++i) {
+    int32_t storageChannel = static_cast<int32_t>(keyChannels_.size() + i);
+    int32_t inputChannel = dependentChannels_[i];
+    
+    auto it = inputChannelMap.find(inputChannel);
+    BOLT_CHECK(
+        it != inputChannelMap.end(),
+        "N-way late-m: inputChannel {} for storageChannel {} not found in upstream columnSourceMap",
+        inputChannel,
+        storageChannel);
+    // Payload data is in upstream container - keep the original source
+    storageChannelMap[storageChannel] = it->second;
+  }
+
+  // Replace the columnSourceMap with the new storageChannel-keyed map
+  driverCtx->columnSourceMap = std::move(storageChannelMap);
+
+  // Update the columnSourceMap stored in HybridContainer
+  hybridData->mutableColumnSourceMap() = driverCtx->columnSourceMap;
 }
 
 } // namespace bytedance::bolt::exec

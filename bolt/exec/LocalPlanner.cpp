@@ -394,6 +394,137 @@ uint32_t maxDrivers(
   }
   return count;
 }
+
+/// Detects N-way join patterns where a HashJoin's output becomes another
+/// HashJoin's build input. When detected, marks factories for late
+/// materialization.
+///
+/// Pattern: HashJoin₁ output → HashJoin₂ build side (source[1])
+///
+/// For a chain like A ⋈ (B ⋈ C), the final HashJoin (⋈₂) is where
+/// materialization should happen.
+void detectNWayJoinChains(
+    const core::PlanNodePtr& root,
+    std::vector<std::unique_ptr<DriverFactory>>& factories) {
+  // Map from plan node ID to factory index
+  std::unordered_map<core::PlanNodeId, size_t> nodeIdToFactory;
+  for (size_t i = 0; i < factories.size(); ++i) {
+    for (const auto& node : factories[i]->planNodes) {
+      nodeIdToFactory[node->id()] = i;
+    }
+  }
+
+  // Find all HashJoinNodes whose build side (source[1]) is also a HashJoinNode
+  // Traverse the entire plan tree
+  std::function<void(
+      const core::PlanNodePtr&,
+      std::unordered_set<core::PlanNodeId>& chainNodes,
+      core::PlanNodeId& materializationNodeId)>
+      findChains;
+
+  // All chain nodes and their materialization point
+  std::unordered_set<core::PlanNodeId> allChainNodeIds;
+  std::unordered_map<core::PlanNodeId, core::PlanNodeId>
+      nodeToMaterializationPoint;
+
+  // First pass: identify N-way join chains
+  // We look for patterns where a HashJoinNode's source[1] (build side)
+  // contains or leads to another HashJoinNode
+  std::function<void(const core::PlanNodePtr&, const core::PlanNodeId*)>
+      traversePlan;
+  traversePlan = [&](const core::PlanNodePtr& node,
+                     const core::PlanNodeId* outerJoinId) {
+    if (!node) {
+      return;
+    }
+
+    if (auto hashJoin =
+            std::dynamic_pointer_cast<const core::HashJoinNode>(node)) {
+      // This HashJoin node is a candidate for materialization point if
+      // its probe side is the current outerJoin (meaning we're in its
+      // build subtree)
+      const core::PlanNodeId* materializationPoint =
+          outerJoinId ? outerJoinId : &hashJoin->id();
+
+      // Check if this join's build side contains another HashJoin
+      auto buildSource = hashJoin->sources().size() > 1
+          ? hashJoin->sources()[1]
+          : nullptr;
+
+      if (buildSource) {
+        // Check if buildSource itself is a HashJoin or contains one
+        std::function<bool(const core::PlanNodePtr&)> hasBuildSideJoin;
+        hasBuildSideJoin = [&](const core::PlanNodePtr& n) -> bool {
+          if (!n)
+            return false;
+          if (std::dynamic_pointer_cast<const core::HashJoinNode>(n)) {
+            return true;
+          }
+          for (const auto& src : n->sources()) {
+            if (hasBuildSideJoin(src))
+              return true;
+          }
+          return false;
+        };
+
+        if (hasBuildSideJoin(buildSource)) {
+          // Found N-way pattern! This join and all joins in its build subtree
+          // should have late-m enabled
+          allChainNodeIds.insert(hashJoin->id());
+          nodeToMaterializationPoint[hashJoin->id()] = *materializationPoint;
+
+          // Mark all HashJoins in the build subtree
+          std::function<void(const core::PlanNodePtr&)> markBuildSubtree;
+          markBuildSubtree = [&](const core::PlanNodePtr& n) {
+            if (!n)
+              return;
+            if (auto innerJoin =
+                    std::dynamic_pointer_cast<const core::HashJoinNode>(n)) {
+              allChainNodeIds.insert(innerJoin->id());
+              nodeToMaterializationPoint[innerJoin->id()] =
+                  *materializationPoint;
+            }
+            for (const auto& src : n->sources()) {
+              markBuildSubtree(src);
+            }
+          };
+          markBuildSubtree(buildSource);
+
+          // Continue traversing build side with current materialization point
+          traversePlan(buildSource, materializationPoint);
+        } else {
+          // No N-way pattern on build side, continue normally
+          traversePlan(buildSource, nullptr);
+        }
+      }
+
+      // Traverse probe side (source[0]) - new chain starts here
+      if (!hashJoin->sources().empty()) {
+        traversePlan(hashJoin->sources()[0], nullptr);
+      }
+    } else {
+      // Not a HashJoin - continue traversing all sources
+      for (const auto& src : node->sources()) {
+        traversePlan(src, outerJoinId);
+      }
+    }
+  };
+
+  traversePlan(root, nullptr);
+
+  // Second pass: mark factories
+  for (size_t i = 0; i < factories.size(); ++i) {
+    for (const auto& node : factories[i]->planNodes) {
+      auto it = nodeToMaterializationPoint.find(node->id());
+      if (it != nodeToMaterializationPoint.end()) {
+        factories[i]->nWayJoinLateMEnabled = true;
+        factories[i]->nWayMaterializationPlanNodeId = it->second;
+        break; // Factory marked, move to next factory
+      }
+    }
+  }
+}
+
 } // namespace detail
 
 // static
@@ -444,6 +575,11 @@ void LocalPlanner::plan(
         queryConfig.exceptionTraceLevel());
     process::ExceptionTraceContext::get_instance().set_whitelist(
         queryConfig.exceptionTraceWhitelist());
+  }
+
+  // Detect N-way join chains for late materialization (only if enabled)
+  if (queryConfig.lateMaterializationEnabled()) {
+    detail::detectNWayJoinChains(planFragment.planNode, *driverFactories);
   }
 
   (*driverFactories)[0]->outputDriver = true;
@@ -593,6 +729,13 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     std::shared_ptr<LocalExchangeQueue> primedQueue) {
   auto driver = std::shared_ptr<Driver>(new Driver());
   ctx->driver = driver.get();
+
+  // Propagate N-way join late materialization settings to DriverCtx
+  if (nWayJoinLateMEnabled) {
+    ctx->buildSideLateMEnabled = true;
+    ctx->materializationPlanNodeId = nWayMaterializationPlanNodeId;
+  }
+
   std::vector<std::unique_ptr<Operator>> operators;
   operators.reserve(planNodes.size());
   bool markSkipProject = false;

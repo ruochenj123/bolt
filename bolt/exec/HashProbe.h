@@ -675,6 +675,39 @@ class HashProbe : public Operator {
   RowTypePtr matchFlagType_{nullptr};
   RowVectorPtr accumulatedMatchFlag_{nullptr};
   RowVectorPtr tmpMatchFlagForFilter_{nullptr};
+
+  // === N-way Late Materialization Support ===
+
+  /// True if this probe is part of an N-way late-m chain (not base table input)
+  bool isNWayLateMInput_{false};
+
+  /// True if this probe outputs to downstream HashBuild (not final materialization)
+  bool isNWayLateMOutput_{false};
+
+  /// Driver ID for encoding probe row IDs
+  uint8_t driverId_{0};
+
+  /// Base row count for encoding probe row IDs (accumulated across batches)
+  uint64_t probeRowIdBase_{0};
+
+  /// Container for probe-side payload columns (for N-way late-m)
+  /// Shared ownership because downstream HybridContainer references it after merge
+  std::shared_ptr<ProbePayloadContainer> probePayloadContainer_;
+
+  /// Pre-computed payload type for ProbePayloadContainer batches
+  RowTypePtr probePayloadType_;
+
+  /// Flag to ensure columnSourceMap is updated only once
+  bool columnSourceMapUpdated_{false};
+
+  /// Update columnSourceMap for output: remap storageChannel → outputChannel
+  void updateColumnSourceMapForOutput();
+
+  /// Fill output for N-way late-m path (pass rowIds instead of materializing)
+  void fillOutputLateMaterialization(vector_size_t size);
+
+  /// Fill output for final late-m materialization (extract from all sources)
+  void fillOutputFinalMaterialization(vector_size_t size);
 };
 
 inline std::ostream& operator<<(std::ostream& os, ProbeOperatorState state) {

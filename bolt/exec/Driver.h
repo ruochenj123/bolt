@@ -44,7 +44,13 @@
 #include "bolt/core/QueryCtx.h"
 #include "bolt/exec/Spiller.h"
 #include "bolt/exec/TraceConfig.h"
+
 namespace bytedance::bolt::exec {
+
+// Forward declarations for late materialization
+class HybridContainer;
+class ProbePayloadContainer;
+struct ColumnSource;
 
 class Driver;
 class ExchangeClient;
@@ -292,6 +298,49 @@ struct DriverCtx {
   std::unordered_map<int32_t, std::string> tracedOperatorMap;
 
   const bool isAbtestControlGroup;
+
+  // === Late Materialization State ===
+
+  /// Whether build-side late-m is enabled for this pipeline
+  bool buildSideLateMEnabled = false;
+
+  /// Column source metadata: output channel → source location
+  /// Passed from HashProbe to HashBuild, updated as columns are extracted
+  std::unordered_map<int32_t, ColumnSource> columnSourceMap;
+
+  /// Upstream row pointers for current batch (build side)
+  /// These are char* pointers directly into upstream HybridContainer rows
+  std::vector<char*> buildSideLateMBuildRowPtrs;
+
+  /// Upstream probe row IDs for current batch
+  /// Encoded as (driverId << 56) | localRowIndex
+  std::vector<uint64_t> buildSideLateMProbeRowIds;
+
+  /// Shared ownership of upstream containers (keeps char* pointers valid)
+  std::unordered_map<uint8_t, std::shared_ptr<HybridContainer>>
+      buildSideLateMUpstreamBuildContainers;
+  std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>
+      buildSideLateMUpstreamProbePayloads;
+
+  /// Plan node ID where materialization should happen (final probe)
+  std::string materializationPlanNodeId;
+
+  /// Clear batch-level state between batches
+  void clearBatchState() {
+    buildSideLateMBuildRowPtrs.clear();
+    buildSideLateMProbeRowIds.clear();
+  }
+
+  /// Clear all late-m state (called at pipeline end)
+  void clearLateMaterializationState() {
+    buildSideLateMEnabled = false;
+    columnSourceMap.clear();
+    buildSideLateMBuildRowPtrs.clear();
+    buildSideLateMProbeRowIds.clear();
+    buildSideLateMUpstreamBuildContainers.clear();
+    buildSideLateMUpstreamProbePayloads.clear();
+    materializationPlanNodeId.clear();
+  }
 
   DriverCtx(
       std::shared_ptr<Task> _task,
@@ -623,6 +672,16 @@ struct DriverFactory {
   folly::F14FastSet<core::PlanNodeId> mixedExecutionModeHashJoinNodeIds;
   /// Same as 'mixedExecutionModeHashJoinNodeIds' but for Nested Loop Joins.
   folly::F14FastSet<core::PlanNodeId> mixedExecutionModeNestedLoopJoinNodeIds;
+
+  // === N-way Join Late Materialization ===
+
+  /// Whether this pipeline participates in an N-way join chain where
+  /// build-side late materialization is enabled.
+  bool nWayJoinLateMEnabled{false};
+
+  /// For N-way join chains, the plan node ID where final materialization
+  /// should happen (the outermost HashProbe in the chain).
+  core::PlanNodeId nWayMaterializationPlanNodeId;
 
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,

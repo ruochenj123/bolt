@@ -1852,6 +1852,28 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     for (auto& table : otherTables_)
       hybridDataChannel[table->hybridData()->getId()] = table->hybridData();
     hybridData_->setAllContainers(hybridDataChannel);
+
+    // For N-way late-m: merge upstream ProbePayloadContainers
+    // Collect all ProbePayloadContainers from all merged tables and call
+    // setAllContainers on each one to enable cross-driver extraction
+    const auto& myProbePayloads = hybridData_->getUpstreamProbePayloads();
+    if (!myProbePayloads.empty()) {
+      // Build merged map of all probe payload containers
+      std::unordered_map<uint8_t, ProbePayloadContainer*> allProbePayloads;
+      for (const auto& [driverId, container] : myProbePayloads) {
+        allProbePayloads[driverId] = container.get();
+      }
+      for (auto& table : otherTables_) {
+        for (const auto& [driverId, container] :
+             table->hybridData()->getUpstreamProbePayloads()) {
+          allProbePayloads[driverId] = container.get();
+        }
+      }
+      // Set allContainers on each ProbePayloadContainer for cross-driver extraction
+      for (auto& [_, container] : allProbePayloads) {
+        container->setAllContainers(allProbePayloads);
+      }
+    }
   }
 
   bool useValueIds = mayUseValueIds(*this);
