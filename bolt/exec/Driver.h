@@ -33,6 +33,7 @@
 #include <folly/futures/Future.h>
 #include <folly/portability/SysSyscall.h>
 #include <memory>
+#include <set>
 
 #include <folly/Random.h>
 #include "bolt/common/future/BoltPromise.h"
@@ -48,6 +49,7 @@
 namespace bytedance::bolt::exec {
 
 // Forward declarations for late materialization
+class BaseHashTable;
 class HybridContainer;
 class ProbePayloadContainer;
 struct ColumnSource;
@@ -316,14 +318,26 @@ struct DriverCtx {
   /// Encoded as (driverId << 56) | localRowIndex
   std::vector<uint64_t> buildSideLateMProbeRowIds;
 
-  /// Shared ownership of upstream containers (keeps char* pointers valid)
-  std::unordered_map<uint8_t, std::shared_ptr<HybridContainer>>
-      buildSideLateMUpstreamBuildContainers;
+  /// The primary upstream hash table - keeps the table alive so row pointers remain valid.
+  /// This is the build-side hash table from the current probe operation.
+  std::shared_ptr<BaseHashTable> primaryUpstreamHashTable;
+
+  /// The primary upstream build container - the one that buildSideLateMBuildRowPtrs point into.
+  /// This is the build-side container from the current probe operation.
+  std::shared_ptr<HybridContainer> primaryUpstreamBuildContainer;
+
+  /// Shared ownership of upstream probe payloads (for cross-driver access)
   std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>
       buildSideLateMUpstreamProbePayloads;
 
   /// Plan node ID where materialization should happen (final probe)
   std::string materializationPlanNodeId;
+
+  /// For N-way late-m: output channels that are keys for downstream HashBuild.
+  /// Keyed by HashProbe's plan node ID. Only these channels need to be materialized
+  /// in intermediate probe outputs. Empty set means materialize all (final probe).
+  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
+      downstreamBuildKeyChannels;
 
   /// Clear batch-level state between batches
   void clearBatchState() {
@@ -337,7 +351,8 @@ struct DriverCtx {
     columnSourceMap.clear();
     buildSideLateMBuildRowPtrs.clear();
     buildSideLateMProbeRowIds.clear();
-    buildSideLateMUpstreamBuildContainers.clear();
+    primaryUpstreamHashTable.reset();
+    primaryUpstreamBuildContainer.reset();
     buildSideLateMUpstreamProbePayloads.clear();
     materializationPlanNodeId.clear();
   }
@@ -682,6 +697,11 @@ struct DriverFactory {
   /// For N-way join chains, the plan node ID where final materialization
   /// should happen (the outermost HashProbe in the chain).
   core::PlanNodeId nWayMaterializationPlanNodeId;
+
+  /// For N-way late-m: output channels of HashProbe that are keys for downstream
+  /// HashBuild. Keyed by the HashProbe's plan node ID.
+  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
+      nWayDownstreamBuildKeyChannels;
 
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,

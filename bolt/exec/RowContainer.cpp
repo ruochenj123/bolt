@@ -1480,7 +1480,8 @@ HybridContainer::HybridContainer(
       payloadTypes_(payloadTypes),
       numKeys_(keyTypes_.size()),
       keys_(rows) {
-  BOLT_CHECK(!payloadTypes_.empty());
+  // For N-way late-m, payloadTypes can be empty - we only store keys and refs
+  // BOLT_CHECK(!payloadTypes_.empty());
   rowIdColumnOffset_ = keys_->columnAt(keyTypes.size()).offset();
   isNullable_.resize(payloadTypes_.size(), false);
   types_.reserve(keyTypes_.size() + payloadTypes_.size());

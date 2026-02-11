@@ -744,6 +744,7 @@ _build/Release/bolt/benchmarks/tpch/bolt_tpch_benchmark \
 
 ### 13.3 Baseline Comparison
 
+Baseline:
 ```bash
 _build/Release/bolt/benchmarks/tpch/bolt_tpch_benchmark \
   --run_query_verbose=27 \
@@ -753,7 +754,16 @@ _build/Release/bolt/benchmarks/tpch/bolt_tpch_benchmark \
   --hybrid_sort_enabled=false \
   --data_path=/home/jiang.2091/velox_join/data/tpch_parquet/sf3_hive
 ```
-
+Hybrid-only:
+```bash
+_build/Release/bolt/benchmarks/tpch/bolt_tpch_benchmark \
+  --run_query_verbose=27 \
+  --num_drivers=4 \
+  --late_materialization_enabled=false \
+  --hybrid_join_enabled=true \
+  --hybrid_sort_enabled=true \
+  --data_path=/home/jiang.2091/velox_join/data/tpch_parquet/sf3_hive
+```
 ---
 
 ## 14. Example Data Flow (Q27)
@@ -818,3 +828,56 @@ _build/Release/bolt/benchmarks/tpch/bolt_tpch_benchmark \
 │ Output: final query result                                          │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+
+---
+
+## 15. Future Optimizations
+
+This section lists potential optimizations to improve N-way late materialization performance.
+
+### 15.1 Ownership Model Simplification
+
+**Current State**: To keep upstream row pointers (`upstreamBuildRowPtrs_`) valid, we store both:
+- `primaryUpstreamHashTable_` (shared_ptr<BaseHashTable>)
+- `primaryUpstreamBuildContainer_` (shared_ptr<HybridContainer>)
+
+This is redundant because the ownership chain is:
+```
+BaseHashTable
+  └── owns RowContainer (unique_ptr)
+  └── owns HybridContainer (unique_ptr hybridData_)
+        └── raw pointer to RowContainer (keys_)
+```
+
+Since `char*` row pointers point into RowContainer (owned by BaseHashTable), we must keep the entire hash table alive even though we only need the container.
+
+**TODO**: Refactor HybridContainer to take shared ownership of its RowContainer, eliminating the need to store `primaryUpstreamHashTable_`. This would:
+- Simplify lifetime management
+- Reduce memory footprint (no need to keep full BaseHashTable alive)
+- Make the ownership model more intuitive
+
+### 15.2 Reduce Upstream Reference Storage Overhead
+
+**Current State**: `upstreamBuildRowPtrs_` stores raw pointers and `upstreamProbeRowIds_` stores encoded IDs for every build row, which can be significant for large joins.
+
+**TODO**: Investigate storing offsets instead of pointers (relative to a base), or using compressed representations for row references.
+
+### 15.3 Batch-Level Extraction Optimization
+
+**Current State**: `extractColumnsFromUpstream` processes all output rows in a single call, which may cause cache pressure for very large batches.
+
+**TODO**: Implement chunked extraction that processes rows in cache-friendly batch sizes while maintaining the single-pass extraction semantics.
+
+### 15.4 Selective Column Extraction
+
+**Current State**: All columns in the ColumnSourceMap are extracted, even if some are not needed by downstream operators.
+
+**TODO**: Integrate with projection pushdown to only extract columns actually used by downstream operators (OrderBy, Filter, Project).
+
+### 15.5 Parallel Cross-Container Extraction
+
+**Current State**: Extraction from multiple upstream containers is done serially.
+
+**TODO**: For large result sets with many containers, parallelize extraction across containers to utilize multiple cores.
+

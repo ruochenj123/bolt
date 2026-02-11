@@ -406,12 +406,17 @@ uint32_t maxDrivers(
 void detectNWayJoinChains(
     const core::PlanNodePtr& root,
     std::vector<std::unique_ptr<DriverFactory>>& factories) {
+  LOG(INFO) << "detectNWayJoinChains: Starting with " << factories.size() << " factories";
+  
   // Map from plan node ID to factory index
   std::unordered_map<core::PlanNodeId, size_t> nodeIdToFactory;
   for (size_t i = 0; i < factories.size(); ++i) {
+    std::string nodeIds;
     for (const auto& node : factories[i]->planNodes) {
       nodeIdToFactory[node->id()] = i;
+      nodeIds += node->id() + "(" + std::string(node->name()) + ") ";
     }
+    LOG(INFO) << "  Factory " << i << " planNodes: " << nodeIds;
   }
 
   // Find all HashJoinNodes whose build side (source[1]) is also a HashJoinNode
@@ -426,14 +431,19 @@ void detectNWayJoinChains(
   std::unordered_set<core::PlanNodeId> allChainNodeIds;
   std::unordered_map<core::PlanNodeId, core::PlanNodeId>
       nodeToMaterializationPoint;
+  
+  // Map from HashProbe's plan node ID to the set of output channels that are
+  // keys for the downstream HashBuild
+  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
+      probeToDownstreamKeyChannels;
 
   // First pass: identify N-way join chains
   // We look for patterns where a HashJoinNode's source[1] (build side)
   // contains or leads to another HashJoinNode
-  std::function<void(const core::PlanNodePtr&, const core::PlanNodeId*)>
+  std::function<void(const core::PlanNodePtr&, const core::HashJoinNode*)>
       traversePlan;
   traversePlan = [&](const core::PlanNodePtr& node,
-                     const core::PlanNodeId* outerJoinId) {
+                     const core::HashJoinNode* outerJoin) {
     if (!node) {
       return;
     }
@@ -443,8 +453,8 @@ void detectNWayJoinChains(
       // This HashJoin node is a candidate for materialization point if
       // its probe side is the current outerJoin (meaning we're in its
       // build subtree)
-      const core::PlanNodeId* materializationPoint =
-          outerJoinId ? outerJoinId : &hashJoin->id();
+      const core::HashJoinNode* materializationJoin =
+          outerJoin ? outerJoin : hashJoin.get();
 
       // Check if this join's build side contains another HashJoin
       auto buildSource = hashJoin->sources().size() > 1
@@ -471,27 +481,54 @@ void detectNWayJoinChains(
           // Found N-way pattern! This join and all joins in its build subtree
           // should have late-m enabled
           allChainNodeIds.insert(hashJoin->id());
-          nodeToMaterializationPoint[hashJoin->id()] = *materializationPoint;
+          nodeToMaterializationPoint[hashJoin->id()] = materializationJoin->id();
 
-          // Mark all HashJoins in the build subtree
-          std::function<void(const core::PlanNodePtr&)> markBuildSubtree;
-          markBuildSubtree = [&](const core::PlanNodePtr& n) {
+          // Mark all HashJoins in the build subtree and compute downstream keys
+          std::function<void(const core::PlanNodePtr&, const core::HashJoinNode*)>
+              markBuildSubtree;
+          markBuildSubtree = [&](const core::PlanNodePtr& n,
+                                 const core::HashJoinNode* parentJoin) {
             if (!n)
               return;
             if (auto innerJoin =
                     std::dynamic_pointer_cast<const core::HashJoinNode>(n)) {
               allChainNodeIds.insert(innerJoin->id());
               nodeToMaterializationPoint[innerJoin->id()] =
-                  *materializationPoint;
-            }
-            for (const auto& src : n->sources()) {
-              markBuildSubtree(src);
+                  materializationJoin->id();
+              
+              // Compute downstream key channels for this inner join's HashProbe.
+              // The parent join's rightKeys() reference columns from inner join's output.
+              // We need to map key names to output channel indices.
+              if (parentJoin) {
+                std::set<column_index_t> keyChannels;
+                auto innerOutputType = innerJoin->outputType();
+                for (const auto& keyExpr : parentJoin->rightKeys()) {
+                  auto keyName = keyExpr->name();
+                  auto channelOpt = innerOutputType->getChildIdxIfExists(keyName);
+                  if (channelOpt.has_value()) {
+                    keyChannels.insert(static_cast<column_index_t>(*channelOpt));
+                    LOG(INFO) << "detectNWayJoinChains: Inner join " << innerJoin->id()
+                              << " output channel " << *channelOpt << " ('" << keyName
+                              << "') is key for downstream " << parentJoin->id();
+                  }
+                }
+                probeToDownstreamKeyChannels[innerJoin->id()] = std::move(keyChannels);
+              }
+              
+              // Continue marking this join's build subtree with this join as parent
+              for (const auto& src : n->sources()) {
+                markBuildSubtree(src, innerJoin.get());
+              }
+            } else {
+              for (const auto& src : n->sources()) {
+                markBuildSubtree(src, parentJoin);
+              }
             }
           };
-          markBuildSubtree(buildSource);
+          markBuildSubtree(buildSource, hashJoin.get());
 
-          // Continue traversing build side with current materialization point
-          traversePlan(buildSource, materializationPoint);
+          // Continue traversing build side with current materialization join
+          traversePlan(buildSource, materializationJoin);
         } else {
           // No N-way pattern on build side, continue normally
           traversePlan(buildSource, nullptr);
@@ -505,7 +542,7 @@ void detectNWayJoinChains(
     } else {
       // Not a HashJoin - continue traversing all sources
       for (const auto& src : node->sources()) {
-        traversePlan(src, outerJoinId);
+        traversePlan(src, outerJoin);
       }
     }
   };
@@ -519,6 +556,13 @@ void detectNWayJoinChains(
       if (it != nodeToMaterializationPoint.end()) {
         factories[i]->nWayJoinLateMEnabled = true;
         factories[i]->nWayMaterializationPlanNodeId = it->second;
+        
+        // Also set downstream key channels for this node if available
+        auto keyIt = probeToDownstreamKeyChannels.find(node->id());
+        if (keyIt != probeToDownstreamKeyChannels.end()) {
+          factories[i]->nWayDownstreamBuildKeyChannels[node->id()] =
+              keyIt->second;
+        }
         break; // Factory marked, move to next factory
       }
     }
@@ -734,6 +778,7 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
   if (nWayJoinLateMEnabled) {
     ctx->buildSideLateMEnabled = true;
     ctx->materializationPlanNodeId = nWayMaterializationPlanNodeId;
+    ctx->downstreamBuildKeyChannels = nWayDownstreamBuildKeyChannels;
   }
 
   std::vector<std::unique_ptr<Operator>> operators;

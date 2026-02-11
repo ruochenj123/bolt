@@ -79,13 +79,17 @@ RowTypePtr makeTableType(
 
 // Copy values from 'rows' of 'table' according to 'projections' in
 // 'result'. Reuses 'result' children where possible.
+// 'allowSorting': If false, disables sorting even if the hybridData supports it.
+// This is needed when the caller also has probe-side columns that won't be
+// reordered - we must keep build-side and probe-side in the same order.
 void extractColumns(
     BaseHashTable* table,
     folly::Range<char**> rows,
     folly::Range<const IdentityProjection*> projections,
     memory::MemoryPool* pool,
     const std::vector<TypePtr>& resultTypes,
-    std::vector<VectorPtr>& resultVectors) {
+    std::vector<VectorPtr>& resultVectors,
+    bool allowSorting = true) {
   BOLT_CHECK_EQ(resultTypes.size(), resultVectors.size())
   auto hybridData = table->hybridData();
   if (hybridData != nullptr) {
@@ -97,8 +101,9 @@ void extractColumns(
     // For multiple containers, sort by containerId for better cache locality.
     // Note: sorting is safe here because the output order of hash join results
     // does not need to match any specific order (SQL doesn't guarantee order).
-    // Sorting can be disabled via query config for deterministic testing.
-    const bool useSorting = hybridData->shouldUseSorting();
+    // Sorting can be disabled via query config for deterministic testing,
+    // or disabled by caller when probe-side columns must stay in sync.
+    const bool useSorting = allowSorting && hybridData->shouldUseSorting();
 
     const char* const* extractRows = rows.data();
     std::vector<HybridRowId>* extractRowIds = &outputRowIds;
@@ -211,6 +216,11 @@ HashProbe::HashProbe(
   isNWayLateMOutput_ = driverCtx->buildSideLateMEnabled &&
       !driverCtx->materializationPlanNodeId.empty() &&
       driverCtx->materializationPlanNodeId != planNodeId();
+
+  // Precompute whether this is the final materialization point
+  isFinalMaterializationProbe_ = driverCtx->buildSideLateMEnabled &&
+      !driverCtx->materializationPlanNodeId.empty() &&
+      driverCtx->materializationPlanNodeId == planNodeId();
 }
 
 void HashProbe::initialize() {
@@ -283,32 +293,51 @@ void HashProbe::initialize() {
     selfContainer[driverId_] = probePayloadContainer_.get();
     probePayloadContainer_->setAllContainers(selfContainer);
 
-    // Pre-compute payload schema (column names and types)
-    std::vector<std::string> payloadNames;
-    std::vector<TypePtr> payloadTypes;
-    payloadNames.reserve(projectedInputColumns_.size());
-    payloadTypes.reserve(projectedInputColumns_.size());
-
-    for (auto projection : projectedInputColumns_) {
-      payloadNames.push_back(probeType_->nameOf(projection.inputChannel));
-      payloadTypes.push_back(probeType_->childAt(projection.inputChannel));
-    }
-    probePayloadType_ = ROW(std::move(payloadNames), std::move(payloadTypes));
-
     // Register container in DriverCtx for downstream HashBuild access
     // This enables cross-driver extraction after table merge
     auto* driverCtx = operatorCtx_->driverCtx();
     driverCtx->buildSideLateMUpstreamProbePayloads[driverId_] = probePayloadContainer_;
 
-    // Update columnSourceMap: add PROBE_PAYLOAD entries for probe columns
-    // This is done once during initialization
-    for (size_t i = 0; i < projectedInputColumns_.size(); ++i) {
-      int32_t outputChannel = projectedInputColumns_[i].outputChannel;
-      driverCtx->columnSourceMap[outputChannel] = ColumnSource{
-          ColumnSource::Type::PROBE_PAYLOAD,
-          static_cast<int32_t>(i),
-          probePayloadContainer_.get()};
+    // Precompute which output channels are keys for downstream HashBuild
+    auto keyMapIt = driverCtx->downstreamBuildKeyChannels.find(planNodeId());
+    if (keyMapIt != driverCtx->downstreamBuildKeyChannels.end()) {
+      downstreamKeyOutputChannels_ = keyMapIt->second;
     }
+    // If empty, all columns will be materialized (conservative fallback)
+
+    // Precompute probe-side key vs payload (non-key) projections
+    for (const auto& projection : projectedInputColumns_) {
+      if (downstreamKeyOutputChannels_.empty() ||
+          downstreamKeyOutputChannels_.count(projection.outputChannel) > 0) {
+        probeKeyProjections_.push_back(projection);
+      } else {
+        // Non-key columns: only stored in ProbePayloadContainer
+        probePayloadProjections_.push_back(projection);
+      }
+    }
+
+    // Precompute build-side key projections and channel mapping
+    for (const auto& projection : tableOutputProjections_) {
+      if (downstreamKeyOutputChannels_.empty() ||
+          downstreamKeyOutputChannels_.count(projection.outputChannel) > 0) {
+        buildKeyProjections_.push_back(projection);
+        buildKeyChannelMapping_.emplace_back(
+            projection.inputChannel, projection.outputChannel);
+      }
+    }
+
+    // Now compute payload schema for ProbePayloadContainer (non-key probe columns only)
+    std::vector<std::string> payloadNames;
+    std::vector<TypePtr> payloadTypes;
+    payloadNames.reserve(probePayloadProjections_.size());
+    payloadTypes.reserve(probePayloadProjections_.size());
+
+    for (const auto& projection : probePayloadProjections_) {
+      payloadNames.push_back(probeType_->nameOf(projection.inputChannel));
+      payloadTypes.push_back(probeType_->childAt(projection.inputChannel));
+    }
+    probePayloadType_ = ROW(std::move(payloadNames), std::move(payloadTypes));
+    // Note: columnSourceMap is updated in updateColumnSourceMapForOutput() when table_ is available
   }
 }
 
@@ -486,6 +515,16 @@ void HashProbe::asyncWaitForHashTable() {
 
   table_ = std::move(hashBuildResult->table);
   BOLT_CHECK_NOT_NULL(table_);
+
+  // Compute late-m output paths once now that table_ is available.
+  // Check if this table actually has late-m metadata (columnSourceMap).
+  // This handles cases where a probe shares DriverCtx with late-m enabled,
+  // but its table comes from a base TableScan (no late-m chain).
+  const bool tableHasLateMMetadata = table_->hybridData() &&
+      !table_->hybridData()->getColumnSourceMap().empty();
+
+  useLateMOutputPath_ = isNWayLateMOutput_ && tableHasLateMMetadata;
+  useFinalMaterializationPath_ = isFinalMaterializationProbe_ && tableHasLateMMetadata;
 
   maybeSetupSpillInput(
       hashBuildResult->restoredPartitionId,
@@ -948,18 +987,18 @@ void HashProbe::fillLeftSemiProjectMatchColumn(vector_size_t size) {
 }
 
 void HashProbe::fillOutput(vector_size_t size) {
-  // N-way late materialization paths
-  if (isNWayLateMOutput_) {
+  // N-way late materialization paths - flags precomputed in asyncWaitForHashTable()
+  if (useLateMOutputPath_) {
     // Intermediate probe: pass rowIds downstream instead of materializing
     fillOutputLateMaterialization(size);
     return;
   }
 
-  auto* driverCtx = operatorCtx_->driverCtx();
-  if (driverCtx->buildSideLateMEnabled &&
-      driverCtx->materializationPlanNodeId == planNodeId() &&
-      !driverCtx->columnSourceMap.empty()) {
+  if (useFinalMaterializationPath_) {
     // Final probe: do full materialization from all sources
+    // Copy columnSourceMap from hash table to DriverCtx for fillOutputFinalMaterialization
+    auto* driverCtx = operatorCtx_->driverCtx();
+    driverCtx->columnSourceMap = table_->hybridData()->getColumnSourceMap();
     fillOutputFinalMaterialization(size);
     return;
   }
@@ -995,13 +1034,16 @@ void HashProbe::fillOutput(vector_size_t size) {
       // get dictionary raw value
       RowVectorPtr dictOutput = std::static_pointer_cast<RowVector>(
           BaseVector::create(outputType_, numDistinct, pool()));
+      // Disable sorting when there are probe columns to keep build and probe in sync.
+      const bool hasProbeColumns = !projectedInputColumns_.empty();
       extractColumns(
           table_.get(),
           folly::Range<char**>(distinctRows.data(), numDistinct),
           tableOutputProjections_,
           pool(),
           outputType_->children(),
-          dictOutput->children());
+          dictOutput->children(),
+          /*allowSorting=*/!hasProbeColumns);
 
       // calculate dictionary index
       BufferPtr indexBuffer;
@@ -1014,13 +1056,16 @@ void HashProbe::fillOutput(vector_size_t size) {
             size, indexBuffer, dictOutput->childAt(projection.outputChannel));
       }
     } else {
+      // Disable sorting when there are probe columns to keep build and probe in sync.
+      const bool hasProbeColumns = !projectedInputColumns_.empty();
       extractColumns(
           table_.get(),
           folly::Range<char**>(outputTableRows_.data(), size),
           tableOutputProjections_,
           pool(),
           outputType_->children(),
-          output_->children());
+          output_->children(),
+          /*allowSorting=*/!hasProbeColumns);
     }
   }
 }
@@ -1461,7 +1506,8 @@ void HashProbe::applyFilterOnTableRowsForNullAwareJoin(
 
       // For single container, extract directly without sorting.
       // For multiple containers, sort by containerId for better cache locality.
-      const bool useSorting = hybridData->shouldUseSorting();
+      // const bool useSorting = hybridData->shouldUseSorting();
+      const bool useSorting = false;
       const char* const* extractRows = data;
       std::vector<HybridRowId>* extractRowIds = &outputRowIds;
       HybridContainer::SortedRows sorted;
@@ -1983,62 +2029,90 @@ void HashProbe::resetHashTable() {
 void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
   // Intermediate probe in N-way chain: pass rowIds downstream instead of materializing
   // Data flow:
-  // - Probe-side payloads → ProbePayloadContainer (tracked via columnSourceMap)
-  // - Build-side data → via buildSideLateMBuildRowPtrs (tracked via columnSourceMap)
-  // - Output RowVector is minimal (for framework compatibility)
+  // - For key columns (precomputed): materialize in output for downstream HashBuild
+  // - For non-key columns: store in containers only (deferred materialization)
+  // 
+  // Note: probeKeyProjections_, probePayloadProjections_, buildKeyProjections_,
+  // buildKeyChannelMapping_ are precomputed once in initialize()
 
   auto* driverCtx = operatorCtx_->driverCtx();
 
-  // 1. Store ALL probe-side input rows in ProbePayloadContainer
-  //    We store all rows (not just matched) because probeRowId encoding uses sequential indices.
-  //    The matched rows will be referenced via probeRowId in downstream.
-  if (probePayloadContainer_ && !projectedInputColumns_.empty()) {
-    // Build a batch containing probe payload columns for current input batch
-    std::vector<VectorPtr> payloadChildren;
-    payloadChildren.reserve(projectedInputColumns_.size());
-
-    for (auto projection : projectedInputColumns_) {
+  // 1. Store only NON-KEY probe columns in ProbePayloadContainer
+  //    (key columns are materialized in output, no need to duplicate)
+  if (!probePayloadProjections_.empty() && probePayloadContainer_) {
+    std::vector<VectorPtr> payloadColumns;
+    payloadColumns.reserve(probePayloadProjections_.size());
+    for (const auto& projection : probePayloadProjections_) {
       ensureLoadedIfNotAtEnd(projection.inputChannel);
-      payloadChildren.push_back(input_->childAt(projection.inputChannel));
+      payloadColumns.push_back(wrapChild(size, outputRowMapping_, input_->childAt(projection.inputChannel)));
     }
-
+    
     auto payloadBatch = std::make_shared<RowVector>(
-        pool(), probePayloadType_, nullptr, input_->size(), std::move(payloadChildren));
+        pool(),
+        probePayloadType_,
+        nullptr,
+        size,
+        std::move(payloadColumns));
+
     probePayloadContainer_->addBatch(payloadBatch);
   }
 
-  // 2. Set rowIds for downstream HashBuild (only for matched rows)
+  // 2. Set rowIds for downstream HashBuild
+  // probeRowIds are sequential indices into probePayloadContainer_.
+  // The payload batch was added with consecutive rows 0..size-1 at offset
+  // probePayloadContainer_->numRows() - size, so we need sequential IDs.
   driverCtx->buildSideLateMBuildRowPtrs.resize(size);
   driverCtx->buildSideLateMProbeRowIds.resize(size);
 
-  auto* rawMapping = outputRowMapping_->as<vector_size_t>();
-
   for (vector_size_t i = 0; i < size; ++i) {
-    // Build row pointer: directly from outputTableRows_
     driverCtx->buildSideLateMBuildRowPtrs[i] = outputTableRows_[i];
-
-    // Probe row ID: encode (driverId << 56) | localIndex
-    // localIndex is the absolute row index in input (probeRowIdBase_ + rawMapping[i])
+    // probeRowId is a sequential index into probePayloadContainer_
+    // (not an index into the input vector)
     uint64_t probeRowId = (static_cast<uint64_t>(driverId_) << 56) |
-        ((probeRowIdBase_ + rawMapping[i]) & ((1ULL << 56) - 1));
+        ((probeRowIdBase_ + i) & ((1ULL << 56) - 1));
     driverCtx->buildSideLateMProbeRowIds[i] = probeRowId;
   }
 
-  // Update probeRowIdBase for next input batch
-  probeRowIdBase_ += input_->size();
+  // Increment by the number of output rows added to probePayloadContainer_
+  probeRowIdBase_ += size;
 
-  // 3. Update columnSourceMap: remap build-side columns to outputChannel
-  //    Probe-side columnSourceMap already set in initialize()
+  // 3. Update columnSourceMap (once only, tracked by flag)
   updateColumnSourceMapForOutput();
 
-  // 4. Create minimal output RowVector for Driver compatibility
-  //    Only size is needed - HashBuild's late-m path doesn't access children
-  output_ = std::make_shared<RowVector>(
-      pool(),
-      outputType_,
-      nullptr,
-      size,
-      std::vector<VectorPtr>(outputType_->size()));
+  // 4. Prepare output and fill with selective materialization
+  prepareOutput(size);
+  
+  // 4a. Probe-side KEY columns: materialize directly into output_
+  for (const auto& projection : probeKeyProjections_) {
+    ensureLoadedIfNotAtEnd(projection.inputChannel);
+    output_->childAt(projection.outputChannel) = wrapChild(
+        size, outputRowMapping_, input_->childAt(projection.inputChannel));
+  }
+  // Non-key probe columns: in ProbePayloadContainer, output_ child stays nullptr
+  
+  // 4b. Build-side KEY columns: extract directly into output_ using precomputed mapping
+  if (!buildKeyChannelMapping_.empty()) {
+    // Pre-allocate output columns for build keys
+    for (const auto& projection : buildKeyProjections_) {
+      output_->childAt(projection.outputChannel) = BaseVector::create(
+          outputType_->childAt(projection.outputChannel), size, pool());
+    }
+
+    // Build row pointers for extraction
+    std::vector<char*> buildRowPtrs(outputTableRows_.begin(),
+                                     outputTableRows_.begin() + size);
+
+    // Extract key columns directly into output_ using channel mapping
+    HybridContainer::extractColumnsFromUpstream(
+        buildKeyChannelMapping_,
+        buildRowPtrs,
+        std::vector<uint64_t>{},
+        table_->hybridData(),
+        nullptr,
+        driverCtx->columnSourceMap,
+        output_);
+  }
+  // Non-key build columns: stay nullptr - tracked via columnSourceMap
 }
 
 void HashProbe::updateColumnSourceMapForOutput() {
@@ -2050,6 +2124,14 @@ void HashProbe::updateColumnSourceMapForOutput() {
 
   auto* driverCtx = operatorCtx_->driverCtx();
   auto* hybridData = table_->hybridData();
+
+  // Set the primary upstream hash table - keeps the table alive so row pointers remain valid.
+  // Also set the container pointer for extraction.
+  if (!driverCtx->primaryUpstreamHashTable) {
+    driverCtx->primaryUpstreamHashTable = table_;  // Keep hash table alive
+    driverCtx->primaryUpstreamBuildContainer = std::shared_ptr<HybridContainer>(
+        hybridData, [](HybridContainer*) {}); // non-deleting, hash table owns it
+  }
 
   // Create new columnSourceMap keyed by outputChannel
   ColumnSourceMap outputChannelMap;
@@ -2077,15 +2159,15 @@ void HashProbe::updateColumnSourceMapForOutput() {
     }
   }
 
-  // For probe-side columns in output: add PROBE_PAYLOAD entries
-  // pointing to probePayloadContainer_ with column index
-  if (probePayloadContainer_) {
-    for (size_t i = 0; i < projectedInputColumns_.size(); ++i) {
-      int32_t outputChannel = projectedInputColumns_[i].outputChannel;
-      // Index in ProbePayloadContainer corresponds to position in projectedInputColumns_
+  // For probe-side NON-KEY columns: they're stored in ProbePayloadContainer for final materialization
+  // Key columns are materialized in output, not stored in container
+  if (!probePayloadProjections_.empty() && probePayloadContainer_) {
+    // Map non-key probe columns to PROBE_PAYLOAD (using output channel)
+    for (size_t i = 0; i < probePayloadProjections_.size(); ++i) {
+      int32_t outputChannel = probePayloadProjections_[i].outputChannel;
       outputChannelMap[outputChannel] = ColumnSource{
           ColumnSource::Type::PROBE_PAYLOAD,
-          static_cast<int32_t>(i),
+          static_cast<int32_t>(i),  // column index in ProbePayloadContainer
           probePayloadContainer_.get()};
     }
   }
@@ -2112,9 +2194,12 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
       output_->children());
 
   // For build-side columns: use columnSourceMap to extract from correct sources
+  // Note: For final probe, sourceMap is keyed by storageChannel (from HashBuild)
+  // For N-way intermediate, sourceMap is keyed by outputChannel (from updateColumnSourceMapForOutput)
   const auto& sourceMap = driverCtx->columnSourceMap;
 
   // Collect channels to extract from sourceMap
+  // Note: In final probe, the map is keyed by storageChannel (= inputChannel in tableOutputProjections_)
   std::vector<column_index_t> channelsToExtract;
   for (auto projection : tableOutputProjections_) {
     channelsToExtract.push_back(projection.inputChannel);
@@ -2144,13 +2229,13 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
 
   // Extract build-side columns from their sources using N-way pre-compute approach
   // table_->hybridData() is the current level's HybridContainer for chain traversal
-  // Pass nullptr for currentProbePayload because:
-  // - Current probe data is already handled by wrapIndirectChildren above
-  // - PROBE_PAYLOAD entries in sourceMap reference upstream ProbePayloadContainers,
-  //   which are accessed via getUpstreamProbePayloads() during chain traversal
+  // Pass empty probeRowIds for level 0 since current probe is handled separately
+  // (PROBE_PAYLOAD entries in sourceMap reference upstream ProbePayloadContainers,
+  //  which are accessed via getUpstreamProbePayloads() during chain traversal)
   HybridContainer::extractColumnsFromUpstream(
       channelsToExtract,
       buildRowPtrs,
+      std::vector<uint64_t>{}, // No level 0 probeRowIds - current probe handled by wrapIndirectChildren
       table_->hybridData(),
       nullptr, // currentProbePayload - current probe handled separately
       sourceMap,

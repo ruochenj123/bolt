@@ -165,7 +165,9 @@ class HashBuild final : public Operator {
   // N-way late materialization: process input via DriverCtx data instead of
   // RowVector children. Extracts keys from columnSourceMap and stores upstream
   // references for deferred extraction.
-  void addInputLateMaterialization();
+  // For CURRENT_PROBE columns, uses input directly; for others, extracts from
+  // upstream containers.
+  void addInputLateMaterialization(const RowVectorPtr& input);
 
   bool spillEnabled() const {
     return spillConfig_.has_value();

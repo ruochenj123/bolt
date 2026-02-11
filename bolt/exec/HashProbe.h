@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <set>
 #include "bolt/exec/HashBuild.h"
 #include "bolt/exec/HashPartitionFunction.h"
 #include "bolt/exec/HashTable.h"
@@ -682,7 +683,18 @@ class HashProbe : public Operator {
   bool isNWayLateMInput_{false};
 
   /// True if this probe outputs to downstream HashBuild (not final materialization)
+  /// Note: This is a preliminary flag set in constructor. The actual path used
+  /// is determined by useLateMOutputPath_ after table_ is available.
   bool isNWayLateMOutput_{false};
+
+  /// True if this probe is the final materialization point for an N-way chain.
+  /// Precomputed in constructor since it only depends on planNodeId.
+  bool isFinalMaterializationProbe_{false};
+
+  /// Actual output path flags - computed once when table_ becomes available.
+  /// These determine which fillOutput path is used at runtime.
+  bool useLateMOutputPath_{false};
+  bool useFinalMaterializationPath_{false};
 
   /// Driver ID for encoding probe row IDs
   uint8_t driverId_{0};
@@ -699,6 +711,23 @@ class HashProbe : public Operator {
 
   /// Flag to ensure columnSourceMap is updated only once
   bool columnSourceMapUpdated_{false};
+
+  // === Precomputed N-way late-m output info (computed once in initialize) ===
+  
+  /// Output channels that are keys for downstream HashBuild (need materialization)
+  std::set<column_index_t> downstreamKeyOutputChannels_;
+  
+  /// Probe-side projections that are keys (materialize in output)
+  std::vector<IdentityProjection> probeKeyProjections_;
+  
+  /// Probe-side projections that are NOT keys (store in ProbePayloadContainer only)
+  std::vector<IdentityProjection> probePayloadProjections_;
+  
+  /// Build-side projections that are keys (extract and materialize)
+  std::vector<IdentityProjection> buildKeyProjections_;
+  
+  /// Pre-computed mapping: (inputChannel → outputChannel) for build-side key extraction
+  std::vector<std::pair<column_index_t, column_index_t>> buildKeyChannelMapping_;
 
   /// Update columnSourceMap for output: remap storageChannel → outputChannel
   void updateColumnSourceMapForOutput();

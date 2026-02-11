@@ -50,6 +50,7 @@
 namespace bytedance::bolt::exec {
 
 class Aggregate;
+class BaseHashTable;
 class RowFormatInfo;
 
 class Accumulator {
@@ -1811,8 +1812,7 @@ struct ColumnSource {
   enum Type {
     HYBRID_KEY,      // From HybridContainer's keys_ (RowContainer)
     HYBRID_PAYLOAD,  // From HybridContainer's owningInputs_ (columnar batches)
-    PROBE_PAYLOAD,   // From ProbePayloadContainer (columnar batches)
-    CURRENT_PROBE    // From current probe input (not stored, just dictionary wrap)
+    PROBE_PAYLOAD    // From ProbePayloadContainer (columnar batches)
   };
 
   Type type;
@@ -2000,7 +2000,12 @@ class HybridContainer {
   }
 
   uint32_t getNumRows() const {
-    return totalRows_;
+    // For N-way late-m, totalRows_ may be 0 (no payloads), but we have upstream refs
+    // Use upstreamBuildRowPtrs_ size as fallback
+    if (totalRows_ > 0) {
+      return totalRows_;
+    }
+    return upstreamBuildRowPtrs_.size();
   }
 
   uint32_t getNumBatches() const {
@@ -2076,6 +2081,11 @@ class HybridContainer {
     return !upstreamBuildRowPtrs_.empty();
   }
 
+  /// Get size of upstream build row pointers
+  size_t upstreamBuildRowPtrsSize() const {
+    return upstreamBuildRowPtrs_.size();
+  }
+
   /// Get upstream build row pointer for extraction
   char* getUpstreamBuildRowPtr(size_t localIndex) const {
     BOLT_CHECK_LT(localIndex, upstreamBuildRowPtrs_.size());
@@ -2088,16 +2098,19 @@ class HybridContainer {
     return upstreamProbeRowIds_[localIndex];
   }
 
-  /// Set shared ownership of upstream build containers (for cross-driver access)
-  void setUpstreamBuildContainers(
-      const std::unordered_map<uint8_t, std::shared_ptr<HybridContainer>>& containers) {
-    upstreamBuildContainers_ = containers;
+  /// Set the primary upstream build container (the one that upstreamBuildRowPtrs_ point into)
+  void setPrimaryUpstreamBuildContainer(std::shared_ptr<HybridContainer> container) {
+    primaryUpstreamBuildContainer_ = std::move(container);
   }
 
-  /// Get upstream build containers map
-  const std::unordered_map<uint8_t, std::shared_ptr<HybridContainer>>&
-  getUpstreamBuildContainers() const {
-    return upstreamBuildContainers_;
+  /// Get the primary upstream build container
+  HybridContainer* getPrimaryUpstreamBuildContainer() const {
+    return primaryUpstreamBuildContainer_.get();
+  }
+
+  /// Set the primary upstream hash table (keeps the table alive so row pointers remain valid)
+  void setPrimaryUpstreamHashTable(std::shared_ptr<BaseHashTable> table) {
+    primaryUpstreamHashTable_ = std::move(table);
   }
 
   /// Set shared ownership of upstream probe payloads
@@ -2278,6 +2291,7 @@ class HybridContainer {
   ///
   /// @param channels The input channels to extract (keys in sourceMap)
   /// @param currentBuildRowPtrs Row pointers into the current hash table
+  /// @param currentProbeRowIds Probe row IDs corresponding to currentBuildRowPtrs (for level 0 PROBE_PAYLOAD extraction)
   /// @param currentHybrid The current level's HybridContainer (for traversing upstream chain)
   /// @param currentProbePayload The current level's ProbePayloadContainer (for PROBE_PAYLOAD extraction)
   /// @param sourceMap The ColumnSourceMap mapping channels to their sources
@@ -2285,10 +2299,23 @@ class HybridContainer {
   static void extractColumnsFromUpstream(
       const std::vector<column_index_t>& channels,
       const std::vector<char*>& currentBuildRowPtrs,
+      const std::vector<uint64_t>& currentProbeRowIds,
       HybridContainer* currentHybrid,
       ProbePayloadContainer* currentProbePayload,
       const ColumnSourceMap& sourceMap,
       const RowVectorPtr& result);
+
+  /// Overload that writes directly to output RowVector using channel mapping.
+  /// @param channelMapping Vector of (inputChannel, outputChannel) pairs
+  /// @param output The output RowVector to write directly to (must have columns pre-allocated)
+  static void extractColumnsFromUpstream(
+      const std::vector<std::pair<column_index_t, column_index_t>>& channelMapping,
+      const std::vector<char*>& currentBuildRowPtrs,
+      const std::vector<uint64_t>& currentProbeRowIds,
+      HybridContainer* currentHybrid,
+      ProbePayloadContainer* currentProbePayload,
+      const ColumnSourceMap& sourceMap,
+      const RowVectorPtr& output);
 
  private:
   // Get the single container's coalesced data (only valid when
@@ -2996,9 +3023,10 @@ class HybridContainer {
       uint32_t numRows,
       std::vector<HybridRowId>& outputRowIds) {
     BOLT_CHECK_EQ(numRows, outputRowIds.size());
-    // No payload column
-    if (payloadTypes_.size() == 0)
-      return;
+    // NOTE: For N-way late-m, payloadTypes can be empty (join only stores keys).
+    // We still need to extract rowIds for upstream traversal.
+    // The rowIdColumnOffset_ is always valid since it's the uint64_t column
+    // appended after the key columns.
     for (int32_t i = 0; i < numRows; ++i) {
       const char* row;
       if constexpr (useRowNumbers) {
@@ -3048,13 +3076,20 @@ class HybridContainer {
   // Data flows: upstream join → current join's build side.
   std::vector<char*> upstreamBuildRowPtrs_;    // Direct pointers to upstream join's build rows
   std::vector<uint64_t> upstreamProbeRowIds_;  // Encoded (driverId << 56 | rowIndex)
+  
+  // Keeps the upstream hash table alive so row pointers remain valid.
+  // The hash table owns the RowContainer that char* pointers reference.
+  std::shared_ptr<BaseHashTable> primaryUpstreamHashTable_;
+  
+  // Direct pointer to the container that upstreamBuildRowPtrs_ point into.
+  // This is the build-side container from the upstream probe operation.
+  std::shared_ptr<HybridContainer> primaryUpstreamBuildContainer_;
 
   // Column source metadata: output channel → where to extract the data
   // Stored here so it's shared across drivers after JoinBridge merge
   ColumnSourceMap columnSourceMap_;
 
-  // Cross-driver container access (after merge via JoinBridge)
-  std::unordered_map<uint8_t, std::shared_ptr<HybridContainer>> upstreamBuildContainers_;
+  // Cross-driver probe payload access (after merge via JoinBridge)
   std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>> upstreamProbePayloads_;
 };
 
@@ -3070,6 +3105,8 @@ class ProbePayloadContainer {
       batches_.push_back(batch);
       totalRows_ += batch->size();
       ++totalBatches_;
+      // Reset coalesced flag since we added new data
+      coalesced_ = false;
     }
   }
 
@@ -3369,11 +3406,19 @@ void ProbePayloadContainer::extractColumnNoNullsSingleContainer(
   BufferPtr valuesBuffer = result->mutableValues(numRows);
   auto values = valuesBuffer->asMutableRange<T>();
 
-  auto* flatChild = getSingleContainerData()
-                        ->childAt(columnIndex)
-                        ->template as<FlatVector<T>>();
+  auto* data = getSingleContainerData();
+  
+  BOLT_CHECK_LT(columnIndex, data->childrenSize());
+  auto* flatChild = data->childAt(columnIndex)->template as<FlatVector<T>>();
   BOLT_CHECK_NOT_NULL(flatChild);
+  
   const T* rawValues = flatChild->rawValues();
+  
+  // Check first rowId is in bounds
+  if (numRows > 0) {
+    auto localIdx0 = static_cast<vector_size_t>(rowIds[0] & ((1ULL << 56) - 1));
+    BOLT_CHECK_LT(localIdx0, flatChild->size(), "localIdx out of bounds");
+  }
 
   constexpr vector_size_t kPrefetchDist = 16;
   int32_t i = 0;
@@ -3808,6 +3853,7 @@ inline void HybridContainer::extractNulls(
 inline void HybridContainer::extractColumnsFromUpstream(
     const std::vector<column_index_t>& channels,
     const std::vector<char*>& currentBuildRowPtrs,
+    const std::vector<uint64_t>& currentProbeRowIds,
     HybridContainer* currentHybrid,
     ProbePayloadContainer* currentProbePayload,
     const ColumnSourceMap& sourceMap,
@@ -3845,14 +3891,16 @@ inline void HybridContainer::extractColumnsFromUpstream(
   //   - probePayloadContainer: upstream's ProbePayloadContainer (for level N+1's extraction)
   std::vector<LevelRowRefs> levels;
 
-  // Level 0: current level
-  levels.emplace_back(currentBuildRowPtrs, std::vector<uint64_t>{}, currentHybrid, currentProbePayload);
+  // Level 0: current level (use passed-in probeRowIds for PROBE_PAYLOAD extraction)
+  levels.emplace_back(currentBuildRowPtrs, currentProbeRowIds, currentHybrid, currentProbePayload);
 
   // Traverse the upstream chain
   HybridContainer* levelHybrid = currentHybrid;
+  int levelIdx = 0;
   while (levelHybrid && levelHybrid->hasUpstreamRefs()) {
     // Get local indices from current level's row pointers
     std::vector<HybridRowId> localRowIds;
+    localRowIds.resize(numRows);  // Must pre-size before calling getRowIds
     levelHybrid->getRowIds(
         levels.back().buildRowPtrs.data(),
         numRows,
@@ -3874,19 +3922,25 @@ inline void HybridContainer::extractColumnsFromUpstream(
       size_t localIdx = localRowIds[i].rowId_;
 
       // Find the container that owns this row
-      HybridContainer* owningContainer = allContainers.at(containerId);
-      nextLevel.buildRowPtrs[i] = owningContainer->getUpstreamBuildRowPtr(localIdx);
-      nextLevel.probeRowIds[i] = owningContainer->getUpstreamProbeRowId(localIdx);
+      auto it = allContainers.find(containerId);
+      if (it == allContainers.end()) {
+        BOLT_FAIL("containerId {} not found in allContainers", containerId);
+      }
+      HybridContainer* owningContainer = it->second;
+      if (!owningContainer) {
+        BOLT_FAIL("owningContainer is null for containerId {}", containerId);
+      }
+
+      auto upstreamPtr = owningContainer->getUpstreamBuildRowPtr(localIdx);
+      auto upstreamProbeId = owningContainer->getUpstreamProbeRowId(localIdx);
+      nextLevel.buildRowPtrs[i] = upstreamPtr;
+      nextLevel.probeRowIds[i] = upstreamProbeId;
     }
 
     // Get upstream HybridContainer for next iteration
-    // Note: upstreamBuildContainers_ contains all upstream containers by driverId
-    // For now, we get the container from the first entry (all point to same merged table)
-    HybridContainer* upstreamHybrid = nullptr;
-    const auto& upstreamContainers = levelHybrid->getUpstreamBuildContainers();
-    if (!upstreamContainers.empty()) {
-      upstreamHybrid = upstreamContainers.begin()->second.get();
-    }
+    // Use getPrimaryUpstreamBuildContainer() which tracks the specific container
+    // that upstreamBuildRowPtrs_ point into.
+    HybridContainer* upstreamHybrid = levelHybrid->getPrimaryUpstreamBuildContainer();
     nextLevel.hybridContainer = upstreamHybrid;
 
     // Get upstream ProbePayloadContainer for next level's probe data extraction
@@ -3897,6 +3951,8 @@ inline void HybridContainer::extractColumnsFromUpstream(
       upstreamProbePayload = upstreamProbePayloads.begin()->second.get();
     }
     nextLevel.probePayloadContainer = upstreamProbePayload;
+
+    levelIdx++;
 
     levels.push_back(std::move(nextLevel));
     levelHybrid = upstreamHybrid;
@@ -3964,8 +4020,10 @@ inline void HybridContainer::extractColumnsFromUpstream(
 
         // Get the row pointers for this level
         const std::vector<char*>* levelBuildPtrs = &currentBuildRowPtrs;
+        size_t useLevel = 0;
         if (levelIt != hybridContainerToLevel.end()) {
-          levelBuildPtrs = &levels[levelIt->second].buildRowPtrs;
+          useLevel = levelIt->second;
+          levelBuildPtrs = &levels[useLevel].buildRowPtrs;
         }
 
         // Extract keys using the correct level's row pointers
@@ -3991,7 +4049,7 @@ inline void HybridContainer::extractColumnsFromUpstream(
         // Check if we already computed rowIds for this container
         auto cacheIt = rowIdCache.find(hybridContainer);
         if (cacheIt == rowIdCache.end()) {
-          std::vector<HybridRowId> outputRowIds;
+          std::vector<HybridRowId> outputRowIds(numRows);  // Pre-size to numRows
           hybridContainer->getRowIds(
               levelBuildPtrs->data(),
               numRows,
@@ -4018,20 +4076,20 @@ inline void HybridContainer::extractColumnsFromUpstream(
         auto levelIt = probeContainerToLevel.find(probeContainer);
 
         if (levelIt != probeContainerToLevel.end()) {
-          // The probeRowIds that point to this container are at level+1
+          // Use probeRowIds from the same level as the container
+          // (level 0's probeRowIds point to level 0's probePayloadContainer)
           size_t containerLevel = levelIt->second;
-          size_t rowIdLevel = containerLevel + 1;
 
-          if (rowIdLevel < levels.size() && !levels[rowIdLevel].probeRowIds.empty()) {
+          if (!levels[containerLevel].probeRowIds.empty()) {
             probeContainer->extractColumn(
-                levels[rowIdLevel].probeRowIds,
+                levels[containerLevel].probeRowIds,
                 source.columnIndex,
                 columnVector);
           }
         } else {
           // Fallback: if container not found in level map, try using first available probeRowIds
           // This handles cases where the container wasn't explicitly tracked
-          for (size_t lvl = 1; lvl < levels.size(); ++lvl) {
+          for (size_t lvl = 0; lvl < levels.size(); ++lvl) {
             if (!levels[lvl].probeRowIds.empty()) {
               probeContainer->extractColumn(
                   levels[lvl].probeRowIds,
@@ -4043,9 +4101,166 @@ inline void HybridContainer::extractColumnsFromUpstream(
         }
         break;
       }
-      case ColumnSource::Type::CURRENT_PROBE: {
-        // CURRENT_PROBE is handled separately by the caller
-        BOLT_UNREACHABLE("CURRENT_PROBE should be handled separately");
+    }
+  }
+}
+
+// Overload that writes directly to output using channel mapping
+inline void HybridContainer::extractColumnsFromUpstream(
+    const std::vector<std::pair<column_index_t, column_index_t>>& channelMapping,
+    const std::vector<char*>& currentBuildRowPtrs,
+    const std::vector<uint64_t>& currentProbeRowIds,
+    HybridContainer* currentHybrid,
+    ProbePayloadContainer* currentProbePayload,
+    const ColumnSourceMap& sourceMap,
+    const RowVectorPtr& output) {
+  const int32_t numRows = currentBuildRowPtrs.size();
+  if (numRows == 0 || channelMapping.empty()) {
+    return;
+  }
+
+  // ========== Phase 1: Pre-compute all depth levels ==========
+  std::vector<LevelRowRefs> levels;
+  levels.emplace_back(currentBuildRowPtrs, currentProbeRowIds, currentHybrid, currentProbePayload);
+
+  HybridContainer* levelHybrid = currentHybrid;
+  while (levelHybrid && levelHybrid->hasUpstreamRefs()) {
+    std::vector<HybridRowId> localRowIds;
+    localRowIds.resize(numRows);
+    levelHybrid->getRowIds(
+        levels.back().buildRowPtrs.data(),
+        numRows,
+        localRowIds);
+
+    LevelRowRefs nextLevel;
+    nextLevel.buildRowPtrs.resize(numRows);
+    nextLevel.probeRowIds.resize(numRows);
+
+    const auto& allContainers = levelHybrid->getAllContainers();
+
+    for (int32_t i = 0; i < numRows; ++i) {
+      uint8_t containerId = localRowIds[i].containerId_;
+      size_t localIdx = localRowIds[i].rowId_;
+
+      auto it = allContainers.find(containerId);
+      if (it == allContainers.end()) {
+        BOLT_FAIL("containerId {} not found in allContainers", containerId);
+      }
+
+      HybridContainer* ownerContainer = it->second;
+      if (!ownerContainer) {
+        BOLT_FAIL("ownerContainer is null for containerId {}", containerId);
+      }
+      
+      nextLevel.buildRowPtrs[i] = ownerContainer->getUpstreamBuildRowPtr(localIdx);
+      nextLevel.probeRowIds[i] = ownerContainer->getUpstreamProbeRowId(localIdx);
+    }
+
+    // Get upstream HybridContainer for next iteration
+    // Use getPrimaryUpstreamBuildContainer() which tracks the specific container
+    // that upstreamBuildRowPtrs_ point into.
+    HybridContainer* upstreamHybrid = levelHybrid->getPrimaryUpstreamBuildContainer();
+    nextLevel.hybridContainer = upstreamHybrid;
+
+    // Get upstream ProbePayloadContainer for next level's probe data extraction
+    ProbePayloadContainer* upstreamProbePayload = nullptr;
+    const auto& upstreamProbePayloads = levelHybrid->getUpstreamProbePayloads();
+    if (!upstreamProbePayloads.empty()) {
+      upstreamProbePayload = upstreamProbePayloads.begin()->second.get();
+    }
+    nextLevel.probePayloadContainer = upstreamProbePayload;
+
+    if (upstreamHybrid == nullptr) {
+      break;
+    }
+
+    levels.push_back(std::move(nextLevel));
+    levelHybrid = upstreamHybrid;
+  }
+
+  // ========== Phase 2: Build container-to-level maps ==========
+  std::unordered_map<HybridContainer*, size_t> hybridContainerToLevel;
+  std::unordered_map<ProbePayloadContainer*, size_t> probeContainerToLevel;
+
+  for (size_t i = 0; i < levels.size(); ++i) {
+    if (levels[i].hybridContainer) {
+      for (const auto& [cid, container] : levels[i].hybridContainer->getAllContainers()) {
+        hybridContainerToLevel[container] = i;
+      }
+    }
+    if (levels[i].probePayloadContainer) {
+      probeContainerToLevel[levels[i].probePayloadContainer] = i;
+    }
+  }
+
+  // ========== Phase 3: Extract each column directly to output ==========
+  std::unordered_map<HybridContainer*, std::vector<HybridRowId>> rowIdCache;
+
+  for (const auto& [inputChannel, outputChannel] : channelMapping) {
+    auto it = sourceMap.find(inputChannel);
+    BOLT_CHECK(
+        it != sourceMap.end(),
+        "Channel {} not found in ColumnSourceMap",
+        inputChannel);
+
+    const ColumnSource& source = it->second;
+    auto& columnVector = output->childAt(outputChannel);
+
+    switch (source.type) {
+      case ColumnSource::Type::HYBRID_KEY: {
+        auto* hybridContainer = source.hybridContainer();
+        auto levelIt = hybridContainerToLevel.find(hybridContainer);
+        const std::vector<char*>* levelBuildPtrs = &currentBuildRowPtrs;
+        if (levelIt != hybridContainerToLevel.end()) {
+          levelBuildPtrs = &levels[levelIt->second].buildRowPtrs;
+        }
+        hybridContainer->getKeys()->extractColumn(
+            levelBuildPtrs->data(),
+            numRows,
+            source.columnIndex,
+            columnVector);
+        break;
+      }
+      case ColumnSource::Type::HYBRID_PAYLOAD: {
+        auto* hybridContainer = source.hybridContainer();
+        auto levelIt = hybridContainerToLevel.find(hybridContainer);
+        const std::vector<char*>* levelBuildPtrs = &currentBuildRowPtrs;
+        size_t level = 0;
+        if (levelIt != hybridContainerToLevel.end()) {
+          level = levelIt->second;
+          levelBuildPtrs = &levels[level].buildRowPtrs;
+        }
+        auto cacheIt = rowIdCache.find(hybridContainer);
+        if (cacheIt == rowIdCache.end()) {
+          std::vector<HybridRowId> outputRowIds(numRows);
+          hybridContainer->getRowIds(levelBuildPtrs->data(), numRows, outputRowIds);
+          cacheIt = rowIdCache.emplace(hybridContainer, std::move(outputRowIds)).first;
+        }
+        folly::Range<const vector_size_t*> emptyRange;
+        hybridContainer->extractPayload(
+            levelBuildPtrs->data(),
+            emptyRange,
+            numRows,
+            source.columnIndex,
+            0,
+            columnVector,
+            cacheIt->second,
+            false);
+        break;
+      }
+      case ColumnSource::Type::PROBE_PAYLOAD: {
+        auto* probeContainer = source.probePayloadContainer();
+        auto levelIt = probeContainerToLevel.find(probeContainer);
+        if (levelIt != probeContainerToLevel.end()) {
+          size_t containerLevel = levelIt->second;
+          if (!levels[containerLevel].probeRowIds.empty()) {
+            probeContainer->extractColumn(
+                levels[containerLevel].probeRowIds,
+                source.columnIndex,
+                columnVector);
+          }
+        }
+        break;
       }
     }
   }
