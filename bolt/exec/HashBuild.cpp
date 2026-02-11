@@ -1891,6 +1891,10 @@ void HashBuild::recordHashBuildSpillStats() {
 void HashBuild::populateBaseTableSourceMap() {
   auto* driverCtx = operatorCtx_->driverCtx();
   auto* hybridData = table_->hybridData();
+  
+  if (!hybridData) {
+    return;  // No HybridContainer, nothing to populate
+  }
 
   // Base table: Key columnSourceMap by storageChannel (what HashProbe uses).
   // storageChannel for keys: 0..numKeys-1
@@ -1914,6 +1918,9 @@ void HashBuild::populateBaseTableSourceMap() {
         static_cast<int32_t>(i),  // columnIndex within owningInputs_ (0-based payload index)
         hybridData};
   }
+  
+  // Store the columnSourceMap in HybridContainer so downstream HashProbe can access it
+  hybridData->mutableColumnSourceMap() = driverCtx->columnSourceMap;
 }
 
 void HashBuild::updateSourceMapForNWay() {

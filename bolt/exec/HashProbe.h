@@ -714,7 +714,8 @@ class HashProbe : public Operator {
 
   // === Precomputed N-way late-m output info (computed once in initialize) ===
   
-  /// Output channels that are keys for downstream HashBuild (need materialization)
+  /// Output channels that are keys for downstream HashBuild or sort keys for
+  /// downstream OrderBy (need materialization). If empty, all columns materialize.
   std::set<column_index_t> downstreamKeyOutputChannels_;
   
   /// Probe-side projections that are keys (materialize in output)

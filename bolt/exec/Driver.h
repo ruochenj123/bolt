@@ -338,6 +338,11 @@ struct DriverCtx {
   /// in intermediate probe outputs. Empty set means materialize all (final probe).
   std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
       downstreamBuildKeyChannels;
+  
+  /// For N-way late-m followed by Sort: output channels that are sort keys for
+  /// downstream OrderBy. Keyed by HashProbe's plan node ID.
+  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
+      downstreamSortKeyChannels;
 
   /// Clear batch-level state between batches
   void clearBatchState() {
@@ -695,13 +700,21 @@ struct DriverFactory {
   bool nWayJoinLateMEnabled{false};
 
   /// For N-way join chains, the plan node ID where final materialization
-  /// should happen (the outermost HashProbe in the chain).
+  /// should happen (the outermost HashProbe in the chain). This is always
+  /// a HashProbe, even if followed by OrderBy - the final HashProbe
+  /// materializes all columns before passing to Sort.
   core::PlanNodeId nWayMaterializationPlanNodeId;
 
   /// For N-way late-m: output channels of HashProbe that are keys for downstream
   /// HashBuild. Keyed by the HashProbe's plan node ID.
   std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
       nWayDownstreamBuildKeyChannels;
+  
+  /// For N-way late-m followed by Sort: output channels of HashProbe that are
+  /// sort keys for downstream OrderBy. Keyed by the HashProbe's plan node ID.
+  /// (Currently informational; final HashProbe materializes all columns anyway)
+  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
+      nWayDownstreamSortKeyChannels;
 
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,

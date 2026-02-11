@@ -298,10 +298,18 @@ void HashProbe::initialize() {
     auto* driverCtx = operatorCtx_->driverCtx();
     driverCtx->buildSideLateMUpstreamProbePayloads[driverId_] = probePayloadContainer_;
 
-    // Precompute which output channels are keys for downstream HashBuild
+    // Precompute which output channels are keys for downstream HashBuild or Sort
     auto keyMapIt = driverCtx->downstreamBuildKeyChannels.find(planNodeId());
     if (keyMapIt != driverCtx->downstreamBuildKeyChannels.end()) {
       downstreamKeyOutputChannels_ = keyMapIt->second;
+    }
+    // Also check for sort keys if downstream is an OrderBy
+    auto sortKeyMapIt = driverCtx->downstreamSortKeyChannels.find(planNodeId());
+    if (sortKeyMapIt != driverCtx->downstreamSortKeyChannels.end()) {
+      // Merge sort keys with join keys (sort keys also need to be materialized)
+      for (auto channel : sortKeyMapIt->second) {
+        downstreamKeyOutputChannels_.insert(channel);
+      }
     }
     // If empty, all columns will be materialized (conservative fallback)
 
