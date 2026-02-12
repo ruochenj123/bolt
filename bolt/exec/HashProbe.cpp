@@ -217,10 +217,19 @@ HashProbe::HashProbe(
       !driverCtx->materializationPlanNodeId.empty() &&
       driverCtx->materializationPlanNodeId != planNodeId();
 
-  // Precompute whether this is the final materialization point
+  // Check if this is the final probe before Sort (Sort is the materialization point)
+  // In this case, we use OUTPUT mode but pass sort key columns instead of build key columns
+  isFinalProbeBeforeSort_ = driverCtx->buildSideLateMEnabled &&
+      driverCtx->sortMaterializationEnabled &&
+      !driverCtx->materializationPlanNodeId.empty() &&
+      driverCtx->materializationPlanNodeId != planNodeId();
+
+  // Precompute whether this is the final materialization point (HashProbe does materialization)
+  // This is false when Sort is the materialization point
   isFinalMaterializationProbe_ = driverCtx->buildSideLateMEnabled &&
       !driverCtx->materializationPlanNodeId.empty() &&
-      driverCtx->materializationPlanNodeId == planNodeId();
+      driverCtx->materializationPlanNodeId == planNodeId() &&
+      !driverCtx->sortMaterializationEnabled;
 }
 
 void HashProbe::initialize() {
@@ -2084,7 +2093,16 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
   // Increment by the number of output rows added to probePayloadContainer_
   probeRowIdBase_ += size;
 
-  // 3. Update columnSourceMap (once only, tracked by flag)
+  // 3. Copy columnSourceMap from hash table to DriverCtx (once only)
+  //    The hash table's columnSourceMap was set up by HashBuild.
+  //    We need to copy it before updateColumnSourceMapForOutput() which remaps it.
+  if (!columnSourceMapUpdated_) {
+    if (table_->hybridData()) {
+      driverCtx->columnSourceMap = table_->hybridData()->getColumnSourceMap();
+    }
+  }
+  
+  // 4. Update columnSourceMap (once only, tracked by flag)
   updateColumnSourceMapForOutput();
 
   // 4. Prepare output and fill with selective materialization

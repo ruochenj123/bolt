@@ -442,6 +442,9 @@ void detectNWayJoinChains(
   // Map from HashProbe's plan node ID to downstream Sort key channels
   std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
       probeToDownstreamSortKeyChannels;
+  
+  // Set of materialization point IDs that are OrderBy nodes (Sort materialization)
+  std::unordered_set<core::PlanNodeId> sortMaterializationNodeIds;
 
   // First pass: identify N-way join chains
   // We look for patterns where a HashJoinNode's source[1] (build side)
@@ -468,23 +471,22 @@ void detectNWayJoinChains(
       
       // Determine the materialization point:
       // 1. If outerJoin is set, outerJoin is materialization point
-      // 2. Else this HashJoin is the materialization point
-      // Note: Even if parent is OrderBy, the final HashProbe is still the
-      // materialization point - it materializes all columns for Sort.
+      // 2. If parent is OrderBy (and no outerJoin), OrderBy is materialization point
+      // 3. Otherwise this HashJoin is the materialization point
       core::PlanNodeId materializationId;
       auto parentOrderBy =
           std::dynamic_pointer_cast<const core::OrderByNode>(parentNode);
       if (outerJoin) {
         materializationId = outerJoin->id();
-      } else {
-        materializationId = hashJoin->id();
-      }
-      
-      // Log if OrderBy is above this join chain
-      if (parentOrderBy && !outerJoin) {
+      } else if (parentOrderBy) {
+        // OrderBy is above this join chain - Sort becomes the materialization point
+        materializationId = parentOrderBy->id();
+        sortMaterializationNodeIds.insert(parentOrderBy->id());
         LOG(INFO) << "detectNWayJoinChains: Found OrderBy " << parentOrderBy->id()
                   << " above final HashJoin " << hashJoin->id()
-                  << " (HashJoin is materialization point)";
+                  << " (OrderBy is materialization point)";
+      } else {
+        materializationId = hashJoin->id();
       }
 
       // Check if this join's build side contains another HashJoin
@@ -552,9 +554,10 @@ void detectNWayJoinChains(
               // Compute downstream key channels for this inner join's HashProbe.
               // The parent join's rightKeys() reference columns from inner join's output.
               // We need to map key names to output channel indices.
+              std::set<column_index_t> keyChannels;
+              auto innerOutputType = innerJoin->outputType();
+              
               if (parentJoin) {
-                std::set<column_index_t> keyChannels;
-                auto innerOutputType = innerJoin->outputType();
                 for (const auto& keyExpr : parentJoin->rightKeys()) {
                   auto keyName = keyExpr->name();
                   auto channelOpt = innerOutputType->getChildIdxIfExists(keyName);
@@ -565,7 +568,24 @@ void detectNWayJoinChains(
                               << "') is key for downstream " << parentJoin->id();
                   }
                 }
-                probeToDownstreamKeyChannels[innerJoin->id()] = std::move(keyChannels);
+              }
+              probeToDownstreamKeyChannels[innerJoin->id()] = keyChannels;
+              
+              // Also propagate sort key channels to inner joins (for Sort materialization)
+              // Sort keys need to be passed through all joins in the chain
+              if (parentOrderBy && !outerJoin) {
+                std::set<column_index_t> sortKeyChannels;
+                for (const auto& sortKey : parentOrderBy->sortingKeys()) {
+                  auto keyName = sortKey->name();
+                  auto channelOpt = innerOutputType->getChildIdxIfExists(keyName);
+                  if (channelOpt.has_value()) {
+                    sortKeyChannels.insert(static_cast<column_index_t>(*channelOpt));
+                    LOG(INFO) << "detectNWayJoinChains: Inner join " << innerJoin->id()
+                              << " output channel " << *channelOpt << " ('" << keyName
+                              << "') is sort key for downstream OrderBy " << parentOrderBy->id();
+                  }
+                }
+                probeToDownstreamSortKeyChannels[innerJoin->id()] = std::move(sortKeyChannels);
               }
               
               // Continue marking this join's build subtree with this join as parent
@@ -613,6 +633,11 @@ void detectNWayJoinChains(
         factories[i]->nWayJoinLateMEnabled = true;
         factories[i]->nWayMaterializationPlanNodeId = it->second;
         
+        // Check if materialization point is an OrderBy (Sort materialization)
+        if (sortMaterializationNodeIds.count(it->second) > 0) {
+          factories[i]->nWaySortMaterializationEnabled = true;
+        }
+        
         // Set downstream key channels for HashBuild (join keys)
         auto keyIt = probeToDownstreamKeyChannels.find(node->id());
         if (keyIt != probeToDownstreamKeyChannels.end()) {
@@ -642,6 +667,12 @@ void detectNWayJoinChains(
       if (consumerIt != nodeToMaterializationPoint.end()) {
         factories[i]->nWayJoinLateMEnabled = true;
         factories[i]->nWayMaterializationPlanNodeId = consumerIt->second;
+        
+        // Check if materialization point is an OrderBy (Sort materialization)
+        if (sortMaterializationNodeIds.count(consumerIt->second) > 0) {
+          factories[i]->nWaySortMaterializationEnabled = true;
+        }
+        
         LOG(INFO) << "detectNWayJoinChains: Factory " << i 
                   << " is base build for N-way chain node " << factories[i]->consumerNode->id()
                   << ", enabling late-m";
@@ -859,6 +890,7 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
   if (nWayJoinLateMEnabled) {
     ctx->buildSideLateMEnabled = true;
     ctx->materializationPlanNodeId = nWayMaterializationPlanNodeId;
+    ctx->sortMaterializationEnabled = nWaySortMaterializationEnabled;
     ctx->downstreamBuildKeyChannels = nWayDownstreamBuildKeyChannels;
     ctx->downstreamSortKeyChannels = nWayDownstreamSortKeyChannels;
   }

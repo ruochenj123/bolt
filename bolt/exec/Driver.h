@@ -330,8 +330,13 @@ struct DriverCtx {
   std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>
       buildSideLateMUpstreamProbePayloads;
 
-  /// Plan node ID where materialization should happen (final probe)
+  /// Plan node ID where materialization should happen (final probe or OrderBy)
   std::string materializationPlanNodeId;
+  
+  /// If true, the materialization point is an OrderBy (Sort) node.
+  /// When set, the final HashProbe uses OUTPUT mode (passing row refs to Sort),
+  /// and OrderBy performs final materialization after sorting.
+  bool sortMaterializationEnabled = false;
 
   /// For N-way late-m: output channels that are keys for downstream HashBuild.
   /// Keyed by HashProbe's plan node ID. Only these channels need to be materialized
@@ -700,10 +705,15 @@ struct DriverFactory {
   bool nWayJoinLateMEnabled{false};
 
   /// For N-way join chains, the plan node ID where final materialization
-  /// should happen (the outermost HashProbe in the chain). This is always
-  /// a HashProbe, even if followed by OrderBy - the final HashProbe
-  /// materializes all columns before passing to Sort.
+  /// should happen. This can be:
+  /// - A HashProbe ID: final HashProbe does materialization
+  /// - An OrderBy ID: Sort does materialization after sorting
   core::PlanNodeId nWayMaterializationPlanNodeId;
+  
+  /// If true, the materialization point is an OrderBy (Sort) node.
+  /// When set, the final HashProbe in the chain uses OUTPUT mode (passing
+  /// row references to Sort), and OrderBy performs final materialization.
+  bool nWaySortMaterializationEnabled{false};
 
   /// For N-way late-m: output channels of HashProbe that are keys for downstream
   /// HashBuild. Keyed by the HashProbe's plan node ID.
@@ -712,7 +722,7 @@ struct DriverFactory {
   
   /// For N-way late-m followed by Sort: output channels of HashProbe that are
   /// sort keys for downstream OrderBy. Keyed by the HashProbe's plan node ID.
-  /// (Currently informational; final HashProbe materializes all columns anyway)
+  /// The final HashProbe materializes sort key columns for OrderBy to sort.
   std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
       nWayDownstreamSortKeyChannels;
 

@@ -31,11 +31,10 @@
 #pragma once
 
 #include "bolt/exec/ContainerRowSerde.h"
-#include "bolt/exec/HybridSorter.h"
 #include "bolt/exec/Operator.h"
-#include "bolt/exec/RowContainer.h"
 #include "bolt/exec/SortBuffer.h"
 #include "bolt/exec/Spiller.h"
+
 namespace bytedance::bolt::exec {
 
 /// OrderBy operator implementation: OrderBy stores all its inputs in a
@@ -44,6 +43,14 @@ namespace bytedance::bolt::exec {
 /// to the rows using the RowContainer's compare() function. And finally it
 /// constructs and returns the sorted output RowVector using the data in the
 /// RowContainer.
+///
+/// Late Materialization Mode:
+/// When configured as the materialization point for N-way late-m joins,
+/// the underlying SortBuffer receives sort key columns (materialized) plus
+/// row references from upstream. It sorts by keys while tracking the row
+/// references, then materializes full rows after sorting is complete.
+/// The late-m logic is handled inside SortBuffer for consistency.
+///
 /// Limitations:
 /// * It memcopies twice: 1) input to RowContainer and 2) RowContainer to
 /// output.

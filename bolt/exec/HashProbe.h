@@ -690,6 +690,10 @@ class HashProbe : public Operator {
   /// True if this probe is the final materialization point for an N-way chain.
   /// Precomputed in constructor since it only depends on planNodeId.
   bool isFinalMaterializationProbe_{false};
+  
+  /// True if this is the final probe before Sort (Sort is the materialization point).
+  /// In this case, we output row references + sort key columns to OrderBy.
+  bool isFinalProbeBeforeSort_{false};
 
   /// Actual output path flags - computed once when table_ becomes available.
   /// These determine which fillOutput path is used at runtime.

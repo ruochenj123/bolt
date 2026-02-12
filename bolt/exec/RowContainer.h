@@ -330,6 +330,11 @@ class RowContainer {
   void storeSingleRowId(uint64_t& value, char* FOLLY_NONNULL row) {
     *reinterpret_cast<int64_t*>(row + rowIdOffset_) = value;
   }
+  
+  // Get the stored row id from the row at the reserved offset for hybrid design
+  uint64_t getSingleRowId(char* FOLLY_NONNULL row) const {
+    return *reinterpret_cast<int64_t*>(row + rowIdOffset_);
+  }
 
   void store(const RowVectorPtr& input);
 
@@ -3263,6 +3268,34 @@ class ProbePayloadContainer {
       const std::vector<uint64_t>& rowIds,
       int32_t columnIndex,
       const VectorPtr& result);
+  
+  /// Extract a single value from probe payload at the specified row.
+  /// This is used by OrderBy late materialization for individual row extraction.
+  /// @param columnIndex Column index within the container
+  /// @param localRowIndex Row index within this container's data
+  /// @param result The vector to write the result into
+  /// @param resultIndex The position in result to write to
+  void extractColumnValue(
+      int32_t columnIndex,
+      uint64_t localRowIndex,
+      VectorPtr& result,
+      vector_size_t resultIndex) {
+    if (!coalesced_) {
+      coalesceBatches();
+    }
+    if (batches_.empty() || localRowIndex >= totalRows_) {
+      // Set null for out-of-bounds
+      result->setNull(resultIndex, true);
+      return;
+    }
+    // Copy single value from coalesced batch
+    auto& batch = batches_[0];
+    if (columnIndex < 0 || columnIndex >= batch->childrenSize()) {
+      result->setNull(resultIndex, true);
+      return;
+    }
+    result->copy(batch->childAt(columnIndex).get(), resultIndex, localRowIndex, 1);
+  }
 
  private:
   // Get the single container's coalesced data (only valid when isSingleContainer())
@@ -4197,11 +4230,14 @@ inline void HybridContainer::extractColumnsFromUpstream(
   std::unordered_map<HybridContainer*, std::vector<HybridRowId>> rowIdCache;
 
   for (const auto& [inputChannel, outputChannel] : channelMapping) {
-    auto it = sourceMap.find(inputChannel);
+    // Note: After updateColumnSourceMapForOutput(), sourceMap is keyed by outputChannel
+    // (not inputChannel). The inputChannel is the storageChannel in the hash table,
+    // but the sourceMap has already been remapped to outputChannel keys.
+    auto it = sourceMap.find(outputChannel);
     BOLT_CHECK(
         it != sourceMap.end(),
-        "Channel {} not found in ColumnSourceMap",
-        inputChannel);
+        "Channel {} not found in ColumnSourceMap (looking up by outputChannel)",
+        outputChannel);
 
     const ColumnSource& source = it->second;
     auto& columnVector = output->childAt(outputChannel);

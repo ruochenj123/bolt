@@ -30,6 +30,7 @@
 
 #include "SortBuffer.h"
 #include <algorithm>
+#include "HashTable.h"
 #include "Spiller.h"
 #include "bolt/exec/MemoryReclaimer.h"
 #include "bolt/exec/RowToColumnVector.h"
@@ -49,7 +50,9 @@ SortBuffer::SortBuffer(
     const common::SpillConfig* spillConfig,
     uint64_t spillMemoryThreshold,
     OperatorCtx* operatorCtx,
-    bool hybridSortEnabled)
+    bool hybridSortEnabled,
+    bool lateMaterializationEnabled,
+    DriverCtx* driverCtx)
     : input_(input),
       sortCompareFlags_(sortCompareFlags),
       pool_(pool),
@@ -57,11 +60,21 @@ SortBuffer::SortBuffer(
       spillConfig_(spillConfig),
       spillMemoryThreshold_(spillMemoryThreshold),
       operatorCtx_(operatorCtx),
-      hybridSortEnabled_(hybridSortEnabled) {
+      hybridSortEnabled_(hybridSortEnabled),
+      lateMaterializationEnabled_(lateMaterializationEnabled),
+      driverCtx_(driverCtx) {
   BOLT_CHECK_GE(input_->size(), sortCompareFlags_.size());
   BOLT_CHECK_GT(sortCompareFlags_.size(), 0);
   BOLT_CHECK_EQ(sortColumnIndices.size(), sortCompareFlags_.size());
   BOLT_CHECK_NOT_NULL(nonReclaimableSection_);
+
+  // Late materialization and hybrid sort are incompatible.
+  // Late-m mode: sort keys come from input, payloads come from upstream containers.
+  // Hybrid sort mode: all columns come from input and are stored in HybridContainer.
+  // When late-m is enabled, disable hybrid sort to use the late-m code path.
+  if (lateMaterializationEnabled_) {
+    hybridSortEnabled_ = false;
+  }
 
   // Validate that hybrid sort is not used with row-based spilling
   if (hybridSortEnabled_ && spillConfig_ != nullptr) {
@@ -121,12 +134,27 @@ SortBuffer::SortBuffer(
 
     payloadTypes_ =
         ROW(std::move(nonSortedColumnNames), std::move(nonSortedColumnTypes));
+  } else if (lateMaterializationEnabled_) {
+    // For late-m: only store sort keys + rowId (for tracking original row index)
+    // The non-sort columns will be materialized from upstream containers
+    std::vector<TypePtr> rowIdType = {BIGINT()};
+    data_ = std::make_unique<RowContainer>(sortedColumnTypes, rowIdType, pool_);
   } else {
     data_ = std::make_unique<RowContainer>(
         sortedColumnTypes, nonSortedColumnTypes, pool_);
   }
   spillerStoreType_ =
       ROW(std::move(sortedSpillColumnNames), std::move(sortedSpillColumnTypes));
+  
+  // Initialize late materialization state if enabled
+  if (lateMaterializationEnabled_ && driverCtx_) {
+    // Copy upstream references from DriverCtx - these need to be kept alive
+    primaryUpstreamHashTable_ = driverCtx_->primaryUpstreamHashTable;
+    upstreamProbePayloads_ = driverCtx_->buildSideLateMUpstreamProbePayloads;
+    columnSourceMap_ = driverCtx_->columnSourceMap;
+    LOG(INFO) << "SortBuffer: late materialization enabled, columnSourceMap size: " 
+              << columnSourceMap_.size();
+  }
 }
 
 void SortBuffer::addInput(const VectorPtr& input) {
@@ -140,6 +168,31 @@ void SortBuffer::addInput(const VectorPtr& input) {
   }
   auto* inputRow = input->as<RowVector>();
   MicrosecondTimer timer(&sortColToRowTimeUs_);
+  
+  // For late materialization: capture row references from DriverCtx for this batch
+  if (lateMaterializationEnabled_ && driverCtx_) {
+    const auto& buildRowPtrs = driverCtx_->buildSideLateMBuildRowPtrs;
+    const auto& probeRowIds = driverCtx_->buildSideLateMProbeRowIds;
+    
+    // Append row references for this batch
+    lateMBuildRowPtrs_.insert(
+        lateMBuildRowPtrs_.end(), buildRowPtrs.begin(), buildRowPtrs.end());
+    lateMProbeRowIds_.insert(
+        lateMProbeRowIds_.end(), probeRowIds.begin(), probeRowIds.end());
+    
+    // Update columnSourceMap if not already set (might have new entries)
+    if (columnSourceMap_.empty() && !driverCtx_->columnSourceMap.empty()) {
+      columnSourceMap_ = driverCtx_->columnSourceMap;
+    }
+    // Keep upstream references alive
+    if (!primaryUpstreamHashTable_) {
+      primaryUpstreamHashTable_ = driverCtx_->primaryUpstreamHashTable;
+    }
+    if (upstreamProbePayloads_.empty()) {
+      upstreamProbePayloads_ = driverCtx_->buildSideLateMUpstreamProbePayloads;
+    }
+  }
+  
   if (hybridSortEnabled_) {
     auto currentRows = hybridData_->getNumRows();
     for (int row = 0; row < input->size(); ++row) {
@@ -173,6 +226,30 @@ void SortBuffer::addInput(const VectorPtr& input) {
     auto payloadInput = wrapColumns(
         input->as<RowVector>(), payloadChannels_, payloadTypes_, pool());
     hybridData_->addPayload(std::move(payloadInput));
+  } else if (lateMaterializationEnabled_) {
+    // For late-m: only store sort key columns (like hybrid mode)
+    // Store rowId for tracking original row index
+    auto currentRows = numInputRows_;
+    for (int row = 0; row < input->size(); ++row) {
+      // Store original row index as rowId (for sorting tracking)
+      uint64_t encodedId = (static_cast<uint64_t>(0) << 56) |
+          (static_cast<uint64_t>(row + currentRows) & ((1ULL << 56) - 1));
+      data_->storeSingleRowId(encodedId, rows[row]);
+    }
+    // Store only sort key columns
+    for (const auto& columnProjection : keyColumnMap_) {
+      DecodedVector decoded(
+          *inputRow->childAt(columnProjection.outputChannel), allRows);
+      auto kind =
+          inputRow->childAt(columnProjection.outputChannel)->type()->kind();
+      BOLT_DYNAMIC_TYPE_DISPATCH(
+          data_->storeColumn,
+          kind,
+          decoded,
+          input->size(),
+          rows,
+          columnProjection.inputChannel);
+    }
   } else {
     for (const auto& columnProjection : columnMap_) {
       DecodedVector decoded(
@@ -260,6 +337,29 @@ void SortBuffer::noMoreInput() {
     }
 #endif
 
+    // For late materialization: reorder row references to match sorted order
+    if (lateMaterializationEnabled_ && !lateMBuildRowPtrs_.empty()) {
+      sortedBuildRowPtrs_.resize(numInputRows_);
+      sortedProbeRowIds_.resize(numInputRows_);
+      
+      // Get original row indices from stored rowIds and reorder references
+      for (size_t i = 0; i < numInputRows_; ++i) {
+        uint64_t storedId = data_->getSingleRowId(sortedRows_[i]);
+        size_t origIdx = storedId & ((1ULL << 56) - 1);
+        sortedBuildRowPtrs_[i] = lateMBuildRowPtrs_[origIdx];
+        sortedProbeRowIds_[i] = lateMProbeRowIds_[origIdx];
+      }
+      
+      // Clear original refs to save memory
+      lateMBuildRowPtrs_.clear();
+      lateMBuildRowPtrs_.shrink_to_fit();
+      lateMProbeRowIds_.clear();
+      lateMProbeRowIds_.shrink_to_fit();
+      
+      LOG(INFO) << "SortBuffer: reordered " << numInputRows_ 
+                << " row references for late materialization";
+    }
+
   } else {
     // Spill the remaining in-memory state to disk if spilling has been
     // triggered on this sort buffer. This is to simplify query OOM prevention
@@ -287,7 +387,9 @@ RowVectorPtr SortBuffer::getOutput(uint32_t maxOutputRows) {
   // *nonReclaimableSection_ = oldNonReclaimableSection; });
   // *nonReclaimableSection_ = true;
   MicrosecondTimer timer(&sortOutputTimeUs_);
-  if (spiller_ != nullptr) {
+  if (lateMaterializationEnabled_) {
+    getOutputLateMaterialization();
+  } else if (spiller_ != nullptr) {
     getOutputWithSpill();
   } else {
     getOutputWithoutSpill();
@@ -629,6 +731,62 @@ void SortBuffer::getOutputWithSpill() {
   }
 }
 
+void SortBuffer::getOutputLateMaterialization() {
+  // Materialize full rows from upstream containers using sorted row references.
+  // The sortedBuildRowPtrs_ point into the final HashProbe's hash table.
+  // We need to use HybridContainer::extractColumnsFromUpstream to traverse
+  // the N-way chain and extract columns from their actual sources.
+  const auto batchSize = output_->size();
+  const auto startRow = numOutputRows_;
+  
+  // Get the row pointers for this batch - these point into the final hash table
+  std::vector<char*> batchBuildPtrs(
+      sortedBuildRowPtrs_.begin() + startRow,
+      sortedBuildRowPtrs_.begin() + startRow + batchSize);
+  std::vector<uint64_t> batchProbeIds(
+      sortedProbeRowIds_.begin() + startRow,
+      sortedProbeRowIds_.begin() + startRow + batchSize);
+  
+  // Pre-allocate output columns
+  for (size_t i = 0; i < output_->childrenSize(); ++i) {
+    if (!output_->childAt(i)) {
+      output_->childAt(i) = BaseVector::create(
+          input_->childAt(i), batchSize, pool_);
+    }
+    output_->childAt(i)->resize(batchSize);
+  }
+  
+  // Use extractColumnsFromUpstream to traverse the N-way chain and extract all columns.
+  // Build channel list for extraction - all output channels
+  std::vector<column_index_t> channels;
+  for (size_t i = 0; i < output_->childrenSize(); ++i) {
+    channels.push_back(static_cast<column_index_t>(i));
+  }
+  
+  // Get the primary upstream container (the hash table we have pointers into)
+  HybridContainer* primaryHybrid = nullptr;
+  if (primaryUpstreamHashTable_) {
+    primaryHybrid = primaryUpstreamHashTable_->hybridData();
+  }
+  
+  // Get the first probe payload container (if any)
+  ProbePayloadContainer* probeContainer = nullptr;
+  if (!upstreamProbePayloads_.empty()) {
+    probeContainer = upstreamProbePayloads_.begin()->second.get();
+  }
+  
+  HybridContainer::extractColumnsFromUpstream(
+      channels,
+      batchBuildPtrs,
+      batchProbeIds,
+      primaryHybrid,
+      probeContainer,
+      columnSourceMap_,
+      output_);
+  
+  numOutputRows_ += batchSize;
+}
+
 void SortBuffer::finishSpill() {
   BOLT_CHECK_NULL(spillMerger_);
   auto spillPartition = spiller_->finishSpill();
@@ -642,6 +800,29 @@ void SortBuffer::finishSpill() {
         spillConfig_->getJITenabledForSpill(),
         spillConfig_->spillUringEnabled);
   }
+}
+
+std::vector<size_t> SortBuffer::getOriginalRowIndices() const {
+  std::vector<size_t> indices;
+  indices.reserve(sortedRows_.size());
+  
+  if (hybridSortEnabled_ && data_) {
+    // Extract original row index from stored rowId (low 56 bits)
+    for (char* row : sortedRows_) {
+      uint64_t storedId = data_->getSingleRowId(row);
+      size_t originalIndex = storedId & ((1ULL << 56) - 1);
+      indices.push_back(originalIndex);
+    }
+  } else {
+    // Non-hybrid mode: rows are stored in order, so we need to find original index
+    // by comparing pointers. This is less efficient but provides fallback.
+    // For now, just return sequential indices (no reordering supported).
+    for (size_t i = 0; i < sortedRows_.size(); ++i) {
+      indices.push_back(i);
+    }
+  }
+  
+  return indices;
 }
 
 } // namespace bytedance::bolt::exec

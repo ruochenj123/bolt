@@ -36,17 +36,26 @@
 #include "Spiller.h"
 #include "bolt/common/base/SortStat.h"
 #include "bolt/exec/ContainerRowSerde.h"
+#include "bolt/exec/Driver.h"
 #include "bolt/exec/HybridSorter.h"
 #include "bolt/exec/Operator.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/RowContainer.h"
 #include "bolt/exec/Spill.h"
 #include "bolt/vector/BaseVector.h"
+
 namespace bytedance::bolt::exec {
 
 /// A utility class to accumulate data inside and output the sorted result.
 /// Spilling would be triggered if spilling is enabled and memory usage exceeds
 /// limit.
+///
+/// Late Materialization Mode:
+/// When lateMaterializationEnabled is true, SortBuffer acts as the materialization
+/// point for N-way late-m joins. In this mode:
+/// - addInput() stores sort key columns plus captures row references from DriverCtx
+/// - noMoreInput() sorts and reorders row references to match sorted order
+/// - getOutput() materializes full rows from upstream containers using columnSourceMap
 class SortBuffer {
  public:
   SortBuffer(
@@ -58,7 +67,9 @@ class SortBuffer {
       const common::SpillConfig* spillConfig = nullptr,
       uint64_t spillMemoryThreshold = 0,
       OperatorCtx* operatorCtx = nullptr,
-      bool hybridSortEnabled = false);
+      bool hybridSortEnabled = false,
+      bool lateMaterializationEnabled = false,
+      DriverCtx* driverCtx = nullptr);
 
   void addInput(const VectorPtr& input);
 
@@ -144,6 +155,17 @@ class SortBuffer {
   void setSortAlgo(SortAlgo algo) {
     sorter_ = HybridSorter{algo};
   }
+  
+  /// Returns the sorted row pointers after noMoreInput() is called.
+  /// Only valid after noMoreInput() and before spilling.
+  const std::vector<char*>& getSortedRows() const {
+    return sortedRows_;
+  }
+  
+  /// Returns the original row indices in sorted order.
+  /// Uses the stored rowId in hybrid mode (low 56 bits = original index).
+  /// Only valid when hybridSortEnabled_ is true.
+  std::vector<size_t> getOriginalRowIndices() const;
 
  private:
   // Ensures there is sufficient memory reserved to process 'input'.
@@ -153,6 +175,8 @@ class SortBuffer {
   void prepareOutput(uint32_t maxOutputRows);
   void getOutputWithoutSpill();
   void getOutputWithSpill();
+  // Late materialization output: materialize full rows from upstream containers
+  void getOutputLateMaterialization();
   // Spill during input stage.
   void spillInput();
   // Spill during output stage.
@@ -228,6 +252,36 @@ class SortBuffer {
   std::vector<IdentityProjection> payloadColumnMap_;
   std::vector<column_index_t> payloadChannels_;
   RowTypePtr payloadTypes_;
+  
+  // === Late Materialization State ===
+  // When lateMaterializationEnabled_ is true, SortBuffer is the materialization
+  // point for N-way late-m joins. It stores row references alongside sort keys
+  // and materializes from upstream containers after sorting.
+  
+  bool lateMaterializationEnabled_{false};
+  
+  /// DriverCtx for accessing row references during addInput
+  DriverCtx* driverCtx_{nullptr};
+  
+  /// Column source map for late materialization (tells where each output column comes from)
+  ColumnSourceMap columnSourceMap_;
+  
+  /// Row references stored for all input rows (parallel to rows in data_)
+  /// buildRowPtrs[i] points to build-side row for input row i
+  /// probeRowIds[i] encodes probe-side row reference for input row i
+  std::vector<char*> lateMBuildRowPtrs_;
+  std::vector<uint64_t> lateMProbeRowIds_;
+  
+  /// Sorted row references (reordered to match sortedRows_)
+  std::vector<char*> sortedBuildRowPtrs_;
+  std::vector<uint64_t> sortedProbeRowIds_;
+  
+  /// Primary upstream hash table - kept alive for row pointer validity
+  std::shared_ptr<BaseHashTable> primaryUpstreamHashTable_;
+  
+  /// Upstream probe payload containers (for probe-side column extraction)
+  std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>
+      upstreamProbePayloads_;
 };
 
 } // namespace bytedance::bolt::exec

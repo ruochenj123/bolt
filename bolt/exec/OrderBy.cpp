@@ -34,6 +34,7 @@
 #include "bolt/exec/Task.h"
 #include "bolt/vector/FlatVector.h"
 #include "exec/OperatorMetric.h"
+
 namespace bytedance::bolt::exec {
 
 namespace {
@@ -63,8 +64,7 @@ OrderBy::OrderBy(
               : std::nullopt) {
   maxOutputRows_ = outputBatchRows(std::nullopt);
   BOLT_CHECK(pool()->trackUsage());
-  // isOutputStageSpillEnabled_ =
-  //     driverCtx->queryConfig().orderBySpillInOutputStageEnabled();
+
   std::vector<column_index_t> sortColumnIndices;
   std::vector<CompareFlags> sortCompareFlags;
   sortColumnIndices.reserve(orderByNode->sortingKeys().size());
@@ -80,6 +80,12 @@ OrderBy::OrderBy(
         fromSortOrderToCompareFlags(orderByNode->sortingOrders()[i]));
   }
   auto hybridSortEnabled = driverCtx->queryConfig().hybridSortEnabled();
+  
+  // Check if this OrderBy is the materialization point for N-way late-m
+  bool lateMaterializationEnabled = driverCtx->sortMaterializationEnabled &&
+      !driverCtx->materializationPlanNodeId.empty() &&
+      driverCtx->materializationPlanNodeId == planNodeId();
+  
   sortBuffer_ = std::make_unique<SortBuffer>(
       outputType_,
       sortColumnIndices,
@@ -89,7 +95,13 @@ OrderBy::OrderBy(
       spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
       operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold(),
       operatorCtx_.get(),
-      hybridSortEnabled);
+      hybridSortEnabled,
+      lateMaterializationEnabled,
+      driverCtx);
+  
+  if (lateMaterializationEnabled) {
+    LOG(INFO) << name() << " late materialization enabled, plan node: " << planNodeId();
+  }
 
   this->setRuntimeMetric(
       OperatorMetricKey::kCanUsedToEstimateHashBuildPartitionNum, "true");
