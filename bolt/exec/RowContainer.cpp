@@ -1497,6 +1497,7 @@ HybridContainer::~HybridContainer() {
 
 void HybridContainer::addPayload(RowVectorPtr input) {
   BOLT_CHECK_EQ(input->childrenSize(), payloadTypes_.size());
+  
   totalRows_ += input->size();
   totalBatches_++;
 

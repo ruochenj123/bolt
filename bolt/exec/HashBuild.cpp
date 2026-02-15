@@ -299,6 +299,10 @@ void HashBuild::setupTable() {
     // testing.
     table_->hybridData()->setReorderEnabled(
         queryConfig.hybridJoinReorderEnabled());
+    // Set extraction optimization flag from query config.
+    // When disabled: skip coalesceBatches, sortByContainerId, prefetch.
+    table_->hybridData()->setExtractionOptimized(
+        queryConfig.hybridJoinExtractionOptimized());
 
     // Note: For N-way late-m, upstream container references and columnSourceMap
     // are set in noMoreInputInternal() after data has been processed.
@@ -644,6 +648,11 @@ void HashBuild::addInput(RowVectorPtr input) {
   auto nextOffset = rows->nextOffset();
 
   if (hybridJoin_) {
+    // Get batchId BEFORE addPayload (current batch count)
+    auto batchId = table_->hybridData()->getNumBatches();
+    bool useOptimizedEncoding = table_->hybridData()->isExtractionOptimized();
+    auto baseRow = table_->hybridData()->getNumRows();
+    
     activeRows_.applyToSelected([&](auto rowIndex) {
       char* newRow = rows->newRow();
       if (nextOffset) {
@@ -656,10 +665,16 @@ void HashBuild::addInput(RowVectorPtr input) {
         rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
       }
       // Store RowId
-      auto baseRow = table_->hybridData()->getNumRows();
-      uint64_t encodedId = (static_cast<uint64_t>(driverId_)
-                            << 56) | // top 8 bits: driverId [0, 255]
-          (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+      uint64_t encodedId;
+      if (useOptimizedEncoding) {
+        // Optimized: driverId (8 bits) | globalRowId (56 bits)
+        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+            (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+      } else {
+        // Non-optimized: driverId (8 bits) | batchId (16 bits) | localRowId (40 bits)
+        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+            HybridContainer::encodeBatchAndLocalRow(batchId, rowIndex);
+      }
       rows->storeSingleRowId(encodedId, newRow);
     });
     auto payloadInput = wrapColumns(

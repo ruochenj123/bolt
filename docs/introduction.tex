@@ -1,0 +1,79 @@
+\section{Introduction}
+
+Modern distributed OLAP systems increasingly adopt a \emph{composable architecture}~\cite{composable1, composable2, composable3}, in which the data processing stack is modularized into independent components for storage, query planning, and execution. In this model, a distributed query planner, such as Presto~\cite{presto} or Spark~\cite{spark}, generates execution plans and coordinates task scheduling across the cluster, while specialized execution engines perform the actual query processing. Execution engines in this setting are often \emph{vectorized}, meaning they process data in batches of columnar vectors rather than one tuple at a time. Vectorized processing is naturally aligned with columnar in-memory layouts, which improve CPU cache efficiency, reduce memory bandwidth usage, and exploit Single Instruction, Multiple Data (SIMD) parallelism. These advantages have made columnar, vectorized execution the de facto standard for modern analytic workloads, as evidenced by its adoption in widely used systems such as Velox~\cite{velox}, \proj~\cite{bolt}, DuckDB~\cite{duckdb}, and ClickHouse~\cite{clickhouse}.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/data-flow-new.pdf}
+	\caption{Data layout conversions in a simple query plan. Red arrows indicate inter-operator conversions, and blue arrows indicate intra-operator conversions.}
+    \label{fig:data-flow}
+	\vspace{1em}
+\end{figure}
+
+
+While columnar layouts excel for scan-heavy operators such as filters and projections, not all query operators benefit equally from purely columnar processing. In particular, operators such as \emph{HashJoin}, \emph{Sort}, and \emph{HashAgg}, etc., often require accessing multiple columns from the same row together—for instance, during key building, probing, or comparison—or maintaining per-row state in memory. Prior research~\cite{duckdb-sort, duckdb-join} has shown that operators such as Sort and HashJoin can achieve better performance with row-wise data layouts due to improved CPU cache locality and reduced pointer indirections. Consequently, many vectorized execution engines perform \emph{column-row layout conversions} at runtime—packing columnar input into temporary row-wise representations before processing, and unpacking results back into columnar form afterward. These conversions arise at two distinct levels.
+\begin{enumerate}
+    \item \textbf{Intra-operator conversions} occur when an operator internally converts columnar input into rows to enable efficient key-centric processing.
+    \item \textbf{Inter-operator conversions} occur when data produced in a row-oriented format is re-materialized into columnar form to satisfy the columnar interface expected by downstream operators.
+\end{enumerate}
+
+% To accommodate these diverse access patterns, modern vectorized engines frequently perform data layout conversions between columnar and row-oriented formats. As illustrated in Figure~\ref{fig:data-flow}, 
+
+% Velox, for instance, provides a \texttt{RowContainer} abstraction for temporary in-memory row-wise storage.
+
+
+
+Figure~\ref{fig:data-flow} illustrates these conversions in a simple query plan consisting of a \emph{HashJoin} and a \emph{Sort}. The blue arrows indicate \emph{intra-operator conversions} within operators, while the red arrows indicate \emph{inter-operator conversions} that occur between operators. Both types introduce nontrivial overhead during query execution. Intra-operator conversions incur additional memory allocation, data copying, and CPU cost. For example, in \proj, they can account for more than 50\% of the total CPU time of HashJoin in TPC-DS Query~30, as shown in Figure~\ref{fig:join-breakdown}. Inter-operator conversions further amplify this overhead when adjacent operators—such as HashJoin followed by Sort—both benefit from row-wise processing, leading to redundant materialization of the same data across operator boundaries.
+
+
+% Figure~\ref{fig:data-flow} illustrates these conversions in a simple query plan consisting of a \emph{Filter}, \emph{HashJoin}, and \emph{Sort}. The red arrows indicate inter-operator conversions that occur between operators, while the blue arrows indicate intra-operator conversions within operators. Both of these two conversions can lead to overhead in the query processing: inter-operator conversions sometimes can be redundant when two adjacent operators both are benefit from row-wise layout, for example, HashJoin and Sort here. On the other hand, inter-operator conversions incur additional memory allocations, copying costs, and CPU overhead.  For example, as shown in Figure~\ref{fig:join-breakdown}, in Velox, the conversion alone can account for more than 50\% of total CPU time in HashJoin operators for TPC-DS Query 30.
+
+
+% However, these conversions are not free: they incur additional memory allocations, copying costs, and CPU overhead, making layout switching a critical trade-off in query execution. For example, as shown in Figure~\ref{fig:join-breakdown}, in Velox, the conversion alone can account for more than 50\% of total CPU time in HashJoin operators for TPC-DS Query 30.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\columnwidth]{figures/hashjoin_breakdown.pdf}
+	\caption{CPU time breakdown of \emph{HashJoin} for TPC-DS Query~30 (SF=10), executed in \proj with a single driver.}
+    \label{fig:join-breakdown}
+	\vspace{1em}
+\end{figure}
+
+In this paper, we target the overhead of both \emph{intra-operator} and \emph{inter-operator} layout conversions in vectorized engines.
+To mitigate the intra-operator conversion overheads, we propose a \emph{hybrid execution model} that combines row‑oriented and columnar processing within a single vectorized pipeline.
+Unlike existing approaches that repeatedly convert entire tuples between column- and row-based layouts, our design stores data in a hybrid layout—keeping only \emph{key columns} (frequently accessed together in key‑intensive operators such as HashJoin and Sort) in a compact row‑wise format, while keeping \emph{payload columns} in their native columnar form.
+This approach preserves cache‑locality benefits for key processing while avoiding the cost of packing wide payloads into rows.
+
+Building on this hybrid representation, we further propose a \emph{late materialization} \rj{need a better name} technique that eliminates redundant inter-operator conversions in common analytic pipelines. Such pipelines frequently arise in $N$-way joins or when a join is immediately followed by another key-centric operator, such as Sort. In these cases, eagerly materializing a join’s full output into columnar vectors—only for a downstream operator to immediately reconstruct row-wise data again—wastes CPU cycles and memory bandwidth.
+
+Our approach defers materialization across operator boundaries. Instead of fully materializing its output, HashJoin produces only the key columns required by the downstream operator, while retaining lightweight references that enable the reconstruction of full tuples at a later stage. Downstream operators consume these keys through their standard vectorized interfaces, and payload columns are materialized only when the final output is produced. By decoupling key processing from payload materialization, our design avoids repeated row-to-column reconstruction across operators and reduces inter-operator conversion overhead without modifying the core join algorithms.
+
+
+The main contributions of this paper are as follows:
+\begin{enumerate}[leftmargin=*,topsep=0.3em]
+    \item We propose a \emph{hybrid columnar--row execution model} for vectorized engines that reduces \emph{intra-operator} layout conversion overhead by storing only key columns in a compact row-oriented format while preserving columnar storage for payloads.
+    \item We design an \emph{$N$-way late materialization} technique for multi-operator pipelines—such as $N$-way joins and joins followed by Sort—that defers full tuple materialization and eliminates redundant inter-operator row/column conversions.
+    \item We implement these techniques in \proj~\cite{bolt}, an open-source OLAP query engine developed by ByteDance, and evaluate them on \emph{HashJoin} and \emph{Sort} using the TPC-DS benchmark and real-world workloads. Our results demonstrate up to a $1.43\times$ improvement in end-to-end query performance compared to the baseline. \rj{update after getting new results}.
+\end{enumerate}
+
+
+
+
+
+The paper is structured as follows.
+Section~\ref{sec:layout} introduces the design of the hybrid execution model.
+Section~\ref{sec:late_m} presents our late materialization technique for reducing inter-operator layout conversion overheads in multi-operator pipelines.
+Section~\ref{sec:exp} evaluates our approach on \emph{HashJoin} and \emph{Sort} using both benchmark and real-world workloads.
+Section~\ref{sec:related_work} discusses related work, and Section~\ref{sec:conclusion} concludes with future directions.
+
+
+
+
+
+
+
+
+
+
+
+

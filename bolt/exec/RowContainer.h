@@ -2066,6 +2066,20 @@ class HybridContainer {
     return reorderEnabled_ && !isSingleContainer();
   }
 
+  // Controls whether to use optimized extraction path.
+  // When disabled: skip coalesceBatches, sortByContainerId, prefetch.
+  void setExtractionOptimized(bool enabled) {
+    extractionOptimized_ = enabled;
+    // When not optimized, also disable reorder (sortByContainerId)
+    if (!enabled) {
+      reorderEnabled_ = false;
+    }
+  }
+
+  bool isExtractionOptimized() const {
+    return extractionOptimized_;
+  }
+
   // === N-Way Late Materialization Support ===
 
   /// Append upstream references for a batch of rows.
@@ -2240,6 +2254,12 @@ class HybridContainer {
 
   // Coalesce all payload batches into a single batch to improve locality.
   void coalesceBatches() {
+    // Skip coalesce when extraction optimization is disabled.
+    // Non-optimized extraction will use binary search on cumulativeRowCounts_.
+    if (!extractionOptimized_) {
+      return;
+    }
+    
     // Only skip if no payload columns or no batches to coalesce.
     // Always flatten even for single batch, as input may be dictionary-encoded
     // or other non-flat encodings. Extraction expects FlatVectors.
@@ -2322,6 +2342,16 @@ class HybridContainer {
       const ColumnSourceMap& sourceMap,
       const RowVectorPtr& output);
 
+  /// Encode batchId and localRowId into rowId format.
+  /// Used when extractionOptimized_ = false.
+  /// Format: (batchId << 40) | localRowId
+  /// - batchId: 16 bits (supports up to 65536 batches)
+  /// - localRowId: 40 bits (supports up to ~1 trillion rows per batch)
+  static uint64_t encodeBatchAndLocalRow(uint32_t batchId, vector_size_t localRowId) {
+    return (static_cast<uint64_t>(batchId) << 40) |
+           (static_cast<uint64_t>(localRowId) & ((1ULL << 40) - 1));
+  }
+
  private:
   // Get the single container's coalesced data (only valid when
   // isSingleContainer()). Validates that the single container is actually this
@@ -2335,6 +2365,75 @@ class HybridContainer {
     BOLT_DCHECK_EQ(it->first, id_, "Single container ID mismatch with self ID");
     BOLT_DCHECK(it->second == this, "Single container is not self");
     return owningInputs_[0].get();
+  }
+
+  /// Decode batchId and localRowId from encoded rowId.
+  /// When extractionOptimized_ = false, rowId encodes: (batchId << 40) | localRowId
+  /// @return (batchId, localRowId)
+  static std::pair<uint32_t, vector_size_t> decodeBatchAndLocalRow(uint64_t rowId) {
+    uint32_t batchId = static_cast<uint32_t>(rowId >> 40);
+    vector_size_t localRowId = static_cast<vector_size_t>(rowId & ((1ULL << 40) - 1));
+    return {batchId, localRowId};
+  }
+
+  // Simple extraction without prefetch (non-optimized path).
+  // Uses batchId encoding: rowId = (batchId << 40) | localRowId
+  // NOTE: This handles encoded (dictionary, constant) vectors by using
+  // vector->wrappedVector() and wrappedIndex().
+  template <typename T>
+  void extractPayloadSimple(
+      int32_t numRows,
+      int32_t columnIndex,
+      int32_t resultOffset,
+      FlatVector<T>* FOLLY_NONNULL result,
+      std::vector<HybridRowId>& outputRowIds) {
+    auto maxRows = numRows + resultOffset;
+    BOLT_DCHECK_LE(maxRows, result->size());
+
+    BufferPtr& nullBuffer = result->mutableNulls(maxRows);
+    auto nulls = nullBuffer->asMutable<uint64_t>();
+    BufferPtr valuesBuffer = result->mutableValues(maxRows);
+    auto values = valuesBuffer->asMutableRange<T>();
+
+    for (int32_t i = 0; i < numRows; ++i) {
+      const auto& rec = outputRowIds[i];
+      // Look up in the container for this row
+      auto it = allContainers_.find(rec.containerId_);
+      BOLT_CHECK(
+          it != allContainers_.end(),
+          "containerId not found in allContainers_");
+      auto* container = it->second;
+      BOLT_CHECK_NOT_NULL(container);
+      
+      // Decode batchId and localRowId from encoded rowId
+      auto [batchId, localRowId] = decodeBatchAndLocalRow(rec.rowId_);
+      BOLT_CHECK(
+          batchId < container->owningInputs_.size(),
+          "batchId >= owningInputs_.size()");
+      BOLT_CHECK_NOT_NULL(container->owningInputs_[batchId]);
+      auto* sourceChild = container->owningInputs_[batchId]->childAt(columnIndex).get();
+      BOLT_CHECK_NOT_NULL(sourceChild);
+      
+      auto resultIndex = resultOffset + i;
+      
+      // Handle encoded vectors (dictionary, constant, etc.) by unwrapping
+      if (sourceChild->isNullAt(localRowId)) {
+        bits::setBit(nulls, resultIndex, true);
+      } else {
+        bits::setBit(nulls, resultIndex, false);
+        // Get the underlying flat vector and the decoded index
+        auto* inner = sourceChild->wrappedVector();
+        auto innerIndex = sourceChild->wrappedIndex(localRowId);
+        auto* sourceFlat = inner->template asFlatVector<T>();
+        BOLT_CHECK_NOT_NULL(sourceFlat);
+        
+        if constexpr (std::is_same_v<T, StringView>) {
+          result->set(resultIndex, sourceFlat->valueAt(innerIndex));
+        } else {
+          values[resultIndex] = sourceFlat->valueAt(innerIndex);
+        }
+      }
+    }
   }
 
   template <TypeKind Kind>
@@ -2391,6 +2490,14 @@ class HybridContainer {
     BOLT_CHECK(Kind != TypeKind::ROW && Kind != TypeKind::MAP);
     using T = typename KindToFlatVector<Kind>::HashRowType;
     auto flatResult = result->as<FlatVector<T>>();
+
+    // Non-optimized extraction path: no coalesce, no sortByContainerId, no prefetch.
+    // Uses binary search to find batch from global rowId.
+    if (!extractionOptimized_) {
+      extractPayloadSimple<T>(
+          numRows, columnIndex, resultOffset, flatResult, outputRowIds);
+      return;
+    }
 
     // Fast path for single container (spilling, sort) - avoids map lookups
     if (isSingleContainer()) {
@@ -3074,6 +3181,13 @@ class HybridContainer {
   // Controls whether to reorder rows by containerId during extraction.
   // Default true for better cache locality. Can be disabled for testing.
   bool reorderEnabled_{true};
+
+  // Controls whether to use optimized extraction path:
+  // - coalesceBatches() to merge into single contiguous batch
+  // - sortByContainerId for better cache locality
+  // - prefetch in extraction loops
+  // When false, use simple extraction with batchId encoding.
+  bool extractionOptimized_{true};
 
   // === N-Way Late Materialization Support ===
   // Upstream row pointers for N-way join chain.

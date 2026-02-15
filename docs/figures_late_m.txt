@@ -1,0 +1,344 @@
+================================================================================
+FIGURES FOR LATE MATERIALIZATION SECTION
+================================================================================
+These are text-based diagrams to be converted to proper figures.
+
+
+================================================================================
+FIGURE 1: Baseline N-Way Join Execution (fig:nway-baseline)
+================================================================================
+
+Query: SELECT c.c_custkey, c.c_name, c.c_address, o.o_totalprice, 
+              l.l_quantity, l.l_extendedprice
+       FROM customer c 
+       JOIN orders o ON c.c_custkey = o.o_custkey
+       JOIN lineitem l ON o.o_orderkey = l.l_orderkey
+       ORDER BY c.c_custkey
+
+Pipeline Structure:
+-------------------
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Pipeline 0: Base Table → HashBuild₀                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌──────────────┐      ┌───────────────────────────────────────────────┐  │
+│   │   customer   │      │              HashBuild₀                        │  │
+│   │  (TableScan) │─────▶│  ┌─────────────────────────────────────────┐  │  │
+│   │              │      │  │ HybridContainer                         │  │  │
+│   │ c_custkey    │      │  │  Keys: c_custkey                        │  │  │
+│   │ c_name       │      │  │  Payload: c_name, c_address, ...        │  │  │
+│   │ c_address    │      │  │  rowRef → columnar batches              │  │  │
+│   │ ...          │      │  └─────────────────────────────────────────┘  │  │
+│   └──────────────┘      └───────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼ Hash Table
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Pipeline 1: TableScan → HashProbe₀ → [MATERIALIZE] → HashBuild₁             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌──────────────┐      ┌──────────────────────┐     ┌──────────────────┐  │
+│   │    orders    │      │     HashProbe₀       │     │   HashBuild₁     │  │
+│   │  (TableScan) │─────▶│                      │     │                  │  │
+│   │              │      │  1. Probe hash table │     │ ┌──────────────┐ │  │
+│   │ o_custkey    │      │  2. Extract matches  │     │ │HybridContainer│ │  │
+│   │ o_orderkey   │      │                      │     │ │Keys: c_custkey│ │  │
+│   │ o_totalprice │      │  Output (columnar):  │     │ │      o_orderkey│ │  │
+│   └──────────────┘      │  ┌────────────────┐  │     │ │Payload:       │ │  │
+│                         │  │ c_custkey      │  │────▶│ │  c_name       │ │  │
+│                         │  │ c_name         │  │     │ │  c_address    │ │  │
+│                         │  │ c_address      │  │ ▲   │ │  o_totalprice │ │  │
+│                         │  │ o_orderkey     │  │ │   │ └──────────────┘ │  │
+│                         │  │ o_totalprice   │  │ │   │                  │  │
+│                         │  └────────────────┘  │ │   └──────────────────┘  │
+│                         └──────────────────────┘ │                          │
+│                                                  │                          │
+│                              FULL MATERIALIZATION                           │
+│                              (extract all columns from HybridContainer₀)    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼ Hash Table
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Pipeline 2: TableScan → HashProbe₁ → [MATERIALIZE] → Sort → Output          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌──────────────┐      ┌──────────────────────┐     ┌──────────────────┐  │
+│   │   lineitem   │      │     HashProbe₁       │     │      Sort        │  │
+│   │  (TableScan) │─────▶│                      │────▶│                  │  │
+│   │              │      │  1. Probe hash table │     │ ORDER BY         │  │
+│   │ l_orderkey   │      │  2. Extract matches  │     │ c_custkey        │  │
+│   │ l_quantity   │      │                      │     │                  │  │
+│   │ l_extendedp. │      │  Output (columnar):  │     └──────────────────┘  │
+│   └──────────────┘      │  ┌────────────────┐  │              │            │
+│                         │  │ c_custkey      │  │              ▼            │
+│                         │  │ c_name         │  │        ┌──────────┐       │
+│                         │  │ c_address      │  │        │  Output  │       │
+│                         │  │ o_totalprice   │  │        │ (final)  │       │
+│                         │  │ l_quantity     │  │        └──────────┘       │
+│                         │  │ l_extendedprice│  │                           │
+│                         │  └────────────────┘  │                           │
+│                         └──────────────────────┘                           │
+│                                   ▲                                         │
+│                                   │                                         │
+│                     FULL MATERIALIZATION (again!)                           │
+│                     (extract from HybridContainer₁)                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+PROBLEM: 
+- HashProbe₀ extracts ALL columns (c_name, c_address, o_totalprice...)
+- HashBuild₁ re-converts them to row format (hybrid)
+- HashProbe₁ extracts ALL columns again
+- Redundant column extraction at each level!
+
+
+================================================================================
+FIGURE 2: N-Way Late Materialization (fig:nway-late-m)
+================================================================================
+
+Same query, with late materialization enabled:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Pipeline 0: Base Table → HashBuild₀                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌──────────────┐      ┌───────────────────────────────────────────────┐  │
+│   │   customer   │      │              HashBuild₀                        │  │
+│   │  (TableScan) │─────▶│  ┌─────────────────────────────────────────┐  │  │
+│   │              │      │  │ HybridContainer₀                        │  │  │
+│   │ c_custkey    │      │  │  Keys: c_custkey + rowRef               │  │  │
+│   │ c_name       │      │  │  Payload: c_name, c_address (columnar)  │  │  │
+│   │ c_address    │      │  └─────────────────────────────────────────┘  │  │
+│   │ ...          │      │                                               │  │
+│   └──────────────┘      │  columnSourceMap: {                           │  │
+│                         │    c_custkey → (HYBRID_KEY, container₀, col0) │  │
+│                         │    c_name    → (HYBRID_PAY, container₀, col0) │  │
+│                         │    c_address → (HYBRID_PAY, container₀, col1) │  │
+│                         │  }                                            │  │
+│                         └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼ Hash Table
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Pipeline 1: TableScan → HashProbe₀ → [DEFER] → HashBuild₁                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌──────────────┐      ┌─────────────────────────────────────────────────┐│
+│   │    orders    │      │     HashProbe₀ (Late-M Output Mode)             ││
+│   │  (TableScan) │─────▶│                                                 ││
+│   │              │      │  1. Probe hash table                            ││
+│   │ o_custkey    │      │  2. For each match:                             ││
+│   │ o_orderkey   │      │     - Get buildRowPtr (pointer to container₀)   ││
+│   │ o_totalprice │      │     - Encode probeRowId for orders payload      ││
+│   └──────────────┘      │     - Store orders payload in ProbePayload₀     ││
+│                         │                                                 ││
+│                         │  Output (KEYS ONLY):   ProbePayloadContainer₀:  ││
+│                         │  ┌─────────────────┐   ┌────────────────────┐   ││
+│                         │  │ c_custkey (key) │   │ o_totalprice       │   ││
+│                         │  │ o_orderkey (key)│   │ (columnar batches) │   ││
+│                         │  │ buildRowPtr───────▶ │                    │   ││
+│                         │  │ probeRowId────────▶ │                    │   ││
+│                         │  └─────────────────┘   └────────────────────┘   ││
+│                         └─────────────────────────────────────────────────┘│
+│                                   │                                        │
+│                                   ▼                                        │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │              HashBuild₁ (Late-M Input Mode)                          │  │
+│   │  ┌─────────────────────────────────────────────────────────────┐    │  │
+│   │  │ HybridContainer₁                                            │    │  │
+│   │  │  Keys: c_custkey, o_orderkey + rowRef                       │    │  │
+│   │  │  upstreamBuildRowPtr → container₀ row                       │    │  │
+│   │  │  upstreamProbeRowId → ProbePayload₀ row                     │    │  │
+│   │  │  (NO payload columns stored - just references!)             │    │  │
+│   │  └─────────────────────────────────────────────────────────────┘    │  │
+│   │                                                                     │  │
+│   │  columnSourceMap (extended):                                        │  │
+│   │  {                                                                  │  │
+│   │    c_custkey    → (HYBRID_KEY, container₁, col0)                    │  │
+│   │    c_name       → (HYBRID_PAY, container₀, col0)  ◄── still at 0!   │  │
+│   │    c_address    → (HYBRID_PAY, container₀, col1)  ◄── still at 0!   │  │
+│   │    o_orderkey   → (HYBRID_KEY, container₁, col1)                    │  │
+│   │    o_totalprice → (PROBE_PAY, ProbePayload₀, col0)                  │  │
+│   │  }                                                                  │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼ Hash Table
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Pipeline 2: TableScan → HashProbe₁ → [FINAL MATERIALIZE] → Sort → Output   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌──────────────┐      ┌─────────────────────────────────────────────────┐│
+│   │   lineitem   │      │     HashProbe₁ (Final Materialization Mode)     ││
+│   │  (TableScan) │─────▶│                                                 ││
+│   │              │      │  1. Probe hash table                            ││
+│   │ l_orderkey   │      │  2. For each match, get row from container₁     ││
+│   │ l_quantity   │      │  3. Follow upstreamBuildRowPtr → container₀     ││
+│   │ l_extendedp. │      │  4. Use columnSourceMap to locate each column:  ││
+│   └──────────────┘      │                                                 ││
+│                         │     c_custkey    ← container₁.keys[col0]        ││
+│                         │     c_name       ← container₀.payload[col0]     ││
+│                         │     c_address    ← container₀.payload[col1]     ││
+│                         │     o_totalprice ← ProbePayload₀[col0]          ││
+│                         │     l_quantity   ← current probe input          ││
+│                         │     l_extendedp. ← current probe input          ││
+│                         │                                                 ││
+│                         │  5. Single-pass extraction from all sources!    ││
+│                         └─────────────────────────────────────────────────┘│
+│                                   │                                        │
+│                                   ▼                                        │
+│                         ┌─────────────────┐      ┌──────────────┐          │
+│                         │ Output (full)   │─────▶│     Sort     │──▶ Out   │
+│                         │ c_custkey       │      │              │          │
+│                         │ c_name          │      └──────────────┘          │
+│                         │ c_address       │                                │
+│                         │ o_totalprice    │                                │
+│                         │ l_quantity      │                                │
+│                         │ l_extendedprice │                                │
+│                         └─────────────────┘                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+KEY BENEFITS:
+- HashProbe₀ outputs only KEYS (c_custkey, o_orderkey), not payload!
+- HashBuild₁ stores only REFERENCES, not materialized data!
+- Payload columns extracted ONCE at final HashProbe₁
+- No redundant column-to-row-to-column conversions!
+
+
+================================================================================
+FIGURE 3: Column Source Map and Provenance Chain
+================================================================================
+
+                     ┌─────────────────────────────────────┐
+                     │         columnSourceMap             │
+                     │     (tracks column provenance)      │
+                     └─────────────────────────────────────┘
+                                      │
+          ┌───────────────────────────┼───────────────────────────┐
+          │                           │                           │
+          ▼                           ▼                           ▼
+┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
+│  Output Column 0    │   │  Output Column 1    │   │  Output Column 4    │
+│    "c_custkey"      │   │    "c_name"         │   │   "l_quantity"      │
+├─────────────────────┤   ├─────────────────────┤   ├─────────────────────┤
+│ Type: HYBRID_KEY    │   │ Type: HYBRID_PAYLOAD│   │ Type: CURRENT_PROBE │
+│ Container: HC₁      │   │ Container: HC₀      │   │ (probe input)       │
+│ Column Index: 0     │   │ Column Index: 0     │   │ Column Index: 3     │
+└─────────────────────┘   └─────────────────────┘   └─────────────────────┘
+          │                           │                           │
+          │                           │                           │
+          ▼                           ▼                           ▼
+┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐
+│  HybridContainer₁   │   │  HybridContainer₀   │   │  Current probe      │
+│  (level 1 join)     │   │  (level 0, base)    │   │  RowVector input    │
+│  ┌───────────────┐  │   │  ┌───────────────┐  │   │                     │
+│  │RowContainer   │  │   │  │ColumnarBatch │  │   │   l_orderkey        │
+│  │  c_custkey ◄──┼──┘   │  │  c_name ◄─────┼──┘   │   l_quantity  ◄─────┘
+│  │  o_orderkey   │  │   │  │  c_address    │  │   │   l_extendedprice   │
+│  │  rowRef       │  │   │  │  ...          │  │   │   ...               │
+│  │  upstreamPtr──┼──┼───┼──┼──────────────▶│  │   └─────────────────────┘
+│  └───────────────┘  │   │  └───────────────┘  │
+└─────────────────────┘   └─────────────────────┘
+
+
+
+================================================================================
+FIGURE 4: Row Reference Structure (Detail)
+================================================================================
+
+Single row in HybridContainer (with late-m enabled):
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Row in HybridContainer                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                         RowContainer Entry                            │  │
+│  ├──────────┬──────────┬──────────┬─────────────────────────────────────┤  │
+│  │ Key Col 0│ Key Col 1│ Null bits│            hybridRowId              │  │
+│  │ c_custkey│o_orderkey│ (1 byte) │  ┌───────────┬──────────────────┐   │  │
+│  │ (8 bytes)│ (8 bytes)│          │  │containerID│   localRowIndex  │   │  │
+│  │          │          │          │  │ (8 bits)  │    (56 bits)     │   │  │
+│  │          │          │          │  └───────────┴──────────────────┘   │  │
+│  └──────────┴──────────┴──────────┴─────────────────────────────────────┘  │
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │                  Upstream References (Late-M Only)                    │  │
+│  ├─────────────────────────────────┬────────────────────────────────────┤  │
+│  │      upstreamBuildRowPtr        │        upstreamProbeRowId          │  │
+│  │         (64 bits)               │           (64 bits)                │  │
+│  │                                 │  ┌───────────┬──────────────────┐  │  │
+│  │  Points to matched row in       │  │ driverId  │   localRowIndex  │  │  │
+│  │  parent HybridContainer         │  │ (8 bits)  │    (56 bits)     │  │  │
+│  │         ↓                       │  └───────────┴──────────────────┘  │  │
+│  │  ┌─────────────────────┐        │         ↓                          │  │
+│  │  │ HybridContainer₀    │        │  ┌─────────────────────────┐       │  │
+│  │  │ (parent level)      │        │  │ ProbePayloadContainer   │       │  │
+│  │  │ c_name, c_address...│        │  │ o_totalprice...         │       │  │
+│  │  └─────────────────────┘        │  └─────────────────────────┘       │  │
+│  └─────────────────────────────────┴────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Total overhead per row: 16 bytes (upstreamBuildRowPtr + upstreamProbeRowId)
+
+
+================================================================================
+FIGURE 5: Execution Timeline Comparison
+================================================================================
+
+Baseline (Full Materialization at Each Level):
+──────────────────────────────────────────────
+
+Time ─────────────────────────────────────────────────────────────────────────▶
+
+HashBuild₀  │████████████████│
+            │   store keys   │
+            │ + ALL payloads │
+
+HashProbe₀  │                │██████████████████████████████│
+            │                │  probe + EXTRACT ALL COLUMNS │
+            │                │  (c_name, c_address, o_price)│
+
+HashBuild₁  │                │                              │██████████████████│
+            │                │                              │   RE-STORE keys  │
+            │                │                              │ + ALL payloads   │
+            │                │                              │   (again!)       │
+
+HashProbe₁  │                │                              │                  │██████████████████│
+            │                │                              │                  │ EXTRACT ALL AGAIN│
+
+Sort        │                │                              │                  │                  │████│
+
+
+Late Materialization:
+────────────────────
+
+Time ─────────────────────────────────────────────────────────────────────────▶
+
+HashBuild₀  │████████████████│
+            │   store keys   │
+            │ + payload refs │
+
+HashProbe₀  │                │█████████████│
+            │                │probe + OUTPUT│
+            │                │ KEYS ONLY   │
+
+HashBuild₁  │                │             │███████████│
+            │                │             │store keys │
+            │                │             │ + refs    │
+
+HashProbe₁  │                │             │           │████████████████████│
+            │                │             │           │ probe + EXTRACT ALL│
+            │                │             │           │ FROM SOURCES       │
+
+Sort        │                │             │           │                    │████│
+
+
+SAVINGS:
+- HashProbe₀: No payload extraction (only keys)
+- HashBuild₁: No payload re-storage (only references)
+- Total column extractions: N → 1 (where N = number of join levels)

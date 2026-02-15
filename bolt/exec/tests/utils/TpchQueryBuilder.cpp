@@ -2787,17 +2787,37 @@ TpchPlan TpchQueryBuilder::getQ25Plan() const {
 // Pattern: Join key (orderkey) = Sort key
 // This is the simple case where late-m just needs to track rowIds from build side.
 TpchPlan TpchQueryBuilder::getQ26Plan() const {
-  // Build-side columns (orders)
-  std::vector<std::string> ordersColumns = {
-      "o_orderkey",     // join key and sort key
-      "o_custkey",      // payload
-      "o_totalprice"    // payload
-  };
-  // Probe-side columns (lineitem)
+  // Q26: Single HashJoin with LARGE BUILD SIDE + filtered probe + build-only output
+  // Purpose: Test intra-operator optimization (hybrid row container)
+  // Pattern: orders (probe, filtered) × lineitem (build)
+  // Key optimizations:
+  // 1. LARGE table (lineitem, 60M rows at SF10) on BUILD side
+  // 2. Filter on probe side to reduce output rows
+  // 3. Only output build-side columns (enables sorted extraction by containerId)
+  //
+  // Build-side columns (lineitem) - LARGE table with wide payload
   std::vector<std::string> lineitemColumns = {
-      "l_orderkey",        // join key
-      "l_quantity",        // payload (probe-side)
-      "l_extendedprice"    // payload (probe-side)
+      "l_orderkey",      // join key
+      "l_partkey",       // payload (BIGINT)
+      "l_suppkey",       // payload (BIGINT)
+      "l_linenumber",    // payload (INTEGER)
+      "l_quantity",      // payload (DOUBLE)
+      "l_extendedprice", // payload (DOUBLE)
+      "l_discount",      // payload (DOUBLE)
+      "l_tax",           // payload (DOUBLE)
+      "l_returnflag",    // payload (VARCHAR)
+      "l_linestatus",    // payload (VARCHAR)
+      "l_shipdate",      // payload (DATE)
+      "l_commitdate",    // payload (DATE)
+      "l_receiptdate",   // payload (DATE)
+      "l_shipinstruct",  // payload (VARCHAR) - 25 chars
+      "l_shipmode",      // payload (VARCHAR)
+      "l_comment"        // payload (VARCHAR) - up to 44 chars
+  };
+  // Probe-side columns (orders) - only join key needed
+  std::vector<std::string> ordersColumns = {
+      "o_orderkey",      // join key
+      "o_orderdate"      // for filter
   };
 
   auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
@@ -2809,31 +2829,44 @@ TpchPlan TpchQueryBuilder::getQ26Plan() const {
   core::PlanNodeId ordersPlanNodeId;
   core::PlanNodeId lineitemPlanNodeId;
 
-  // Build side: orders (30M rows at SF30)
-  auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
-                    .filtersAsNode(filtersAsNode_)
-                    .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
-                    .captureScanNodeId(ordersPlanNodeId)
-                    .planNode();
+  // Build side: lineitem (18M rows at SF3, 60M at SF10) - LARGE table
+  auto lineitem = PlanBuilder(planNodeIdGenerator, pool_.get())
+                      .filtersAsNode(filtersAsNode_)
+                      .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
+                      .captureScanNodeId(lineitemPlanNodeId)
+                      .planNode();
 
-  // HashJoin: lineitem (probe) x orders (build), then Sort on o_orderkey
-  // Output includes columns from both sides
+  // HashJoin: orders (probe, filtered) x lineitem (build)
+  // Filter: o_orderdate >= '1995-01-01' (keeps ~60% of orders)
+  // Output: ONLY build-side columns (enables sorted extraction optimization)
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
           .filtersAsNode(filtersAsNode_)
-          .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
-          .captureScanNodeId(lineitemPlanNodeId)
+          .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
+          .captureScanNodeId(ordersPlanNodeId)
+          .filter("o_orderdate >= '1995-01-01'::DATE")
           .hashJoin(
-              {"l_orderkey"},
               {"o_orderkey"},
-              orders,
+              {"l_orderkey"},
+              lineitem,
               "",
-              {"o_orderkey",       // build-side (sort key)
-               "o_custkey",        // build-side payload
-               "o_totalprice",     // build-side payload
-               "l_quantity",       // probe-side payload
-               "l_extendedprice"}) // probe-side payload
-          .orderBy({"o_orderkey"}, false)
+              {// Build-side (lineitem) columns ONLY - 16 columns
+               "l_orderkey",
+               "l_partkey",
+               "l_suppkey",
+               "l_linenumber",
+               "l_quantity",
+               "l_extendedprice",
+               "l_discount",
+               "l_tax",
+               "l_returnflag",
+               "l_linestatus",
+               "l_shipdate",
+               "l_commitdate",
+               "l_receiptdate",
+               "l_shipinstruct",
+               "l_shipmode",
+               "l_comment"})
           .planNode();
 
   TpchPlan context;
@@ -2994,66 +3027,55 @@ TpchPlan TpchQueryBuilder::getQ27Plan() const {
   return context;
 }
 
-// Q28: 2-way join with DIFFERENT join key vs sort key
-// SELECT l_orderkey, l_shipdate, l_quantity, o_orderkey, o_totalprice
-// FROM lineitem JOIN orders ON l_orderkey = o_orderkey
-// ORDER BY l_shipdate
-// Pattern: Join key (orderkey) != Sort key (shipdate)
-// This tests late-m when the final sort key is NOT the join key.
+// Q28: Simple sort on lineitem with large payload and two sort keys
+// SELECT all lineitem columns
+// FROM lineitem
+// ORDER BY l_shipdate, l_orderkey
+// 
+// This query tests:
+// 1. Pure sort (no join) with large payload
+// 2. Two sort keys (l_shipdate, l_orderkey)
+// 3. All 16 lineitem columns to maximize late-m payload benefit
 TpchPlan TpchQueryBuilder::getQ28Plan() const {
-  // Probe-side columns (lineitem)
+  // All lineitem columns - large payload for late-m benefit
   std::vector<std::string> lineitemColumns = {
-      "l_orderkey",     // join key
-      "l_shipdate",     // sort key (different from join key!)
-      "l_quantity"      // payload
-  };
-  // Build-side columns (orders)
-  std::vector<std::string> ordersColumns = {
-      "o_orderkey",     // join key
-      "o_totalprice"    // payload
+      "l_orderkey",       // payload (BIGINT)
+      "l_partkey",        // payload (BIGINT)
+      "l_suppkey",        // payload (BIGINT)
+      "l_linenumber",     // payload (INTEGER)
+      "l_quantity",       // payload (DOUBLE)
+      "l_extendedprice",  // payload (DOUBLE)
+      "l_discount",       // payload (DOUBLE)
+      "l_tax",            // payload (DOUBLE)
+      "l_returnflag",     // payload (VARCHAR)
+      "l_linestatus",     // payload (VARCHAR)
+      "l_shipdate",       // payload (DATE)
+      "l_commitdate",     // payload (DATE)
+      "l_receiptdate",    // payload (DATE)
+      "l_shipinstruct",   // payload (VARCHAR) - 25 chars
+      "l_shipmode",       // payload (VARCHAR)
+      "l_comment"         // sort key (VARCHAR) - up to 44 chars
   };
 
   auto lineitemSelectedRowType = getRowType(kLineitem, lineitemColumns);
   const auto& lineitemFileColumns = getFileColumnNames(kLineitem);
-  auto ordersSelectedRowType = getRowType(kOrders, ordersColumns);
-  const auto& ordersFileColumns = getFileColumnNames(kOrders);
 
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
   core::PlanNodeId lineitemPlanNodeId;
-  core::PlanNodeId ordersPlanNodeId;
 
-  // Build side: orders
-  auto orders = PlanBuilder(planNodeIdGenerator, pool_.get())
-                    .filtersAsNode(filtersAsNode_)
-                    .tableScan(kOrders, ordersSelectedRowType, ordersFileColumns)
-                    .captureScanNodeId(ordersPlanNodeId)
-                    .planNode();
-
-  // HashJoin: lineitem (probe) x orders (build), then Sort on l_shipdate
-  // Note: Sort key (l_shipdate) is NOT the join key (l_orderkey)
+  // Simple: scan lineitem, sort by l_comment (VARCHAR)
   auto plan =
       PlanBuilder(planNodeIdGenerator, pool_.get())
           .filtersAsNode(filtersAsNode_)
           .tableScan(kLineitem, lineitemSelectedRowType, lineitemFileColumns)
           .captureScanNodeId(lineitemPlanNodeId)
-          .hashJoin(
-              {"l_orderkey"},
-              {"o_orderkey"},
-              orders,
-              "",
-              {"l_orderkey",     // probe-side
-               "l_shipdate",     // probe-side (sort key!)
-               "l_quantity",     // probe-side payload
-               "o_orderkey",     // build-side
-               "o_totalprice"})  // build-side payload
-          .orderBy({"l_shipdate"}, false)
+          .orderBy({"l_comment"}, false)
           .planNode();
 
   TpchPlan context;
   context.planName = "q28";
   context.plan = std::move(plan);
   context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
-  context.dataFiles[ordersPlanNodeId] = getTableFilePaths(kOrders);
   context.dataFileFormat = format_;
   return context;
 }

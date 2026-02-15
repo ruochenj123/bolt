@@ -339,11 +339,13 @@ lateMaterializationTable_ = driverCtx->lateMaterializationTable;  // Keep alive
 
 ### Command Line
 ```bash
-./bolt_tpch_benchmark \
-  --data_path=/path/to/tpch \
-  --run_query_verbose=23 \
-  --hybrid_join_enabled=true \
-  --late_materialization_enabled=true
+./bolt/benchmarks/tpch/bolt_tpch_benchmark \
+  --data_path=/home/jiang.2091/velox_join/data/tpch_parquet/sf3_hive \
+  --run_query_verbose=27 \
+  --num_drivers=1 \
+  --num_splits_per_file=1 \
+  --hybrid_join_enabled=false \
+  --late_materialization_enabled=false
 ```
 
 ### Programmatic

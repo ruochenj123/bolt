@@ -1,0 +1,249 @@
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/velox-join-new.pdf}
+	\caption{Original execution of a right-inner HashJoin in \proj, which requires converting data from columnar to row-oriented format and back.}
+    \label{fig:velox-join}
+	\vspace{1em}
+\end{figure*}
+
+
+\begin{figure}[t]
+    \raggedright
+    \begin{subfigure}{\columnwidth}
+        \raggedright
+        \includegraphics[width=\columnwidth]{figures/rowcontainer_layout.pdf}
+        \caption{Original row-oriented layout in \proj, where key and payload columns are co-located within each row.}
+        \label{fig:rowcontainer-layout}
+    \end{subfigure}
+
+    \vspace{0.6em}
+
+    \begin{subfigure}{\columnwidth}
+        \raggedright
+        \includegraphics[width=\columnwidth]{figures/hybridcontainer_layout.pdf}
+        \caption{Hybrid layout in \proj, where key columns are stored in a row-oriented container and payload columns remain in separate columnar storage referenced via a compact \emph{rowRef}.}
+        \label{fig:hybridcontainer-layout}
+    \end{subfigure}
+
+    \caption{Comparison of row layouts in \proj.}
+    \label{fig:rowcontainer-layouts}
+\end{figure}
+
+
+
+
+
+
+
+\section{Hybrid Execution Model}
+\label{sec:layout}
+\subsection{Existing Design and Limitations}
+
+In existing vectorized execution engines, operators frequently switch between columnar and row-oriented representations during query execution, depending on which layout best supports a given computation.
+For example, in \proj~\cite{bolt} and Velox~\cite{velox}, a HashJoin typically converts its columnar input into a row-oriented format before building the hash table, and reconstructs columnar output after probing.
+Figure~\ref{fig:velox-join} illustrates this process for a right inner HashJoin, where the build side contains both join keys and payload columns, while the probe side provides only join keys.
+
+On the build side, input columnar vectors are packed into a \emph{RowContainer} that stores each tuple contiguously in memory.
+A hash table is built on the join keys, with each entry pointing to a corresponding row in the \emph{RowContainer}.
+During probing, join keys from the probe-side input are used to probe the hash table.
+For each match, the stored row pointer is dereferenced, and the projected payload fields are extracted and written into output columnar vectors.
+Algorithm~\ref{algo:velox-extract} illustrates this materialization process.
+
+A similar design is used by Sort.
+Input columnar vectors are first converted into row-oriented tuples stored in a \emph{RowContainer}, and sorting is performed by comparing key fields via row pointers.
+After sorting completes, the engine reconstructs the sorted row pointers in columnar form to conform to the vectorized execution interface.
+
+Figure~\ref{fig:rowcontainer-layout} shows the internal layout of the \emph{RowContainer}.
+Each row stores all serialized key fields contiguously, followed by their null bitmap.
+Payload (non-key) fields are stored next, also accompanied by a null bitmap.
+For HashJoin, rows additionally contain a next-chain pointer that links tuples with identical join keys, enabling efficient traversal during probing.
+
+While this design improves locality for key access during hashing, probing, and comparison, it has several important limitations.
+First, operators eagerly convert entire tuples into a row-oriented format, even though key-centric operators typically access only a small subset of columns.
+This forces unnecessary copying and movement of payload data that is not immediately needed.
+Second, storing keys and payloads together in wide rows reduces cache efficiency for key-centric access, as cache lines fetched for key processing also bring in unused payload fields.
+Finally, the tightly coupled row-oriented layout prevents operators from optimizing the representation of keys independently from payloads, limiting opportunities for fine-grained layout specialization.
+These limitations motivate the hybrid execution model introduced in the next section.
+
+\begin{algorithm}[t]
+\SetKwInOut{Input}{Input}
+\Input{
+  $C$: set of projected column indices;\\
+  $R$: list of matched row pointers;\\
+  $O$: output RowVector
+}
+\ForEach{$c \in C$}{
+  \For{$i \gets 0$ \KwTo $|R|-1$}{
+    $r \gets \textsc{RowContainer.getRow}(P[i])$\;
+    $O.\textsc{childAt}(c)[i] \gets r.\textsc{valueAt}(c)$\;
+  }
+}
+\caption{Original columnar materialization from a row-oriented layout in \proj.}
+\label{algo:velox-extract}
+\end{algorithm}
+
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/hybrid-join-new.pdf}
+	\caption{Hybrid execution of a right-inner HashJoin in \proj, where only key columns are converted to a row-oriented layout.}
+    \label{fig:hybrid-join}
+	\vspace{1em}
+\end{figure*}
+
+
+
+
+
+\subsection{Our Approach}
+
+Our key observation is that many operators require row-wise access only for their \emph{key columns}, while \emph{payload columns} are accessed primarily to produce final results.
+For example, in joins and sorts, key columns are repeatedly accessed together during processing (e.g., for hashing or comparison), whereas payload columns are accessed only during output materialization.
+Despite this asymmetry, existing designs apply layout conversions uniformly to all columns, forcing both keys and payloads into the same row-oriented representation.
+This leads to substantial CPU and memory overhead, particularly for wide tables and complex query plans where the same data may undergo repeated conversions across operators.
+
+To address this inefficiency, we introduce a \textbf{hybrid execution model} that processes different parts of a tuple using the layout best suited to their access patterns.
+Specifically, key columns are stored and accessed in a row-oriented structure to enable efficient key-centric processing, while payload columns remain in their original columnar representation to avoid unnecessary memory copying and layout conversions.
+
+In \proj, this design is implemented as a \emph{HybridContainer}, which combines a row-oriented \emph{RowContainer} for key storage with columnar \emph{RowVector}s for payload storage.
+Figure~\ref{fig:hybrid-join} illustrates the workflow of the hybrid execution model for a HashJoin.
+On the data-generating side (HashBuild), key columns from the input vectors are packed into the \emph{RowContainer} to maximize cache locality during hash table construction, while payload columns are retained in columnar \emph{RowVector}s extracted directly from the input.
+Each row stored in the \emph{RowContainer} additionally records a compact \emph{rowRef}, which serves as a logical reference to the corresponding payload tuple in columnar storage.
+
+During probing, join keys from the probe-side input are used to probe the hash table.
+For each match, the stored \emph{rowRef} identifies the payload tuple associated with the matched key, allowing the engine to retrieve payload columns directly from columnar storage without packing them into rows.
+The output is then produced in columnar form by combining key columns retrieved from the \emph{RowContainer} with payload columns accessed via \emph{rowRef}.
+A similar execution pattern is used by Sort: after sorting the list of row references based on key comparisons, key columns are retrieved from the \emph{RowContainer}, while payload columns are reconstructed using the corresponding \emph{rowRef}s.
+
+Figure~\ref{fig:hybridcontainer-layout} illustrates the internal memory layout of a row stored in the \proj \emph{HybridContainer}.
+Each row still begins with serialized key values and their associated null bitmap, followed by a 64-bit \emph{rowRef}, and an optional chaining pointer used by hash-based operators. Compared to the original row-oriented layout, this compact row representation reduces the cache-line footprint of each row and improves cache-line utilization during key-centric processing, allowing more rows to fit in cache and improving access efficiency for hashing, comparison, and traversal.
+
+The \emph{rowRef} is a compact, immutable identifier that records where the payload of a tuple is stored in columnar form. 
+In vectorized engines such as \proj and Velox, query execution is organized into pipelines that may be executed by multiple parallel \emph{drivers}~\cite{velox-pipelines}.
+Each driver processes a disjoint subset of the input and maintains its own local operator state.
+For multi-driver operators such as HashJoin, rows produced by different drivers cannot be uniquely identified by a local row index alone.
+Accordingly, \emph{rowRef} encodes both the identifier of the data-generating operator instance (e.g., the HashBuild operator in a HashJoin) and the tuple’s row index within that operator’s input.
+In our implementation, \emph{rowRef} is a 64-bit value that dedicates the high-order bits (by default, 8~bits) to the driver identifier and the remaining bits to the row index, enabling a compact and globally unique reference across all parallel drivers.
+
+This representation uniquely identifies the origin of each tuple and enables efficient, direct access to payload columns during output materialization, as illustrated in Algorithm~\ref{algo:hybrid-materialize}.
+Overall, the hybrid execution model avoids eagerly converting payload columns into row-oriented formats, substantially reducing layout conversion and memory copying overheads while preserving cache locality for key-intensive operations such as HashJoin and Sort.
+As shown in Figure~\ref{fig:join-breakdown}, without affecting hash table build performance, the hybrid execution makes the input conversion phase $5.8\times$ faster and improves overall HashJoin performance by up to $1.7\times$.
+
+
+
+\begin{algorithm}[t]
+\SetKwInOut{Input}{Input}
+\Input{
+  $C$: set of projected column indices;\\
+  $R$: list of matched row references;\\
+  $O$: output RowVector;\\
+  $B$: array of payload RowVectors (columnar batches)
+}
+\ForEach{$c \in C$}{
+  \uIf{$\textsc{isKey}(c)$}{
+    \For{$i \gets 0$ \KwTo $|R|-1$}{
+      $r \gets \textsc{RowContainer.getRow}(R[i])$\;
+      $O[c][i] \gets r.\textsc{valueAt}(c)$\;
+    }
+  }
+  \Else{
+    \For{$i \gets 0$ \KwTo $|R|-1$}{
+      $(did, rid) \gets \textsc{decodeRef}(R[i])$\;
+      $O.\textsc{childAt}(c)[i] \gets B[did][c][rid]$\;
+    }
+  }
+}
+\caption{Hybrid columnar materialization in \proj: key columns are extracted from the \textsc{RowContainer}, while payload columns are read directly from columnar storage.}
+\label{algo:hybrid-materialize}
+\end{algorithm}
+
+
+
+
+% \noindent\textbf{Analysis.}The proposed hybrid in-memory execution model offers two main advantages.
+% First, it eliminates the need for memory copying and full column-to-row conversion for key‑intensive operators, reducing both CPU overhead and memory allocation costs.
+% Second, by separating key columns from payload columns, it improves CPU cache utilization: fetching keys no longer pulls unnecessary payload values into the cache, reducing cache misses during key-intensive operations such as HashBuild and HashProbe.
+
+% The design also introduces trade-offs.
+% Each row stores an additional \texttt{rowId}, which incurs extra memory overhead.
+% This design is a well-known technique in columnar database systems, used for late materialization in systems such as MonetDB~\cite{boncz2005monetdb} and HyPer~\cite{kemper2011hyper} to reconstruct tuples from separate columnar storage.
+% In our case, the \texttt{rowId} serves the same purpose entirely in memory, enabling payload retrieval without storing it in row format.
+% Output materialization thus requires a rowId-based lookup into columnar batches, adding a small CPU cost; for example, Figure~\ref{fig:join-breakdown} shows that the hybrid design incurs about 15\% additional CPU time in HashProbe.
+% In practice, we observe that real‑world queries often have wide payload columns with a limited key columns (for example, a Sort on 4 key columns over a table with around 50 projected columns), making the overhead of storing \texttt{rowId} negligible compared to the performance gains.
+
+
+\subsection{Limitations and Optimizations}
+
+The hybrid execution model reduces \textbf{intra-operator} layout conversion overheads by separating key and payload processing.
+By storing keys in a row-oriented layout and retaining payloads in columnar form, it avoids eagerly materializing wide tuples into rows while preserving cache-friendly, key-centric access for operations such as hashing, comparison, and partitioning.
+
+These benefits have been discussed in detail in the preceding subsections; here we focus on the limitations of the design and the optimizations used to mitigate them.
+
+\medskip
+\noindent\textbf{Limitations.}
+The primary cost introduced by the hybrid design arises during output materialization.
+Unlike the original implementation, which reconstructs output columns from a row-oriented container, the hybrid design retrieves payload values via an indirect reference (\emph{rowRef}) into columnar storage.
+
+In the original materialization procedure (Algorithm~\ref{algo:velox-extract}), rows are stored contiguously in the \emph{RowContainer}.
+Although materialization proceeds column by column, extracting multiple columns for the same set of rows benefits from good cache locality: cache lines fetched while accessing one column of a row are often reused when accessing subsequent columns of the same row.
+As a result, the original design exhibits relatively cache-friendly behavior on the read path during materialization.
+
+In contrast, the hybrid materialization procedure (Algorithm~\ref{algo:hybrid-materialize}) accesses payload columns through \emph{rowRef}, which may refer to tuples originating from different drivers and columnar batches.
+These accesses are inherently less cache-friendly, as payload rows are scattered across columnar vectors, leading to additional cache misses and TLB pressure.
+In our evaluation, this manifests as a more than 15\% increase in CPU time during tuple reconstruction phases—such as the HashProbe stage of HashJoin and the getOutput stage of Sort—when no optimizations are applied.
+
+In addition, the hybrid design is most effective for operators with wide payloads.
+When the projected payload is narrow (e.g., a single \texttt{BIGINT} column), storing payload values directly alongside keys in a row-oriented layout is already efficient.
+In such cases, replacing an 8-byte payload value with an 8-byte \emph{rowRef} yields little benefit for key-centric processing, while introducing additional indirection during output materialization.
+As a result, the hybrid layout can underperform the original design for queries with very small payloads.
+
+For queries with moderate to wide payloads, however, the hybrid design avoids eagerly materializing large payloads into rows prior to operator execution.
+In this workload setting, the cost of indirect payload access during output reconstruction is outweighed by the savings from eliminating repeated column-to-row layout conversions, resulting in net performance improvements.
+
+The memory overhead introduced by the hybrid design is modest in the target workload setting.
+Each row stores an additional 64-bit \emph{rowRef}, corresponding to 8~bytes per row.
+For wide analytical workloads (e.g., more than 20 payload columns and average tuple widths exceeding 200~bytes), this overhead accounts for less than 5\% of the total in-memory footprint.
+
+
+
+\medskip
+\noindent\textbf{Optimizations.}
+To account for the workload-dependent trade-offs described above, \proj selectively enables the hybrid execution model only when it is expected to be beneficial.
+Specifically, we introduce a configurable threshold on the total payload width: the hybrid execution model is enabled only when the projected payload size exceeds a predefined number of bytes.
+In our implementation, the default threshold is set to 24~bytes (equivalent to three \texttt{BIGINT} values).
+
+Beyond this adaptive selection, several implementation-level optimizations further mitigate the cost of indirect payload access.
+Our implementation in \proj incorporates the following techniques:
+
+\begin{itemize}[leftmargin=*]
+  \item \emph{Payload batch coalescing}: After all input has been consumed, columnar payload batches are merged into a smaller number of contiguous batches to reduce TLB misses during extraction.
+  \item \emph{Driver-aware materialization}: For multi-driver operators such as HashJoin, matched rows are grouped by driver identifier prior to extraction, improving cache locality when accessing columnar payloads.
+  \item \emph{Software prefetching}: Payload accesses are prefetched during materialization using a fixed prefetch distance and loop unrolling (e.g., four-way unrolling) to overlap memory latency with computation.
+\end{itemize}
+
+We evaluate the effectiveness of these optimizations in Section~\ref{sec:experiments} by comparing hybrid execution with and without these optimizations enabled.
+
+\medskip
+\noindent\textbf{Applicability to other operators and systems.}
+Although implemented in \proj for HashJoin and Sort, the hybrid execution model naturally extends to other key-centric operators such as HashAggregation and Window.
+More broadly, the design is applicable to modern vectorized engines that rely on row-oriented representations for key processing, including systems such as Velox, Presto, DuckDB, and ClickHouse.
+The hybrid abstraction thus represents a general architectural pattern for reducing intra-operator layout conversion overheads in analytical query processing.
+
+
+
+
+
+% \paragraph{Advantages.}
+% This design offers several benefits:  
+% (i) it reduces the memory footprint of the \texttt{RowContainer};  
+% (ii) it eliminates unnecessary columnar-to-row and row-to-column conversions for payload data;  
+% (iii) it improves CPU efficiency by maintaining cache-local key access; and  
+% (iv) it naturally supports our payload-first adaptive spilling strategy described in Section~\ref{sec:adaptive-spill}.
+
+
+
+
+% Velox adopts a purely columnar in-memory layout for intermediate data, representing each column as a contiguous \texttt{Vector} to enable efficient vectorized execution. While this layout excels for scan-heavy operators, certain operators—most notably HashJoin and Sort—require accessing multiple columns from the same row or maintaining per-row state in memory. To support these operators, Velox performs a \emph{column-to-row conversion} by packing selected columns into a \texttt{RowContainer}, a row-oriented storage abstraction optimized for random access to complete rows.
+
+% This conversion, while enabling row-oriented processing, incurs non-trivial CPU and memory overhead. For example, in a representative TPC-H query with a large build-side join table (\texttt{HashBuild}), profiling shows that \texttt{Column-to-Row} conversion accounts for \textbf{XX\%} of the total build time, while the actual hash table insertion accounts for \textbf{YY\%}. Figure~\ref{fig:hashbuild-breakdown} presents a detailed breakdown, illustrating that layout conversion alone can consume a significant fraction of the operator’s runtime.
+

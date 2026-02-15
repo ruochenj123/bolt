@@ -32,7 +32,7 @@ DEFINE_int32(max_batch_rows, 10000, "Max output batch rows");
 DEFINE_bool(hybrid_join, true, "Enable hybrid join");
 DEFINE_bool(hybrid_sort, true, "Enable hybrid sort");
 DEFINE_bool(late_m, false, "Enable late materialization");
-DEFINE_int32(query, 23, "Query to run (23, 24, or 27)");
+DEFINE_int32(query, 23, "Query to run (23, 24, 27, or 28)");
 
 using namespace bytedance::bolt;
 using namespace bytedance::bolt::exec;
@@ -304,6 +304,89 @@ void runQ27(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
   std::cout << "Q27 completed: " << totalRows << " rows in " << durationMs << " ms" << std::endl;
 }
 
+// Q28: Single HashJoin with WIDE payload (for testing hybrid benefit)
+// lineitem (probe) × orders (build), output ALL columns from both tables
+void runQ28(double scaleFactor, int numDrivers, int preferredBatchRows, int maxBatchRows,
+            bool hybridJoin, bool hybridSort, bool lateM) {
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemScanId, ordersScanId;
+
+  // Build side: orders table with ALL columns
+  auto orders = PlanBuilder(planNodeIdGenerator)
+                    .tpchTableScan(
+                        tpch::Table::TBL_ORDERS,
+                        {"o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice",
+                         "o_orderdate", "o_orderpriority", "o_clerk", "o_shippriority",
+                         "o_comment"},
+                        scaleFactor,
+                        kTpchConnectorId)
+                    .capturePlanNodeId(ordersScanId)
+                    .planNode();
+
+  // Probe side: lineitem table with ALL columns (except l_comment to fit schema)
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .tpchTableScan(
+              tpch::Table::TBL_LINEITEM,
+              {"l_orderkey", "l_partkey", "l_suppkey", "l_linenumber",
+               "l_quantity", "l_extendedprice", "l_discount", "l_tax",
+               "l_returnflag", "l_linestatus", "l_shipdate", "l_commitdate",
+               "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment"},
+              scaleFactor,
+              kTpchConnectorId)
+          .capturePlanNodeId(lineitemScanId)
+          .hashJoin(
+              {"l_orderkey"},
+              {"o_orderkey"},
+              orders,
+              "",
+              {// Build-side (orders) columns - 9 columns
+               "o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice",
+               "o_orderdate", "o_orderpriority", "o_clerk", "o_shippriority",
+               "o_comment",
+               // Probe-side (lineitem) columns - 15 columns
+               "l_partkey", "l_suppkey", "l_linenumber", "l_quantity",
+               "l_extendedprice", "l_discount", "l_tax", "l_returnflag",
+               "l_linestatus", "l_shipdate", "l_commitdate", "l_receiptdate",
+               "l_shipinstruct", "l_shipmode", "l_comment"})
+          .planNode();
+
+  std::unordered_map<std::string, std::string> queryConfigs;
+  queryConfigs[core::QueryConfig::kHybridJoinEnabled] = hybridJoin ? "true" : "false";
+  queryConfigs[core::QueryConfig::kHybridSortEnabled] = hybridSort ? "true" : "false";
+  queryConfigs[core::QueryConfig::kLateMaterializationEnabled] = lateM ? "true" : "false";
+  queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] = std::to_string(preferredBatchRows);
+  queryConfigs[core::QueryConfig::kMaxOutputBatchRows] = std::to_string(maxBatchRows);
+
+  CursorParameters params;
+  params.planNode = plan;
+  params.maxDrivers = numDrivers;
+  params.queryConfigs = queryConfigs;
+
+  auto startTime = std::chrono::steady_clock::now();
+  
+  auto cursor = TaskCursor::create(params);
+  cursor->start();
+  
+  auto task = cursor->task();
+  task->addSplit(lineitemScanId, Split(std::make_shared<TpchConnectorSplit>(kTpchConnectorId)));
+  task->noMoreSplits(lineitemScanId);
+  task->addSplit(ordersScanId, Split(std::make_shared<TpchConnectorSplit>(kTpchConnectorId)));
+  task->noMoreSplits(ordersScanId);
+
+  int64_t totalRows = 0;
+  while (cursor->moveNext()) {
+    totalRows += cursor->current()->size();
+  }
+  
+  task->taskCompletionFuture().wait();
+  
+  auto endTime = std::chrono::steady_clock::now();
+  auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+
+  std::cout << "Q28 completed: " << totalRows << " rows in " << durationMs << " ms" << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -349,6 +432,9 @@ int main(int argc, char** argv) {
            FLAGS_hybrid_join, FLAGS_hybrid_sort, FLAGS_late_m);
   } else if (FLAGS_query == 27) {
     runQ27(FLAGS_scale_factor, FLAGS_num_drivers, FLAGS_preferred_batch_rows, FLAGS_max_batch_rows,
+           FLAGS_hybrid_join, FLAGS_hybrid_sort, FLAGS_late_m);
+  } else if (FLAGS_query == 28) {
+    runQ28(FLAGS_scale_factor, FLAGS_num_drivers, FLAGS_preferred_batch_rows, FLAGS_max_batch_rows,
            FLAGS_hybrid_join, FLAGS_hybrid_sort, FLAGS_late_m);
   } else {
     std::cerr << "Unsupported query: " << FLAGS_query << std::endl;

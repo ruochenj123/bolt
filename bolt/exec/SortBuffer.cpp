@@ -122,6 +122,9 @@ SortBuffer::SortBuffer(
     sortedSpillColumnNames.emplace_back(input->nameOf(i));
   }
   hybridSortEnabled_ = hybridSortEnabled_ && !nonSortedColumnTypes.empty();
+  LOG(ERROR) << "SortBuffer: hybridSortEnabled_=" << hybridSortEnabled_
+            << ", nonSortedColumnTypes.size=" << nonSortedColumnTypes.size()
+            << ", sortedColumnTypes.size=" << sortedColumnTypes.size();
   if (hybridSortEnabled_) {
     std::vector<TypePtr> rowIdType = {BIGINT()};
     data_ = std::make_unique<RowContainer>(sortedColumnTypes, rowIdType, pool_);
@@ -131,6 +134,12 @@ SortBuffer::SortBuffer(
     std::unordered_map<uint8_t, HybridContainer*> hybridDataChannel;
     hybridDataChannel[0] = hybridData_.get();
     hybridData_->setAllContainers(hybridDataChannel);
+    // Set extraction optimization flag from query config.
+    // When disabled: skip coalesceBatches, sortByContainerId, prefetch.
+    if (operatorCtx_) {
+      hybridData_->setExtractionOptimized(
+          operatorCtx_->driverCtx()->queryConfig().hybridJoinExtractionOptimized());
+    }
 
     payloadTypes_ =
         ROW(std::move(nonSortedColumnNames), std::move(nonSortedColumnTypes));
@@ -194,12 +203,23 @@ void SortBuffer::addInput(const VectorPtr& input) {
   }
   
   if (hybridSortEnabled_) {
+    // Get batchId BEFORE addPayload (current batch count)
+    auto batchId = hybridData_->getNumBatches();
+    bool useOptimizedEncoding = hybridData_->isExtractionOptimized();
     auto currentRows = hybridData_->getNumRows();
+    
     for (int row = 0; row < input->size(); ++row) {
       // Store RowId
-      uint64_t encodedId = (static_cast<uint64_t>(0)
-                            << 56) | // top 8 bits: driverId, always 0 for Sort
-          (static_cast<uint64_t>(row + currentRows) & ((1ULL << 56) - 1));
+      uint64_t encodedId;
+      if (useOptimizedEncoding) {
+        // Optimized: driverId (8 bits) | globalRowId (56 bits)
+        encodedId = (static_cast<uint64_t>(0) << 56) |
+            (static_cast<uint64_t>(row + currentRows) & ((1ULL << 56) - 1));
+      } else {
+        // Non-optimized: driverId (8 bits) | batchId (16 bits) | localRowId (40 bits)
+        encodedId = (static_cast<uint64_t>(0) << 56) |
+            HybridContainer::encodeBatchAndLocalRow(batchId, row);
+      }
       data_->storeSingleRowId(encodedId, rows[row]);
     }
     // Store key columns
@@ -277,8 +297,17 @@ void SortBuffer::noMoreInput() {
   if (numInputRows_ == 0) {
     return;
   }
-  if (hybridSortEnabled_ && hybridData_ != nullptr) {
+  LOG(ERROR) << "SortBuffer::noMoreInput: hybridSortEnabled_=" << hybridSortEnabled_
+            << ", hybridData_=" << (hybridData_ != nullptr)
+            << ", extractionOptimized=" << (hybridData_ ? hybridData_->isExtractionOptimized() : false);
+  if (hybridSortEnabled_ && hybridData_ != nullptr &&
+      hybridData_->isExtractionOptimized()) {
+    auto coalesceStart = std::chrono::steady_clock::now();
     hybridData_->coalesceBatches();
+    auto coalesceEnd = std::chrono::steady_clock::now();
+    LOG(ERROR) << "SortBuffer: coalesceBatches took "
+               << std::chrono::duration_cast<std::chrono::milliseconds>(coalesceEnd - coalesceStart).count()
+               << "ms for " << numInputRows_ << " rows";
   }
 
   if (spiller_ == nullptr) {
@@ -290,6 +319,7 @@ void SortBuffer::noMoreInput() {
     RowContainerIterator iter;
     data_->listRows(&iter, numInputRows_, sortedRows_.data());
 
+    auto sortStart = std::chrono::steady_clock::now();
     MicrosecondTimer timer(&sortInSortTimeUs_);
 
 #ifdef ENABLE_BOLT_JIT
@@ -336,6 +366,10 @@ void SortBuffer::noMoreInput() {
 #ifdef ENABLE_BOLT_JIT
     }
 #endif
+    auto sortEnd = std::chrono::steady_clock::now();
+    LOG(ERROR) << "SortBuffer: pure sort took "
+               << std::chrono::duration_cast<std::chrono::milliseconds>(sortEnd - sortStart).count()
+               << "ms for " << numInputRows_ << " rows, rowSize=" << data_->fixedRowSize();
 
     // For late materialization: reorder row references to match sorted order
     if (lateMaterializationEnabled_ && !lateMBuildRowPtrs_.empty()) {
@@ -530,7 +564,8 @@ void SortBuffer::spillInput() {
   // After each spill, hybridData_->clear() is called which clears
   // owningInputs_. New data added via addInput() needs to be coalesced before
   // the next spill.
-  if (hybridSortEnabled_ && hybridData_ != nullptr) {
+  if (hybridSortEnabled_ && hybridData_ != nullptr &&
+      hybridData_->isExtractionOptimized()) {
     hybridData_->coalesceBatches();
   }
   spiller_->spill();

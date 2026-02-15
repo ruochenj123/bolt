@@ -588,6 +588,14 @@ class QueryConfig {
 
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
+  /// If true (default), enable extraction optimizations for hybrid join:
+  /// - Sort rows by containerId before extraction (better cache locality)
+  /// - Coalesce payload batches into single batch (contiguous memory access)
+  /// - Use prefetch in extraction loops
+  /// When false, use simple extraction path for benchmarking baseline.
+  static constexpr const char* kHybridJoinExtractionOptimized =
+      "hybrid_join_extraction_optimized";
+
   /// If true, enable late materialization optimization for HashJoin->Sort
   /// pattern when they share the same keys. This avoids redundant layout
   /// conversion between operators.
@@ -1017,6 +1025,13 @@ class QueryConfig {
 
   bool hybridSortEnabled() const {
     return get<bool>(kHybridSortEnabled, false);
+  }
+
+  /// Returns whether extraction optimizations are enabled for hybrid join.
+  /// When true (default): sortByContainerId, coalesceBatches, prefetch enabled.
+  /// When false: use simple extraction path for benchmarking baseline.
+  bool hybridJoinExtractionOptimized() const {
+    return get<bool>(kHybridJoinExtractionOptimized, true);
   }
 
   /// Returns whether late materialization optimization is enabled.
