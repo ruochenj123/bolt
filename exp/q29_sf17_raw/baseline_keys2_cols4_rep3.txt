@@ -1,0 +1,62 @@
+Execution time: 22.59s
+Splits total: 10, finished: 10
+-- OrderBy[1][l_linenumber ASC NULLS LAST, l_suppkey ASC NULLS LAST] -> l_orderkey:BIGINT, l_partkey:BIGINT, l_suppkey:BIGINT, l_linenumber:BIGINT
+   Output: 61440000 rows (2.28GB, 6144 batches), Cpu time: 19.47s, Wall time: 19.52s, Blocked wall time: 0ns, Peak memory: 1.89GB, Memory allocations: 24591, Threads: 1, CPU breakdown: B/I/O/F (24.37ms/2.05s/1.77s/15.62s)
+      runningAddInputWallNanos     sum: 2.06s, count: 1, min: 2.06s, max: 2.06s, avg: 2.06s
+      runningFinishWallNanos       sum: 15.63s, count: 1, min: 15.63s, max: 15.63s, avg: 15.63s
+      runningGetOutputWallNanos    sum: 1.78s, count: 1, min: 1.78s, max: 1.78s, avg: 1.78s
+      sortColToRowTotalTime        sum: 1.35s, count: 1, min: 1.35s, max: 1.35s, avg: 1.35s
+      sortInSortTotalTime          sum: 15.34s, count: 1, min: 15.34s, max: 15.34s, avg: 15.34s
+      sortOutputTotalTime          sum: 1.73s, count: 1, min: 1.73s, max: 1.73s, avg: 1.73s
+  -- TableScan[0][table: lineitem] -> l_orderkey:BIGINT, l_partkey:BIGINT, l_suppkey:BIGINT, l_linenumber:BIGINT
+     Input: 61440000 rows (2.44GB, 7000 batches), Output: 61440000 rows (2.44GB, 7000 batches), Cpu time: 2.28s, Wall time: 2.33s, Blocked wall time: 0ns, Peak memory: 7.82MB, Memory allocations: 67530, Threads: 1, Splits: 10, CPU breakdown: B/I/O/F (10.05ms/0ns/2.27s/770ns)
+        cntRead<128k                     sum: 0, count: 1, min: 0, max: 0, avg: 0
+        cntRead<32k                      sum: 1, count: 1, min: 1, max: 1, avg: 1
+        cntRead<4k                       sum: 0, count: 1, min: 0, max: 0, avg: 0
+        cntRead>=128k                    sum: 520, count: 1, min: 520, max: 520, avg: 520
+        dataSourceWallNanos              sum: 2.22s, count: 1, min: 2.22s, max: 2.22s, avg: 2.22s
+        decodeTime                       sum: 156.88ms, count: 1, min: 156.88ms, max: 156.88ms, avg: 156.88ms
+        decompressDataTime               sum: 1.89s, count: 1, min: 1.89s, max: 1.89s, avg: 1.89s
+        dynamicConcurrency               sum: 0, count: 1, min: 0, max: 0, avg: 0
+        flattenStringDictionaryValues    sum: 0, count: 1, min: 0, max: 0, avg: 0
+        ignoredCorruptFiles              sum: 0B, count: 1, min: 0B, max: 0B, avg: 0B
+        ioWaitNanosAsync                 sum: 80.70ms, count: 1, min: 80.70ms, max: 80.70ms, avg: 80.70ms
+        ioWaitNanosSync                  sum: 3.52ms, count: 1, min: 3.52ms, max: 3.52ms, avg: 3.52ms
+        ioWaitWallNanos                  sum: 84.22ms, count: 1, min: 84.22ms, max: 84.22ms, avg: 84.22ms
+        loadMetaDataTime                 sum: 155.74ms, count: 1, min: 155.74ms, max: 155.74ms, avg: 155.74ms
+        localReadBytes                   sum: 0B, count: 1, min: 0B, max: 0B, avg: 0B
+        maxSingleIoWaitNanos             sum: 369.00us, count: 1, min: 369.00us, max: 369.00us, avg: 369.00us
+        numLocalRead                     sum: 0, count: 1, min: 0, max: 0, avg: 0
+        numPrefetch                      sum: 1, count: 1, min: 1, max: 1, avg: 1
+        numRamRead                       sum: 0, count: 1, min: 0, max: 0, avg: 0
+        numStorageRead                   sum: 521, count: 1, min: 521, max: 521, avg: 521
+        overreadBytes                    sum: 0B, count: 1, min: 0B, max: 0B, avg: 0B
+        prefetchBytes                    sum: 29.32KB, count: 1, min: 29.32KB, max: 29.32KB, avg: 29.32KB
+        preloadSplits                    sum: 9, count: 9, min: 1, max: 1, avg: 1
+        prepareSplitTimeNs               sum: 70981635, count: 10, min: 1424645, max: 15953742, avg: 7098163
+        processedSplits                  sum: 10, count: 1, min: 10, max: 10, avg: 10
+        processedStrides                 sum: 500, count: 1, min: 500, max: 500, avg: 500
+        queryThreadIoLatency             sum: 2020, count: 1, min: 2020, max: 2020, avg: 2020
+        ramReadBytes                     sum: 0B, count: 1, min: 0B, max: 0B, avg: 0B
+        rawBytesRead                     sum: 684.82MB, count: 1, min: 684.82MB, max: 684.82MB, avg: 684.82MB
+        rawBytesRead<128k                sum: 0B, count: 1, min: 0B, max: 0B, avg: 0B
+        rawBytesRead<32k                 sum: 29.32KB, count: 1, min: 29.32KB, max: 29.32KB, avg: 29.32KB
+        rawBytesRead<4k                  sum: 0B, count: 1, min: 0B, max: 0B, avg: 0B
+        rawBytesRead>=128k               sum: 684.79MB, count: 1, min: 684.79MB, max: 684.79MB, avg: 684.79MB
+        readyPreloadedSplits             sum: 6, count: 6, min: 1, max: 1, avg: 1
+        runningAddInputWallNanos         sum: 0ns, count: 1, min: 0ns, max: 0ns, avg: 0ns
+        runningFinishWallNanos           sum: 1.46us, count: 1, min: 1.46us, max: 1.46us, avg: 1.46us
+        runningGetOutputWallNanos        sum: 2.31s, count: 1, min: 2.31s, max: 2.31s, avg: 2.31s
+        skippedSplitBytes                sum: 0B, count: 1, min: 0B, max: 0B, avg: 0B
+        skippedSplits                    sum: 0, count: 1, min: 0, max: 0, avg: 0
+        skippedStrides                   sum: 7800, count: 1, min: 7800, max: 7800, avg: 7800
+        storageReadBytes                 sum: 684.82MB, count: 1, min: 684.82MB, max: 684.82MB, avg: 684.82MB
+        totalMergeTime                   sum: 0ns, count: 1, min: 0ns, max: 0ns, avg: 0ns
+        totalRemainingFilterTime         sum: 0ns, count: 1, min: 0ns, max: 0ns, avg: 0ns
+        totalScanTime                    sum: 78.75ms, count: 1, min: 78.75ms, max: 78.75ms, avg: 78.75ms
+        totalTimeRead<128k               sum: 0ns, count: 1, min: 0ns, max: 0ns, avg: 0ns
+        totalTimeRead<32k                sum: 19.00us, count: 1, min: 19.00us, max: 19.00us, avg: 19.00us
+        totalTimeRead<4k                 sum: 0ns, count: 1, min: 0ns, max: 0ns, avg: 0ns
+        totalTimeRead>=128k              sum: 78.76ms, count: 1, min: 78.76ms, max: 78.76ms, avg: 78.76ms
+
+PROFILE: interrupts/evictions/bytes = 2280/421/138456

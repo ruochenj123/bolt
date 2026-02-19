@@ -1,0 +1,166 @@
+nohup: ignoring input
+Starting Q29 Sort Benchmark on SF17 (102M rows) at Tue 17 Feb 2026 05:20:43 PM EST
+===========================================================
+Total runs: 144 (3 modes × 4 sort keys × 4 proj cols × 3 repeats)
+Data: /home/jiang.2091/velox_join/data/tpch_parquet/sf17_hive
+Results: /home/jiang.2091/velox_join/bolt/exp/q29_sf17_results.csv
+Raw output: /home/jiang.2091/velox_join/bolt/exp/q29_sf17_raw
+
+
+Mode: baseline (Tue 17 Feb 2026 05:20:43 PM EST)
+-------------------------------------
+17:20:52 baseline | keys=1 | cols=4 | rep=1 | time=8.22s | sort_F=1.79s
+17:21:00 baseline | keys=1 | cols=4 | rep=2 | time=8.13s | sort_F=1.78s
+17:21:09 baseline | keys=1 | cols=4 | rep=3 | time=8.25s | sort_F=1.78s
+17:21:22 baseline | keys=1 | cols=8 | rep=1 | time=13.48s | sort_F=2.44s
+17:21:36 baseline | keys=1 | cols=8 | rep=2 | time=13.31s | sort_F=2.40s
+17:21:49 baseline | keys=1 | cols=8 | rep=3 | time=13.42s | sort_F=2.42s
+17:22:08 baseline | keys=1 | cols=12 | rep=1 | time=18.67s | sort_F=2.77s
+17:22:28 baseline | keys=1 | cols=12 | rep=2 | time=19.16s | sort_F=2.75s
+17:22:47 baseline | keys=1 | cols=12 | rep=3 | time=18.49s | sort_F=2.75s
+17:23:26 baseline | keys=1 | cols=16 | rep=1 | time=38.78s | sort_F=3.22s
+17:24:05 baseline | keys=1 | cols=16 | rep=2 | time=38.78s | sort_F=3.21s
+17:24:44 baseline | keys=1 | cols=16 | rep=3 | time=38.58s | sort_F=3.31s
+17:25:07 baseline | keys=2 | cols=4 | rep=1 | time=22.49s | sort_F=15.55s
+17:25:30 baseline | keys=2 | cols=4 | rep=2 | time=22.48s | sort_F=15.55s
+17:25:53 baseline | keys=2 | cols=4 | rep=3 | time=22.59s | sort_F=15.62s
+17:26:21 baseline | keys=2 | cols=8 | rep=1 | time=28.19s | sort_F=16.74s
+17:26:50 baseline | keys=2 | cols=8 | rep=2 | time=28.52s | sort_F=16.87s
+17:27:18 baseline | keys=2 | cols=8 | rep=3 | time=28.19s | sort_F=16.73s
+17:27:53 baseline | keys=2 | cols=12 | rep=1 | time=34.14s | sort_F=17.62s
+17:28:27 baseline | keys=2 | cols=12 | rep=2 | time=33.91s | sort_F=17.47s
+17:29:01 baseline | keys=2 | cols=12 | rep=3 | time=34.02s | sort_F=17.56s
+17:30:02 baseline | keys=2 | cols=16 | rep=1 | time=60s | sort_F=18.30s
+17:31:03 baseline | keys=2 | cols=16 | rep=2 | time=61s | sort_F=18.49s
+17:32:04 baseline | keys=2 | cols=16 | rep=3 | time=60s | sort_F=18.40s
+17:32:32 baseline | keys=3 | cols=4 | rep=1 | time=27.82s | sort_F=20.88s
+17:33:01 baseline | keys=3 | cols=4 | rep=2 | time=28.21s | sort_F=21.23s
+17:33:29 baseline | keys=3 | cols=4 | rep=3 | time=27.99s | sort_F=21.09s
+17:34:03 baseline | keys=3 | cols=8 | rep=1 | time=34.15s | sort_F=22.66s
+17:34:37 baseline | keys=3 | cols=8 | rep=2 | time=33.82s | sort_F=22.28s
+17:35:11 baseline | keys=3 | cols=8 | rep=3 | time=33.98s | sort_F=22.41s
+17:35:51 baseline | keys=3 | cols=12 | rep=1 | time=39.33s | sort_F=23.01s
+17:36:31 baseline | keys=3 | cols=12 | rep=2 | time=39.33s | sort_F=22.95s
+17:37:10 baseline | keys=3 | cols=12 | rep=3 | time=39.37s | sort_F=23.03s
+17:38:17 baseline | keys=3 | cols=16 | rep=1 | time=66s | sort_F=23.91s
+17:39:23 baseline | keys=3 | cols=16 | rep=2 | time=66s | sort_F=23.89s
+17:40:29 baseline | keys=3 | cols=16 | rep=3 | time=66s | sort_F=23.91s
+17:40:58 baseline | keys=4 | cols=4 | rep=1 | time=28.89s | sort_F=22.11s
+17:41:28 baseline | keys=4 | cols=4 | rep=2 | time=29.03s | sort_F=22.19s
+17:41:56 baseline | keys=4 | cols=4 | rep=3 | time=28.70s | sort_F=21.96s
+17:42:31 baseline | keys=4 | cols=8 | rep=1 | time=34.80s | sort_F=23.40s
+17:43:06 baseline | keys=4 | cols=8 | rep=2 | time=34.65s | sort_F=23.21s
+17:43:41 baseline | keys=4 | cols=8 | rep=3 | time=34.70s | sort_F=23.34s
+17:44:22 baseline | keys=4 | cols=12 | rep=1 | time=40.31s | sort_F=24.06s
+17:45:03 baseline | keys=4 | cols=12 | rep=2 | time=40.44s | sort_F=24.15s
+17:45:43 baseline | keys=4 | cols=12 | rep=3 | time=40.40s | sort_F=24.04s
+17:46:51 baseline | keys=4 | cols=16 | rep=1 | time=67s | sort_F=24.82s
+17:47:58 baseline | keys=4 | cols=16 | rep=2 | time=67s | sort_F=24.89s
+17:49:05 baseline | keys=4 | cols=16 | rep=3 | time=67s | sort_F=24.94s
+
+Mode: hybrid-opt (Tue 17 Feb 2026 05:49:05 PM EST)
+-------------------------------------
+17:49:12 hybrid-opt | keys=1 | cols=4 | rep=1 | time=7.10s | sort_F=1.87s
+17:49:20 hybrid-opt | keys=1 | cols=4 | rep=2 | time=7.17s | sort_F=1.96s
+17:49:27 hybrid-opt | keys=1 | cols=4 | rep=3 | time=7.08s | sort_F=1.87s
+17:49:38 hybrid-opt | keys=1 | cols=8 | rep=1 | time=11.20s | sort_F=2.54s
+17:49:50 hybrid-opt | keys=1 | cols=8 | rep=2 | time=11.07s | sort_F=2.55s
+17:50:01 hybrid-opt | keys=1 | cols=8 | rep=3 | time=11.24s | sort_F=2.54s
+17:50:16 hybrid-opt | keys=1 | cols=12 | rep=1 | time=14.32s | sort_F=3.52s
+17:50:30 hybrid-opt | keys=1 | cols=12 | rep=2 | time=14.11s | sort_F=3.51s
+17:50:45 hybrid-opt | keys=1 | cols=12 | rep=3 | time=14.36s | sort_F=3.52s
+17:51:17 hybrid-opt | keys=1 | cols=16 | rep=1 | time=30.88s | sort_F=8.04s
+17:51:48 hybrid-opt | keys=1 | cols=16 | rep=2 | time=30.57s | sort_F=8.02s
+17:52:20 hybrid-opt | keys=1 | cols=16 | rep=3 | time=31.27s | sort_F=8.05s
+17:52:43 hybrid-opt | keys=2 | cols=4 | rep=1 | time=22.81s | sort_F=15.84s
+17:53:06 hybrid-opt | keys=2 | cols=4 | rep=2 | time=22.51s | sort_F=15.62s
+17:53:28 hybrid-opt | keys=2 | cols=4 | rep=3 | time=22.41s | sort_F=15.52s
+17:53:58 hybrid-opt | keys=2 | cols=8 | rep=1 | time=29.44s | sort_F=16.17s
+17:54:28 hybrid-opt | keys=2 | cols=8 | rep=2 | time=29.54s | sort_F=16.15s
+17:54:58 hybrid-opt | keys=2 | cols=8 | rep=3 | time=29.69s | sort_F=16.27s
+17:55:37 hybrid-opt | keys=2 | cols=12 | rep=1 | time=38.30s | sort_F=17.27s
+17:56:15 hybrid-opt | keys=2 | cols=12 | rep=2 | time=38.00s | sort_F=17.14s
+17:56:53 hybrid-opt | keys=2 | cols=12 | rep=3 | time=37.84s | sort_F=17.18s
+17:58:01 hybrid-opt | keys=2 | cols=16 | rep=1 | time=67s | sort_F=21.62s
+17:59:09 hybrid-opt | keys=2 | cols=16 | rep=2 | time=67s | sort_F=21.63s
+18:00:17 hybrid-opt | keys=2 | cols=16 | rep=3 | time=67s | sort_F=21.59s
+18:00:44 hybrid-opt | keys=3 | cols=4 | rep=1 | time=27.62s | sort_F=21.11s
+18:01:13 hybrid-opt | keys=3 | cols=4 | rep=2 | time=27.91s | sort_F=21.37s
+18:01:40 hybrid-opt | keys=3 | cols=4 | rep=3 | time=27.62s | sort_F=21.14s
+18:02:15 hybrid-opt | keys=3 | cols=8 | rep=1 | time=34.74s | sort_F=22.01s
+18:02:50 hybrid-opt | keys=3 | cols=8 | rep=2 | time=34.67s | sort_F=21.79s
+18:03:25 hybrid-opt | keys=3 | cols=8 | rep=3 | time=34.72s | sort_F=21.97s
+18:04:09 hybrid-opt | keys=3 | cols=12 | rep=1 | time=42.80s | sort_F=22.98s
+18:04:51 hybrid-opt | keys=3 | cols=12 | rep=2 | time=42.45s | sort_F=22.74s
+18:05:34 hybrid-opt | keys=3 | cols=12 | rep=3 | time=42.45s | sort_F=22.77s
+18:06:46 hybrid-opt | keys=3 | cols=16 | rep=1 | time=72s | sort_F=27.28s
+18:07:59 hybrid-opt | keys=3 | cols=16 | rep=2 | time=72s | sort_F=27.48s
+18:09:11 hybrid-opt | keys=3 | cols=16 | rep=3 | time=72s | sort_F=27.18s
+18:09:40 hybrid-opt | keys=4 | cols=4 | rep=1 | time=28.75s | sort_F=21.96s
+18:10:09 hybrid-opt | keys=4 | cols=4 | rep=2 | time=29.07s | sort_F=22.25s
+18:10:38 hybrid-opt | keys=4 | cols=4 | rep=3 | time=28.84s | sort_F=22.04s
+18:11:13 hybrid-opt | keys=4 | cols=8 | rep=1 | time=34.70s | sort_F=22.93s
+18:11:48 hybrid-opt | keys=4 | cols=8 | rep=2 | time=34.72s | sort_F=22.94s
+18:12:23 hybrid-opt | keys=4 | cols=8 | rep=3 | time=34.73s | sort_F=23.01s
+18:13:06 hybrid-opt | keys=4 | cols=12 | rep=1 | time=42.46s | sort_F=23.95s
+18:13:49 hybrid-opt | keys=4 | cols=12 | rep=2 | time=42.76s | sort_F=24.09s
+18:14:33 hybrid-opt | keys=4 | cols=12 | rep=3 | time=42.95s | sort_F=24.09s
+18:15:45 hybrid-opt | keys=4 | cols=16 | rep=1 | time=72s | sort_F=28.39s
+18:16:57 hybrid-opt | keys=4 | cols=16 | rep=2 | time=72s | sort_F=28.38s
+18:18:10 hybrid-opt | keys=4 | cols=16 | rep=3 | time=72s | sort_F=28.39s
+
+Mode: hybrid-nonopt (Tue 17 Feb 2026 06:18:10 PM EST)
+-------------------------------------
+18:18:20 hybrid-nonopt | keys=1 | cols=4 | rep=1 | time=9.99s | sort_F=1.39s
+18:18:31 hybrid-nonopt | keys=1 | cols=4 | rep=2 | time=9.95s | sort_F=1.38s
+18:18:41 hybrid-nonopt | keys=1 | cols=4 | rep=3 | time=9.83s | sort_F=1.37s
+18:19:05 hybrid-nonopt | keys=1 | cols=8 | rep=1 | time=23.66s | sort_F=1.40s
+18:19:29 hybrid-nonopt | keys=1 | cols=8 | rep=2 | time=23.55s | sort_F=1.38s
+18:19:53 hybrid-nonopt | keys=1 | cols=8 | rep=3 | time=23.75s | sort_F=1.38s
+18:20:34 hybrid-nonopt | keys=1 | cols=12 | rep=1 | time=40.44s | sort_F=1.39s
+18:21:15 hybrid-nonopt | keys=1 | cols=12 | rep=2 | time=40.63s | sort_F=1.39s
+18:21:56 hybrid-nonopt | keys=1 | cols=12 | rep=3 | time=40.38s | sort_F=1.40s
+18:23:06 hybrid-nonopt | keys=1 | cols=16 | rep=1 | time=69s | sort_F=1.40s
+18:24:15 hybrid-nonopt | keys=1 | cols=16 | rep=2 | time=69s | sort_F=1.38s
+18:25:26 hybrid-nonopt | keys=1 | cols=16 | rep=3 | time=69s | sort_F=1.39s
+18:25:51 hybrid-nonopt | keys=2 | cols=4 | rep=1 | time=25.12s | sort_F=15.20s
+18:26:17 hybrid-nonopt | keys=2 | cols=4 | rep=2 | time=25.33s | sort_F=15.27s
+18:26:42 hybrid-nonopt | keys=2 | cols=4 | rep=3 | time=25.22s | sort_F=15.21s
+18:27:28 hybrid-nonopt | keys=2 | cols=8 | rep=1 | time=45.05s | sort_F=15.30s
+18:28:13 hybrid-nonopt | keys=2 | cols=8 | rep=2 | time=45.10s | sort_F=15.28s
+18:28:58 hybrid-nonopt | keys=2 | cols=8 | rep=3 | time=44.87s | sort_F=15.18s
+18:30:05 hybrid-nonopt | keys=2 | cols=12 | rep=1 | time=66s | sort_F=15.17s
+18:31:12 hybrid-nonopt | keys=2 | cols=12 | rep=2 | time=66s | sort_F=15.28s
+18:32:18 hybrid-nonopt | keys=2 | cols=12 | rep=3 | time=66s | sort_F=15.18s
+18:34:05 hybrid-nonopt | keys=2 | cols=16 | rep=1 | time=106s | sort_F=15.18s
+18:35:52 hybrid-nonopt | keys=2 | cols=16 | rep=2 | time=105s | sort_F=15.35s
+18:37:37 hybrid-nonopt | keys=2 | cols=16 | rep=3 | time=105s | sort_F=15.27s
+18:38:06 hybrid-nonopt | keys=3 | cols=4 | rep=1 | time=28.81s | sort_F=21.05s
+18:38:35 hybrid-nonopt | keys=3 | cols=4 | rep=2 | time=28.74s | sort_F=20.96s
+18:39:05 hybrid-nonopt | keys=3 | cols=4 | rep=3 | time=28.81s | sort_F=21.10s
+18:39:51 hybrid-nonopt | keys=3 | cols=8 | rep=1 | time=46.46s | sort_F=20.98s
+18:40:39 hybrid-nonopt | keys=3 | cols=8 | rep=2 | time=46.86s | sort_F=20.96s
+18:41:26 hybrid-nonopt | keys=3 | cols=8 | rep=3 | time=46.79s | sort_F=21.18s
+18:42:35 hybrid-nonopt | keys=3 | cols=12 | rep=1 | time=69s | sort_F=20.96s
+18:43:43 hybrid-nonopt | keys=3 | cols=12 | rep=2 | time=68s | sort_F=21.08s
+18:44:52 hybrid-nonopt | keys=3 | cols=12 | rep=3 | time=68s | sort_F=21.15s
+18:46:39 hybrid-nonopt | keys=3 | cols=16 | rep=1 | time=106s | sort_F=20.95s
+18:48:26 hybrid-nonopt | keys=3 | cols=16 | rep=2 | time=106s | sort_F=21.14s
+18:50:12 hybrid-nonopt | keys=3 | cols=16 | rep=3 | time=106s | sort_F=20.90s
+18:50:41 hybrid-nonopt | keys=4 | cols=4 | rep=1 | time=29.02s | sort_F=22.14s
+18:51:11 hybrid-nonopt | keys=4 | cols=4 | rep=2 | time=28.96s | sort_F=22.05s
+18:51:40 hybrid-nonopt | keys=4 | cols=4 | rep=3 | time=28.85s | sort_F=22.02s
+18:52:25 hybrid-nonopt | keys=4 | cols=8 | rep=1 | time=45.31s | sort_F=22.27s
+18:53:11 hybrid-nonopt | keys=4 | cols=8 | rep=2 | time=45.45s | sort_F=22.45s
+18:53:57 hybrid-nonopt | keys=4 | cols=8 | rep=3 | time=45.24s | sort_F=22.25s
+18:55:03 hybrid-nonopt | keys=4 | cols=12 | rep=1 | time=66s | sort_F=22.29s
+18:56:09 hybrid-nonopt | keys=4 | cols=12 | rep=2 | time=66s | sort_F=22.50s
+18:57:15 hybrid-nonopt | keys=4 | cols=12 | rep=3 | time=66s | sort_F=22.25s
+18:59:02 hybrid-nonopt | keys=4 | cols=16 | rep=1 | time=106s | sort_F=22.28s
+19:00:50 hybrid-nonopt | keys=4 | cols=16 | rep=2 | time=106s | sort_F=22.26s
+19:02:37 hybrid-nonopt | keys=4 | cols=16 | rep=3 | time=106s | sort_F=22.31s
+
+===========================================================
+Benchmark completed at Tue 17 Feb 2026 07:02:37 PM EST
+Results saved to: /home/jiang.2091/velox_join/bolt/exp/q29_sf17_results.csv
+Raw outputs in: /home/jiang.2091/velox_join/bolt/exp/q29_sf17_raw

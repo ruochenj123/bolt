@@ -337,6 +337,14 @@ class RowContainer {
       char* FOLLY_NONNULL row,
       int32_t column);
 
+  /// Velox-style store: stores column for all rows using per-row type dispatch
+  /// (runtime dispatch inside loop, like Velox's data_->store approach)
+  void storeColumnVelox(
+      const DecodedVector& decoded,
+      size_t size,
+      const std::vector<char*>& rows,
+      size_t column);
+
   template <TypeKind Kind>
   void storeColumn(
       const DecodedVector& decoded,
@@ -1845,6 +1853,24 @@ class HybridContainer {
       std::vector<HybridRowId>& outputRowIds) {
     getRowIdsInternal<true>(rows, rowNumbers, rowNumbers.size(), outputRowIds);
   }
+
+  // Decode batchId and localRowId from encoded rowIds.
+  // NOTE: This is now a no-op. extractPayloadSimple decodes inline to avoid
+  // race conditions with member pointers in multi-threaded extraction.
+  void decodeRowIdsForSimpleExtraction(
+      const std::vector<HybridRowId>& /*outputRowIds*/,
+      std::vector<uint8_t>& /*decodedContainerIds*/,
+      std::vector<uint32_t>& /*decodedBatchIds*/,
+      std::vector<uint32_t>& /*decodedLocalRowIds*/) {
+    // No-op: extractPayloadSimple now decodes inline
+  }
+
+  // Clear decoded row ID pointers after extraction is complete.
+  // NOTE: This is now a no-op.
+  void clearDecodedRowIds() {
+    // No-op
+  }
+
   void extractColumn(
       const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
       int32_t numRows,
@@ -1976,6 +2002,41 @@ class HybridContainer {
     return reorderEnabled_ && !isSingleContainer();
   }
 
+  // Returns whether sorting by rowId should be used for single-container extraction.
+  // Currently disabled - sorting overhead outweighs benefit for per-batch extraction.
+  // TODO: Consider global sorting across all output batches for better locality.
+  bool shouldUseSortingByRowId() const {
+    return false; // Disabled - sorting overhead too high for per-batch case
+  }
+
+  // Controls extraction optimization (coalesce, prefetch).
+  // When false: no coalesce, no prefetch, use batchId-based encoding.
+  void setExtractionOptimized(bool enabled) {
+    extractionOptimized_ = enabled;
+  }
+
+  bool isExtractionOptimized() const {
+    return extractionOptimized_;
+  }
+
+  /// Encode batchId and localRowId into rowId format.
+  /// Used when extractionOptimized_ = false.
+  /// Format: (batchId << 40) | localRowId
+  /// - batchId: 24 bits (supports up to 16M batches)
+  /// - localRowId: 40 bits (supports up to ~1 trillion rows per batch)
+  static uint64_t encodeBatchAndLocalRow(uint32_t batchId, vector_size_t localRowId) {
+    return (static_cast<uint64_t>(batchId) << 40) |
+           (static_cast<uint64_t>(localRowId) & ((1ULL << 40) - 1));
+  }
+
+  /// Decode batchId and localRowId from encoded rowId.
+  /// @return (batchId, localRowId)
+  static std::pair<uint32_t, vector_size_t> decodeBatchAndLocalRow(uint64_t rowId) {
+    uint32_t batchId = static_cast<uint32_t>(rowId >> 40);
+    vector_size_t localRowId = static_cast<vector_size_t>(rowId & ((1ULL << 40) - 1));
+    return {batchId, localRowId};
+  }
+
   // Reorder rows and rowIds by containerId to improve locality for extraction.
   // Returns reordered rows, rowIds, and optionally rowNumbers when provided.
   struct SortedRows {
@@ -2024,8 +2085,60 @@ class HybridContainer {
     return out;
   }
 
+  // Sort rows and rowIds by rowId_ for single-container case.
+  // This makes payload access sequential, improving cache locality.
+  // Uses counting sort for O(n) complexity since rowIds are dense within [0, totalRows_).
+  SortedRows sortByRowId(
+      const char* const* rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      const std::vector<HybridRowId>& outputRowIds) {
+    const int size = outputRowIds.size();
+    SortedRows out;
+
+    // For small batches, sorting overhead outweighs benefit
+    if (size < 256) {
+      out.rows.assign(rows, rows + size);
+      out.rowIds = outputRowIds;
+      if (!rowNumbers.empty()) {
+        out.rowNumbers.assign(rowNumbers.begin(), rowNumbers.end());
+      }
+      return out;
+    }
+
+    out.rows.resize(size);
+    out.rowIds.resize(size);
+    if (!rowNumbers.empty()) {
+      out.rowNumbers.resize(size);
+    }
+
+    // Build permutation by sorting indices by rowId_
+    std::vector<int32_t> perm(size);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::sort(perm.begin(), perm.end(), [&outputRowIds](int32_t a, int32_t b) {
+      return outputRowIds[a].rowId_ < outputRowIds[b].rowId_;
+    });
+
+    // Apply permutation.
+    for (int outIdx = 0; outIdx < size; ++outIdx) {
+      const int srcIdx = perm[outIdx];
+      out.rowIds[outIdx] = outputRowIds[srcIdx];
+      if (!out.rowNumbers.empty()) {
+        out.rowNumbers[outIdx] = rowNumbers[srcIdx];
+      }
+      out.rows[outIdx] = rows[srcIdx];
+    }
+
+    return out;
+  }
+
   // Coalesce all payload batches into a single batch to improve locality.
   void coalesceBatches() {
+    // Skip coalesce when extraction optimization is disabled.
+    // Non-optimized extraction uses batchId-based encoding to access separate batches.
+    if (!extractionOptimized_) {
+      return;
+    }
+
     // Only skip if no payload columns or no batches to coalesce.
     // Always flatten even for single batch, as input may be dictionary-encoded
     // or other non-flat encodings. Extraction expects FlatVectors.
@@ -2070,6 +2183,88 @@ class HybridContainer {
   }
 
  private:
+  // Simple extraction without prefetch (non-optimized path).
+  // Uses batchId encoding: rowId = (batchId << 40) | localRowId
+  // Assumes inputs are already flattened at addPayload time.
+  // Assumes non-null input for current experiment (matches optimized path using
+  // extractPayloadNoNullsSingleContainer).
+  // Uses pre-decoded containerIds/batchIds/localRowIds from member pointers (set by
+  // decodeRowIdsForSimpleExtraction).
+  template <typename T>
+  void extractPayloadSimple(
+      int32_t numRows,
+      int32_t columnIndex,
+      int32_t resultOffset,
+      FlatVector<T>* FOLLY_NONNULL result,
+      std::vector<HybridRowId>& outputRowIds) {
+    auto maxRows = numRows + resultOffset;
+    BOLT_DCHECK_LE(maxRows, result->size());
+
+    BufferPtr valuesBuffer = result->mutableValues(maxRows);
+    auto values = valuesBuffer->asMutableRange<T>();
+
+    // Build a map of containerId -> vector of batch raw value pointers
+    // This supports multiple containers (multi-driver case)
+    std::unordered_map<uint8_t, std::vector<const T*>> containerBatchRawValues;
+    for (const auto& [cid, container] : allContainers_) {
+      if (container->owningInputs_.empty()) {
+        continue;
+      }
+      auto& batchRawValues = containerBatchRawValues[cid];
+      batchRawValues.resize(container->owningInputs_.size());
+      for (size_t b = 0; b < container->owningInputs_.size(); ++b) {
+        auto* child = container->owningInputs_[b]->childAt(columnIndex).get();
+        BOLT_DCHECK_NOT_NULL(child);
+        auto* flatVec = child->template asFlatVector<T>();
+        BOLT_DCHECK_NOT_NULL(flatVec);
+        batchRawValues[b] = flatVec->rawValues();
+      }
+    }
+
+    // Cache current container/batch pointer - avoid lookups when unchanged
+    const T* currentRawValues = nullptr;
+    uint8_t currentContainerId = UINT8_MAX; // invalid sentinel
+    uint32_t currentBatchId = UINT32_MAX;   // invalid sentinel
+    const std::vector<const T*>* currentContainerBatches = nullptr;
+
+    for (int32_t i = 0; i < numRows; ++i) {
+      // Decode inline - avoids race conditions with member pointers
+      uint8_t containerId = outputRowIds[i].containerId_;
+      auto [batchId, localRowId] = decodeBatchAndLocalRow(outputRowIds[i].rowId_);
+
+      // Reload container batch vector when container changes
+      if (containerId != currentContainerId) {
+        currentContainerId = containerId;
+        auto it = containerBatchRawValues.find(containerId);
+        BOLT_CHECK(
+            it != containerBatchRawValues.end(),
+            "Container {} not found in containerBatchRawValues",
+            containerId);
+        currentContainerBatches = &it->second;
+        currentBatchId = UINT32_MAX; // force batch reload
+      }
+
+      // Reload batch pointer when batch changes
+      if (batchId != currentBatchId) {
+        currentBatchId = batchId;
+        BOLT_CHECK(
+            batchId < currentContainerBatches->size(),
+            "batchId {} out of range for container {} (size={})",
+            batchId,
+            currentContainerId,
+            currentContainerBatches->size());
+        currentRawValues = (*currentContainerBatches)[batchId];
+      }
+
+      auto resultIndex = resultOffset + i;
+      if constexpr (std::is_same_v<T, StringView>) {
+        values[resultIndex] = StringView(currentRawValues[localRowId]);
+      } else {
+        values[resultIndex] = currentRawValues[localRowId];
+      }
+    }
+  }
+
   // Get the single container's coalesced data (only valid when
   // isSingleContainer()). Validates that the single container is actually this
   // container.
@@ -2138,6 +2333,14 @@ class HybridContainer {
     BOLT_CHECK(Kind != TypeKind::ROW && Kind != TypeKind::MAP);
     using T = typename KindToFlatVector<Kind>::HashRowType;
     auto flatResult = result->as<FlatVector<T>>();
+
+    // Non-optimized extraction path: no coalesce, no prefetch.
+    // Uses batchId encoding to access separate batches.
+    if (!extractionOptimized_) {
+      extractPayloadSimple<T>(
+          numRows, columnIndex, resultOffset, flatResult, outputRowIds);
+      return;
+    }
 
     // Fast path for single container (spilling, sort) - avoids map lookups
     if (isSingleContainer()) {
@@ -2820,6 +3023,18 @@ class HybridContainer {
   // Controls whether to reorder rows by containerId during extraction.
   // Default true for better cache locality. Can be disabled for testing.
   bool reorderEnabled_{true};
+
+  // Controls extraction optimization (coalesce + prefetch).
+  // When true (default): batches are coalesced, prefetch is used.
+  // When false: batches kept separate, batchId-based encoding, no prefetch.
+  bool extractionOptimized_{true};
+
+  // Pre-decoded containerIds, batchIds and localRowIds for simple extraction.
+  // Set by decodeRowIdsForSimpleExtraction(), used by extractPayloadSimple().
+  // This avoids per-row decode overhead when extracting multiple columns.
+  std::vector<uint8_t>* decodedContainerIds_{nullptr};
+  std::vector<uint32_t>* decodedBatchIds_{nullptr};
+  std::vector<uint32_t>* decodedLocalRowIds_{nullptr};
 };
 
 template <>

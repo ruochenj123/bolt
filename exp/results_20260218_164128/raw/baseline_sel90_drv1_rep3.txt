@@ -1,0 +1,16 @@
+Execution time: 55.92s
+Splits total: 2, finished: 2
+-- HashJoin[4][INNER p_row_id=row_id AND p_suppkey=l_suppkey AND p_returnflag=l_returnflag AND p_linestatus=l_linestatus] -> row_id:BIGINT, l_suppkey:BIGINT, l_returnflag:VARCHAR, l_linestatus:VARCHAR, l_orderkey:BIGINT, l_partkey:BIGINT, l_linenumber:BIGINT, l_quantity:DOUBLE, l_extendedprice:DOUBLE, l_discount:DOUBLE, l_tax:DOUBLE, l_shipdate:DATE, l_commitdate:DATE, l_receiptdate:DATE, l_shipinstruct:VARCHAR, l_shipmode:VARCHAR, l_comment:VARCHAR
+   Output: 45002297 rows (15.93GB, 48848 batches), Cpu time: 31.28s, Wall time: 31.53s, Blocked wall time: 34.65s, Peak memory: 21.24GB, Memory allocations: 635100, CPU breakdown: B/I/O/F (131.57ms/20.52s/4.55s/6.08s)
+   HashBuild: Input: 100000000 rows (29.26GB, 10900 batches), Output: 0 rows (0B, 0 batches), Cpu time: 24.29s, Wall time: 24.33s, Blocked wall time: 0ns, Peak memory: 21.23GB, Memory allocations: 56, Threads: 1, CPU breakdown: B/I/O/F (9.82ms/18.21s/8.24ms/6.07s)
+   HashProbe: Input: 180004315 rows (22.80GB, 21800 batches), Output: 45002297 rows (15.93GB, 48848 batches), Cpu time: 6.99s, Wall time: 7.20s, Blocked wall time: 34.65s, Peak memory: 351.25KB, Memory allocations: 635044, Threads: 1, CPU breakdown: B/I/O/F (121.75ms/2.31s/4.54s/16.13ms)
+  -- Project[3][expressions: (p_row_id:BIGINT, ROW["row_id"]), (p_suppkey:BIGINT, ROW["l_suppkey"]), (p_returnflag:VARCHAR, ROW["l_returnflag"]), (p_linestatus:VARCHAR, ROW["l_linestatus"])] -> p_row_id:BIGINT, p_suppkey:BIGINT, p_returnflag:VARCHAR, p_linestatus:VARCHAR
+     Output: 180004315 rows (22.80GB, 21800 batches), Cpu time: 1.95s, Wall time: 2.08s, Blocked wall time: 0ns, Peak memory: 241.50KB, Memory allocations: 65403, Threads: 1, CPU breakdown: B/I/O/F (79.82ms/18.78ms/1.83s/15.33ms)
+    -- Filter[2][expression: lt(mod(ROW["s_orderkey"],10),9)] -> row_id:BIGINT, l_suppkey:BIGINT, l_returnflag:VARCHAR, l_linestatus:VARCHAR, s_orderkey:BIGINT
+       Output: 0 rows (0B, 0 batches), Cpu time: 0ns, Wall time: 0ns, Blocked wall time: 0ns, Peak memory: 0B, Memory allocations: 0, CPU breakdown: B/I/O/F (0ns/0ns/0ns/0ns)
+      -- TableScan[1][table: S] -> row_id:BIGINT, l_suppkey:BIGINT, l_returnflag:VARCHAR, l_linestatus:VARCHAR, s_orderkey:BIGINT
+         Input: 200000000 rows (27.31GB, 21800 batches), Output: 200000000 rows (27.31GB, 21800 batches), Cpu time: 5.26s, Wall time: 5.32s, Blocked wall time: 0ns, Peak memory: 41.40MB, Memory allocations: 345707, Threads: 1, Splits: 1, CPU breakdown: B/I/O/F (31.63ms/0ns/5.23s/720ns)
+  -- TableScan[0][table: R] -> row_id:BIGINT, l_suppkey:BIGINT, l_returnflag:VARCHAR, l_linestatus:VARCHAR, l_orderkey:BIGINT, l_partkey:BIGINT, l_linenumber:BIGINT, l_quantity:DOUBLE, l_extendedprice:DOUBLE, l_discount:DOUBLE, l_tax:DOUBLE, l_shipdate:DATE, l_commitdate:DATE, l_receiptdate:DATE, l_shipinstruct:VARCHAR, l_shipmode:VARCHAR, l_comment:VARCHAR
+     Input: 100000000 rows (29.26GB, 10900 batches), Output: 100000000 rows (29.26GB, 10900 batches), Cpu time: 10.28s, Wall time: 10.31s, Blocked wall time: 0ns, Peak memory: 142.20MB, Memory allocations: 600327, Threads: 1, Splits: 1, CPU breakdown: B/I/O/F (16.50ms/0ns/10.26s/744ns)
+
+PROFILE: interrupts/evictions/bytes = 5646/2339/478872

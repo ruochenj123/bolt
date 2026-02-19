@@ -557,6 +557,17 @@ void RowContainer::store(
   }
 }
 
+/// Velox-style store: per-row type dispatch inside loop
+void RowContainer::storeColumnVelox(
+    const DecodedVector& decoded,
+    size_t size,
+    const std::vector<char*>& rows,
+    size_t column) {
+  for (size_t r = 0; r < size; ++r) {
+    store(decoded, r, rows[r], column);
+  }
+}
+
 std::unique_ptr<ByteInputStream> RowContainer::prepareRead(
     const char* row,
     int32_t offset) {
@@ -1505,6 +1516,17 @@ void HybridContainer::addPayload(RowVectorPtr input) {
     isNullable_[i] |= input->childAt(i)->mayHaveNulls();
     payloadFlatBytesSum_[i] += input->childAt(i)->estimateFlatSize();
   }
+
+  // For non-optimized mode, flatten dictionary-encoded columns at addPayload
+  // time so extraction can directly access flat vectors without indirection.
+  if (!extractionOptimized_) {
+    for (int32_t i = 0; i < payloadTypes_.size(); ++i) {
+      auto child = input->childAt(i);
+      BaseVector::flattenVector(child);
+      input->childAt(i) = std::move(child);
+    }
+  }
+
   owningInputs_.emplace_back(std::move(input));
 }
 

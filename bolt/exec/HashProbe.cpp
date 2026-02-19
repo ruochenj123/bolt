@@ -97,20 +97,37 @@ void extractColumns(
     outputRowIds.resize(rows.size());
     hybridData->getRowIds(rows.data(), rows.size(), outputRowIds);
 
-    // For single container, extract directly without sorting overhead.
+    // For non-optimized extraction, decode containerIds/batchIds/localRowIds once for all columns
+    std::vector<uint8_t> decodedContainerIds;
+    std::vector<uint32_t> decodedBatchIds;
+    std::vector<uint32_t> decodedLocalRowIds;
+    if (!hybridData->isExtractionOptimized()) {
+      hybridData->decodeRowIdsForSimpleExtraction(
+          outputRowIds, decodedContainerIds, decodedBatchIds, decodedLocalRowIds);
+    }
+
+    // For single container, sort by rowId for sequential payload access.
     // For multiple containers, sort by containerId for better cache locality.
     // Note: sorting is safe here because the output order of hash join results
     // does not need to match any specific order (SQL doesn't guarantee order).
     // Sorting can be disabled via query config for deterministic testing,
     // or disabled by caller when probe-side columns must stay in sync.
-    const bool useSorting = allowSorting && hybridData->shouldUseSorting();
+    // Sorting is disabled for non-optimized extraction because decoded IDs would be mismatched.
+    const bool useNonOptExtraction = !hybridData->isExtractionOptimized();
+    const bool useSortingByContainerId = allowSorting && !useNonOptExtraction && hybridData->shouldUseSorting();
+    const bool useSortingByRowId = allowSorting && !useNonOptExtraction && hybridData->shouldUseSortingByRowId();
 
     const char* const* extractRows = rows.data();
     std::vector<HybridRowId>* extractRowIds = &outputRowIds;
     HybridContainer::SortedRows sorted;
 
-    if (useSorting) {
+    if (useSortingByContainerId) {
       sorted = hybridData->sortByContainerId(
+          rows.data(), folly::Range<const vector_size_t*>{}, outputRowIds);
+      extractRows = sorted.rows.data();
+      extractRowIds = &sorted.rowIds;
+    } else if (useSortingByRowId) {
+      sorted = hybridData->sortByRowId(
           rows.data(), folly::Range<const vector_size_t*>{}, outputRowIds);
       extractRows = sorted.rows.data();
       extractRowIds = &sorted.rowIds;
@@ -133,6 +150,11 @@ void extractColumns(
           projection.inputChannel,
           child,
           *extractRowIds);
+    }
+
+    // Clear decoded vectors after extraction
+    if (!hybridData->isExtractionOptimized()) {
+      hybridData->clearDecodedRowIds();
     }
   } else {
     for (auto projection : projections) {
@@ -920,7 +942,12 @@ void HashProbe::fillOutput(vector_size_t size) {
     bool wrapInDictionary = false;
     std::map<int64_t, int16_t> addrToIndex;
     // if size too small, no need to sample
-    if (hitSampling_ && size > 1024) {
+    // For hybrid with coalesced payload, prefer dictionary wrapping to avoid extraction
+    auto hybridData = table_->hybridData();
+    const bool isHybridSingleContainer = 
+        hybridData != nullptr && hybridData->isSingleContainer();
+    const int minSizeForDictionary = isHybridSingleContainer ? 128 : 1024;
+    if (hitSampling_ && size > minSizeForDictionary) {
       wrapInDictionary = canWrapInDictionary(size, addrToIndex);
     }
     if (wrapInDictionary) {
@@ -1402,9 +1429,20 @@ void HashProbe::applyFilterOnTableRowsForNullAwareJoin(
       outputRowIds.resize(numRows);
       hybridData->getRowIds(data, numRows, outputRowIds);
 
+      // For non-optimized extraction, decode containerIds/batchIds/localRowIds once for all columns
+      std::vector<uint8_t> decodedContainerIds;
+      std::vector<uint32_t> decodedBatchIds;
+      std::vector<uint32_t> decodedLocalRowIds;
+      if (!hybridData->isExtractionOptimized()) {
+        hybridData->decodeRowIdsForSimpleExtraction(
+            outputRowIds, decodedContainerIds, decodedBatchIds, decodedLocalRowIds);
+      }
+
       // For single container, extract directly without sorting.
       // For multiple containers, sort by containerId for better cache locality.
-      const bool useSorting = hybridData->shouldUseSorting();
+      // Sorting is disabled for non-optimized extraction because decoded IDs would be mismatched.
+      const bool useNonOptExtraction = !hybridData->isExtractionOptimized();
+      const bool useSorting = !useNonOptExtraction && hybridData->shouldUseSorting();
       const char* const* extractRows = data;
       std::vector<HybridRowId>* extractRowIds = &outputRowIds;
       HybridContainer::SortedRows sorted;
@@ -1423,6 +1461,11 @@ void HashProbe::applyFilterOnTableRowsForNullAwareJoin(
             projection.inputChannel,
             filterTableInput_->childAt(projection.outputChannel),
             *extractRowIds);
+      }
+
+      // Clear decoded vectors after extraction
+      if (!hybridData->isExtractionOptimized()) {
+        hybridData->clearDecodedRowIds();
       }
     } else {
       for (auto& projection : filterTableProjections_) {

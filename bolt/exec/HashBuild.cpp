@@ -286,6 +286,9 @@ void HashBuild::setupTable() {
     // testing.
     table_->hybridData()->setReorderEnabled(
         queryConfig.hybridJoinReorderEnabled());
+    // Set extraction optimization flag from query config.
+    table_->hybridData()->setExtractionOptimized(
+        queryConfig.hybridJoinExtractionOptimized());
   }
 }
 
@@ -618,6 +621,11 @@ void HashBuild::addInput(RowVectorPtr input) {
   auto nextOffset = rows->nextOffset();
 
   if (hybridJoin_) {
+    // Get batchId BEFORE addPayload (current batch count)
+    auto batchId = table_->hybridData()->getNumBatches();
+    auto currentRows = table_->hybridData()->getNumRows();
+    bool optimized = table_->hybridData()->isExtractionOptimized();
+
     activeRows_.applyToSelected([&](auto rowIndex) {
       char* newRow = rows->newRow();
       if (nextOffset) {
@@ -629,11 +637,17 @@ void HashBuild::addInput(RowVectorPtr input) {
       for (auto i = 0; i < hashers.size(); ++i) {
         rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
       }
-      // Store RowId
-      auto baseRow = table_->hybridData()->getNumRows();
-      uint64_t encodedId = (static_cast<uint64_t>(driverId_)
-                            << 56) | // top 8 bits: driverId [0, 255]
-          (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+      // Store RowId with format depending on optimization mode
+      uint64_t encodedId;
+      if (optimized) {
+        // Optimized: global row counter (after coalesce)
+        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+            (static_cast<uint64_t>(rowIndex + currentRows) & ((1ULL << 56) - 1));
+      } else {
+        // Non-optimized: driverId (8 bits) | batchId (24 bits) | localRowId (40 bits)
+        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+            HybridContainer::encodeBatchAndLocalRow(batchId, rowIndex);
+      }
       rows->storeSingleRowId(encodedId, newRow);
     });
     auto payloadInput = wrapColumns(
@@ -967,8 +981,9 @@ void HashBuild::runSpill(const std::vector<Operator*>& spillOperators) {
   for (auto& spillOp : spillOperators) {
     HashBuild* build = dynamic_cast<HashBuild*>(spillOp);
     // Coalesce batches before spilling to ensure hybrid data is properly laid
-    // out.
-    if (build->hybridJoin_ && build->table_->hybridData()) {
+    // out. Only coalesce if extraction optimization is enabled.
+    if (build->hybridJoin_ && build->table_->hybridData() &&
+        build->table_->hybridData()->isExtractionOptimized()) {
       build->table_->hybridData()->coalesceBatches();
     }
     build->spiller_->spill();
@@ -999,7 +1014,9 @@ void HashBuild::noMoreInputInternal() {
   // Coalesce batches in this driver's HybridContainer before merging with
   // peers. This handles both the normal path (from noMoreInput) and spill
   // restore path (from processSpillInput). Each driver does this independently.
-  if (hybridJoin_ && table_->hybridData()) {
+  // Only coalesce if extraction optimization is enabled.
+  if (hybridJoin_ && table_->hybridData() &&
+      table_->hybridData()->isExtractionOptimized()) {
     table_->hybridData()->coalesceBatches();
   }
 
@@ -1598,8 +1615,9 @@ void HashBuild::reclaim(
         std::make_shared<AsyncSource<SpillResult>>([buildOp]() {
           try {
             // Coalesce batches before spilling to ensure hybrid data is
-            // properly laid out.
-            if (buildOp->hybridJoin_ && buildOp->table_->hybridData()) {
+            // properly laid out. Only coalesce if extraction optimization is enabled.
+            if (buildOp->hybridJoin_ && buildOp->table_->hybridData() &&
+                buildOp->table_->hybridData()->isExtractionOptimized()) {
               buildOp->table_->hybridData()->coalesceBatches();
             }
             buildOp->spiller_->spill();

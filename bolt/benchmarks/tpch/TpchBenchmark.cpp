@@ -70,6 +70,18 @@ DEFINE_int32(
     "Percentage of lineitem columns to "
     "include in IO meter query. The columns are sorted by name and the n% first "
     "are scanned");
+DEFINE_int32(
+    q29_sort_keys,
+    1,
+    "Number of sort keys for Q29 benchmark (1-4)");
+DEFINE_int32(
+    q29_projection_cols,
+    16,
+    "Number of projection columns for Q29 benchmark (4, 8, or 16)");
+DEFINE_int32(
+    q30_probe_selectivity,
+    90,
+    "Probe side selectivity for Q30 benchmark (10, 30, 60, or 90 percent)");
 
 std::shared_ptr<TpchQueryBuilder> queryBuilder;
 
@@ -80,9 +92,19 @@ class TpchBenchmark : public QueryBenchmarkBase {
     if (FLAGS_run_query_verbose == -1 && FLAGS_io_meter_column_pct == 0) {
       folly::runBenchmarks();
     } else {
-      const auto queryPlan = FLAGS_io_meter_column_pct > 0
-          ? queryBuilder->getIoMeterPlan(FLAGS_io_meter_column_pct)
-          : queryBuilder->getQueryPlan(FLAGS_run_query_verbose);
+      TpchPlan queryPlan;
+      if (FLAGS_io_meter_column_pct > 0) {
+        queryPlan = queryBuilder->getIoMeterPlan(FLAGS_io_meter_column_pct);
+      } else if (FLAGS_run_query_verbose == 29) {
+        // Q29: configurable sort benchmark
+        queryPlan = queryBuilder->getQ29Plan(
+            FLAGS_q29_sort_keys, FLAGS_q29_projection_cols);
+      } else if (FLAGS_run_query_verbose == 30) {
+        // Q30: synthetic self-join benchmark
+        queryPlan = queryBuilder->getQ30Plan(FLAGS_q30_probe_selectivity);
+      } else {
+        queryPlan = queryBuilder->getQueryPlan(FLAGS_run_query_verbose);
+      }
       auto [cursor, actualResults] = run(queryPlan);
       if (!cursor) {
         LOG(ERROR) << "Query terminated with error. Exiting";

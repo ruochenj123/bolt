@@ -96,6 +96,18 @@ class TpchQueryBuilder {
   /// by column name and take the first columnPct percent.
   TpchPlan getIoMeterPlan(int columnPct) const;
 
+  /// Q29: Configurable sort benchmark on lineitem.
+  /// @param numSortKeys Number of sort keys (1-4)
+  /// @param numProjectionCols Number of projection columns (4, 8, or 16)
+  TpchPlan getQ29Plan(int numSortKeys, int numProjectionCols) const;
+
+  /// Q30: Join benchmark with R (build, 100M) and S (probe, 200M).
+  /// 4 join keys: row_id, l_suppkey, l_returnflag, l_linestatus
+  /// Match ratio controlled by data generation (S.row_id = -1 for unmatched)
+  /// @param probeSelectivityPct Probe side selectivity: 10, 30, 60, 90, or 100%
+  /// Output: 17 columns from build side (4 keys + 13 payload)
+  TpchPlan getQ30Plan(int probeSelectivityPct) const;
+
   /// Get the TPC-H table names present.
   static const std::vector<std::string>& getTableNames();
 
@@ -129,6 +141,7 @@ class TpchQueryBuilder {
   TpchPlan getQ20Plan() const;
   TpchPlan getQ21Plan() const;
   TpchPlan getQ22Plan() const;
+  TpchPlan getQ28Plan() const;
 
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {
@@ -163,6 +176,11 @@ class TpchQueryBuilder {
   static constexpr const char* kPart = "part";
   static constexpr const char* kSupplier = "supplier";
   static constexpr const char* kPartsupp = "partsupp";
+  // Join benchmark tables (R = build 100M, S = probe 200M)
+  // R has row_id as primary key + lineitem payload
+  // S has row_id as join key, match ratio controlled by data generation
+  static constexpr const char* kR = "R";
+  static constexpr const char* kS = "S";
   std::shared_ptr<memory::MemoryPool> pool_ =
       memory::memoryManager()->addLeafPool();
   const bool filtersAsNode_;

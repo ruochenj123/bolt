@@ -30,6 +30,7 @@
 
 #include "SortBuffer.h"
 #include <algorithm>
+#include <chrono>
 #include "Spiller.h"
 #include "bolt/exec/MemoryReclaimer.h"
 #include "bolt/exec/RowToColumnVector.h"
@@ -118,6 +119,11 @@ SortBuffer::SortBuffer(
     std::unordered_map<uint8_t, HybridContainer*> hybridDataChannel;
     hybridDataChannel[0] = hybridData_.get();
     hybridData_->setAllContainers(hybridDataChannel);
+    // Set extraction optimization flag from query config
+    if (operatorCtx_) {
+      hybridData_->setExtractionOptimized(
+          operatorCtx_->driverCtx()->queryConfig().hybridSortExtractionOptimized());
+    }
 
     payloadTypes_ =
         ROW(std::move(nonSortedColumnNames), std::move(nonSortedColumnTypes));
@@ -125,6 +131,9 @@ SortBuffer::SortBuffer(
     data_ = std::make_unique<RowContainer>(
         sortedColumnTypes, nonSortedColumnTypes, pool_);
   }
+  // LOG(ERROR) << "SortBuffer hybridSortEnabled: " << hybridSortEnabled_
+  //            << ", extractionOptimized: " 
+  //            << (hybridSortEnabled_ ? hybridData_->isExtractionOptimized() : true);
   spillerStoreType_ =
       ROW(std::move(sortedSpillColumnNames), std::move(sortedSpillColumnTypes));
 }
@@ -141,12 +150,23 @@ void SortBuffer::addInput(const VectorPtr& input) {
   auto* inputRow = input->as<RowVector>();
   MicrosecondTimer timer(&sortColToRowTimeUs_);
   if (hybridSortEnabled_) {
+    // Get batchId BEFORE addPayload (current batch count)
+    auto batchId = hybridData_->getNumBatches();
     auto currentRows = hybridData_->getNumRows();
+    bool optimized = hybridData_->isExtractionOptimized();
+    
     for (int row = 0; row < input->size(); ++row) {
-      // Store RowId
-      uint64_t encodedId = (static_cast<uint64_t>(0)
-                            << 56) | // top 8 bits: driverId, always 0 for Sort
-          (static_cast<uint64_t>(row + currentRows) & ((1ULL << 56) - 1));
+      // Store RowId with format depending on optimization mode
+      uint64_t encodedId;
+      if (optimized) {
+        // Optimized: global row counter (after coalesce)
+        encodedId = (static_cast<uint64_t>(0) << 56) | // driverId always 0 for Sort
+            (static_cast<uint64_t>(row + currentRows) & ((1ULL << 56) - 1));
+      } else {
+        // Non-optimized: driverId (8 bits) | batchId (24 bits) | localRowId (40 bits)
+        encodedId = (static_cast<uint64_t>(0) << 56) |
+            HybridContainer::encodeBatchAndLocalRow(batchId, row);
+      }
       data_->storeSingleRowId(encodedId, rows[row]);
     }
     // Store key columns
@@ -174,14 +194,11 @@ void SortBuffer::addInput(const VectorPtr& input) {
         input->as<RowVector>(), payloadChannels_, payloadTypes_, pool());
     hybridData_->addPayload(std::move(payloadInput));
   } else {
+    // Velox-style: per-row type dispatch inside loop (for A/B comparison)
     for (const auto& columnProjection : columnMap_) {
       DecodedVector decoded(
           *inputRow->childAt(columnProjection.outputChannel), allRows);
-      auto kind =
-          inputRow->childAt(columnProjection.outputChannel)->type()->kind();
-      BOLT_DYNAMIC_TYPE_DISPATCH(
-          data_->storeColumn,
-          kind,
+      data_->storeColumnVelox(
           decoded,
           input->size(),
           rows,
@@ -432,11 +449,11 @@ void SortBuffer::spillInput() {
     hybridData_->coalesceBatches();
   }
   spiller_->spill();
-  LOG(INFO) << (operatorCtx_ ? operatorCtx_->toString() : "SortBuffer")
-            << " spill row container, data size: "
-            << spiller_->container()->usedBytes()
-            << ", num rows: " << spiller_->container()->numRows()
-            << ", spill file number: " << spiller_->state().numFinishedFiles(0);
+  // LOG(INFO) << (operatorCtx_ ? operatorCtx_->toString() : "SortBuffer")
+  //           << " spill row container, data size: "
+  //           << spiller_->container()->usedBytes()
+  //           << ", num rows: " << spiller_->container()->numRows()
+  //           << ", spill file number: " << spiller_->state().numFinishedFiles(0);
   if (hybridSortEnabled_ && hybridData_ != nullptr) {
     hybridData_->clear();
   } else {
@@ -467,11 +484,11 @@ void SortBuffer::spillOutput() {
   auto spillRows = std::vector<char*>(
       sortedRows_.begin() + numOutputRows_, sortedRows_.end());
   spiller_->spill(spillRows);
-  LOG(INFO) << (operatorCtx_ ? operatorCtx_->toString() : "SortBuffer")
-            << " spill output, data size: "
-            << spiller_->container()->usedBytes()
-            << ", num rows: " << spiller_->container()->numRows()
-            << ", spill file number: " << spiller_->state().numFinishedFiles(0);
+  // LOG(INFO) << (operatorCtx_ ? operatorCtx_->toString() : "SortBuffer")
+  //           << " spill output, data size: "
+  //           << spiller_->container()->usedBytes()
+  //           << ", num rows: " << spiller_->container()->numRows()
+  //           << ", spill file number: " << spiller_->state().numFinishedFiles(0);
   if (hybridSortEnabled_ && hybridData_ != nullptr) {
     hybridData_->clear();
   } else {
@@ -520,6 +537,16 @@ void SortBuffer::getOutputWithoutSpill() {
     outputRowIds.resize(output_->size());
     hybridData_->getRowIds(
         sortedRows_.data() + numOutputRows_, output_->size(), outputRowIds);
+
+    // For non-optimized extraction, decode containerIds/batchIds/localRowIds once for all columns
+    std::vector<uint8_t> decodedContainerIds;
+    std::vector<uint32_t> decodedBatchIds;
+    std::vector<uint32_t> decodedLocalRowIds;
+    if (!hybridData_->isExtractionOptimized()) {
+      hybridData_->decodeRowIdsForSimpleExtraction(
+          outputRowIds, decodedContainerIds, decodedBatchIds, decodedLocalRowIds);
+    }
+
     for (const auto& columnProjection : columnMap_) {
       hybridData_->extractColumn(
           sortedRows_.data() + numOutputRows_,
@@ -528,6 +555,14 @@ void SortBuffer::getOutputWithoutSpill() {
           output_->childAt(columnProjection.outputChannel),
           outputRowIds);
     }
+
+    // Clear decoded pointers after extraction
+    if (!hybridData_->isExtractionOptimized()) {
+      hybridData_->clearDecodedRowIds();
+    }
+    // LOG(ERROR) << "Hybrid extract: keyExtractUs=" << keyExtractUs
+    //            << " payloadExtractUs=" << payloadExtractUs
+    //            << " numRows=" << output_->size();
   } else {
     for (const auto& columnProjection : columnMap_) {
       data_->extractColumn(

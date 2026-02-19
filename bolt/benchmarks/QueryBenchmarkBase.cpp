@@ -104,6 +104,27 @@ DEFINE_int32(
     "the current one");
 
 DEFINE_int32(split_preload_per_driver, 2, "Prefetch split metadata");
+
+DEFINE_bool(
+    hybrid_sort_enabled,
+    false,
+    "Enable hybrid sort optimization");
+
+DEFINE_bool(
+    hybrid_join_enabled,
+    false,
+    "Enable hybrid join optimization");
+
+DEFINE_bool(
+    hybrid_sort_extraction_optimized,
+    true,
+    "Enable optimized extraction (coalesce + prefetch) for hybrid sort");
+
+DEFINE_bool(
+    hybrid_join_extraction_optimized,
+    true,
+    "Enable optimized extraction (coalesce + prefetch) for hybrid join");
+
 using namespace bytedance::bolt::exec;
 using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::dwio::common;
@@ -241,6 +262,18 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       params.planNode = tpchPlan.plan;
       params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
           std::to_string(FLAGS_split_preload_per_driver);
+      if (FLAGS_hybrid_sort_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridSortEnabled] = "true";
+      }
+      if (FLAGS_hybrid_join_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinEnabled] = "true";
+      }
+      if (!FLAGS_hybrid_sort_extraction_optimized) {
+        params.queryConfigs[core::QueryConfig::kHybridSortExtractionOptimized] = "false";
+      }
+      if (!FLAGS_hybrid_join_extraction_optimized) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinExtractionOptimized] = "false";
+      }
       const int numSplitsPerFile = FLAGS_num_splits_per_file;
 
       bool noMoreSplits = false;

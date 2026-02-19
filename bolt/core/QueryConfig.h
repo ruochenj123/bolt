@@ -592,6 +592,18 @@ class QueryConfig {
 
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
+  // Controls extraction optimization for hybrid sort.
+  // When true (default): batches are coalesced into one, prefetch is used.
+  // When false: batches kept separate, batchId-based encoding, no prefetch.
+  static constexpr const char* kHybridSortExtractionOptimized =
+      "hybrid_sort_extraction_optimized";
+
+  // Controls extraction optimization for hybrid join.
+  // When true (default): batches are coalesced into one, prefetch is used.
+  // When false: batches kept separate, batchId-based encoding, no prefetch.
+  static constexpr const char* kHybridJoinExtractionOptimized =
+      "hybrid_join_extraction_optimized";
+
   /**
    * LLVM JIT enabled
    * -1 : enable all jit (by default)
@@ -1015,6 +1027,20 @@ class QueryConfig {
 
   bool hybridSortEnabled() const {
     return get<bool>(kHybridSortEnabled, false);
+  }
+
+  /// Returns whether extraction optimization is enabled for hybrid sort.
+  /// When true (default): batches are coalesced, prefetch is used.
+  /// When false: batches kept separate, batchId-based encoding, no prefetch.
+  bool hybridSortExtractionOptimized() const {
+    return get<bool>(kHybridSortExtractionOptimized, true);
+  }
+
+  /// Returns whether extraction optimization is enabled for hybrid join.
+  /// When true (default): batches are coalesced, prefetch is used.
+  /// When false: batches kept separate, batchId-based encoding, no prefetch.
+  bool hybridJoinExtractionOptimized() const {
+    return get<bool>(kHybridJoinExtractionOptimized, true);
   }
 
   /// Returns 'is aggregation spilling enabled' flag. Must also check the

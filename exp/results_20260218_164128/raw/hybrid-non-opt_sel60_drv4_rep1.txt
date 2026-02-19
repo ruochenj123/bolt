@@ -1,0 +1,19 @@
+*** Aborted at 1771453879 (Unix time, try 'date -d @1771453879') ***
+*** Signal 11 (SIGSEGV) (0x0) received by PID 832236 (pthread TID 0x7f29277fe700) (linux TID 832252) (code: address not mapped to object), stack trace: ***
+    @ 000000000c22a841 _ZN5folly10symbolizer12_GLOBAL__N_113signalHandlerEiP9siginfo_tPv
+    @ 0000000000000000 (unknown)
+    @ 00000000060df228 _ZN9bytedance4bolt4exec15HybridContainer20extractPayloadSimpleIlEEviiiPNS0_10FlatVectorIT_EERSt6vectorINS1_11HybridRowIdESaIS9_EE.isra.0
+    @ 00000000060fd9f8 _ZZZN9bytedance4bolt4exec15HybridContainer14extractPayloadEPKPKcN5folly5RangeIPKiEEiiiRKSt10shared_ptrINS0_10BaseVectorEERSt6vectorINS1_11HybridRowIdESaISI_EEbENKUlvE_clEvENKUlvE_clEv
+    @ 0000000007c69555 _ZN9bytedance4bolt4exec12_GLOBAL__N_114extractColumnsEPNS1_13BaseHashTableEN5folly5RangeIPPcEENS6_IPKNS1_18IdentityProjectionEEEPNS0_6memory10MemoryPoolERKSt6vectorISt10shared_ptrIKNS0_4TypeEESaISL_EERSH_ISI_INS0_10BaseVectorEESaISR_EEb
+    @ 0000000007c6eb88 _ZN9bytedance4bolt4exec9HashProbe10fillOutputEi
+    @ 0000000007c6fb8a _ZN9bytedance4bolt4exec9HashProbe9getOutputEv
+    @ 00000000036f5679 _ZZN9bytedance4bolt4exec6Driver11runInternalERSt10shared_ptrIS2_ERS3_INS1_13BlockingStateEERS3_INS0_9RowVectorEEENKUlvE3_clEv
+    @ 00000000036f9b21 _ZN9bytedance4bolt4exec6Driver11runInternalERSt10shared_ptrIS2_ERS3_INS1_13BlockingStateEERS3_INS0_9RowVectorEE
+    @ 00000000036fc790 _ZN9bytedance4bolt4exec6Driver3runESt10shared_ptrIS2_E
+    @ 00000000036fcb42 _ZN5folly6detail8function14FunctionTraitsIFvvEE9callSmallIZN9bytedance4bolt4exec6Driver7enqueueESt10shared_ptrIS9_EEUlvE_EEvRNS1_4DataE
+    @ 000000000c224896 _ZN5folly18ThreadPoolExecutor7runTaskERKSt10shared_ptrINS0_6ThreadEEONS0_4TaskE
+    @ 000000000c205654 _ZN5folly21CPUThreadPoolExecutor9threadRunESt10shared_ptrINS_18ThreadPoolExecutor6ThreadEE
+    @ 000000000c2261fa _ZN5folly6detail8function14FunctionTraitsIFvvEE9callSmallISt5_BindIFMNS_18ThreadPoolExecutorEFvSt10shared_ptrINS7_6ThreadEEEPS7_SA_EEEEvRNS1_4DataE
+    @ 0000000000000000 (unknown)
+    @ 0000000000008608 start_thread
+    @ 000000000011f352 clone

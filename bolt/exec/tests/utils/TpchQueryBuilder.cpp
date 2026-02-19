@@ -201,6 +201,14 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ21Plan();
     case 22:
       return getQ22Plan();
+    case 28:
+      return getQ28Plan();
+    case 29:
+      // Q29 requires parameters, use getQ29Plan(numSortKeys, numProjectionCols) directly
+      BOLT_NYI("Q29 requires parameters, use getQ29Plan(numSortKeys, numProjectionCols) directly");
+    case 30:
+      // Q30 requires parameters, use getQ30Plan(probeSelectivityPct) directly
+      BOLT_NYI("Q30 requires parameters, use getQ30Plan(probeSelectivityPct) directly");
     default:
       BOLT_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -2505,6 +2513,41 @@ TpchPlan TpchQueryBuilder::getQ22Plan() const {
   return context;
 }
 
+// Q28: Simple sort on lineitem with large payload (same as Q204)
+// SELECT all lineitem columns
+// FROM lineitem
+// ORDER BY l_comment
+// 
+// This query tests:
+// 1. Pure sort (no join) with large payload
+// 2. VARCHAR sort key (l_comment)
+// 3. All lineitem columns from schema
+TpchPlan TpchQueryBuilder::getQ28Plan() const {
+  // Use kTables_ to get all column names (same as Q204)
+  const auto& columns = kTables_.at(kLineitem);
+  const auto selectedRowType = getRowType(kLineitem, columns);
+  const auto& fileColumnNames = getFileColumnNames(kLineitem);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemPlanNodeId;
+
+  // Simple: scan lineitem, sort by l_comment (VARCHAR)
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kLineitem, selectedRowType, fileColumnNames)
+          .captureScanNodeId(lineitemPlanNodeId)
+          .orderBy({"l_comment"}, false)
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q28";
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFileFormat = format_;
+  return context;
+}
+
 TpchPlan TpchQueryBuilder::getIoMeterPlan(int columnPct) const {
   BOLT_CHECK(columnPct > 0 && columnPct <= 100);
   auto columns = getFileColumnNames(kLineitem);
@@ -2558,6 +2601,199 @@ TpchPlan TpchQueryBuilder::getIoMeterPlan(int columnPct) const {
   return context;
 }
 
+// Q29: Configurable sort benchmark on lineitem
+// Parameters:
+//   numSortKeys: 1-4 sort keys (l_orderkey, l_partkey, l_suppkey, l_linenumber)
+//   numProjectionCols: 4, 8, 12, or 16 (full schema) columns
+// 
+// This query tests:
+// 1. Impact of sort key count on hybrid vs baseline performance
+// 2. Impact of payload size (projection columns) on extraction cost
+TpchPlan TpchQueryBuilder::getQ29Plan(int numSortKeys, int numProjectionCols) const {
+  BOLT_CHECK(numSortKeys >= 1 && numSortKeys <= 4, 
+             "numSortKeys must be 1-4, got {}", numSortKeys);
+  BOLT_CHECK(numProjectionCols == 4 || numProjectionCols == 8 || 
+             numProjectionCols == 12 || numProjectionCols == 16,
+             "numProjectionCols must be 4, 8, 12, or 16, got {}", numProjectionCols);
+
+  // Define sort keys (all numeric for deterministic ordering)
+  // Ordered by increasing cardinality: low cardinality first
+  std::vector<std::string> allSortKeys = {
+      "l_linenumber",  // INTEGER - 1-7 values
+      "l_suppkey",     // BIGINT - ~10K unique values
+      "l_partkey",     // BIGINT - ~200K unique values
+      "l_orderkey"     // BIGINT - ~60M unique values
+  };
+  
+  // Define projection columns in groups
+  // Group 1 (4 cols): sort keys
+  std::vector<std::string> columns4 = {
+      "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber"
+  };
+  // Group 2 (8 cols): + numeric payload
+  std::vector<std::string> columns8 = {
+      "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber",
+      "l_quantity", "l_extendedprice", "l_discount", "l_tax"
+  };
+  // Group 3 (12 cols): + dates
+  std::vector<std::string> columns12 = {
+      "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber",
+      "l_quantity", "l_extendedprice", "l_discount", "l_tax",
+      "l_shipdate", "l_commitdate", "l_receiptdate", "l_returnflag"
+  };
+  // Group 4 (16 cols): full schema
+  const auto& columns16 = kTables_.at(kLineitem);
+  
+  // Select columns based on parameter
+  std::vector<std::string> selectedColumns;
+  if (numProjectionCols == 4) {
+    selectedColumns = columns4;
+  } else if (numProjectionCols == 8) {
+    selectedColumns = columns8;
+  } else if (numProjectionCols == 12) {
+    selectedColumns = columns12;
+  } else {
+    selectedColumns = columns16;
+  }
+  
+  // Select sort keys based on parameter
+  std::vector<std::string> sortKeys(allSortKeys.begin(), allSortKeys.begin() + numSortKeys);
+  
+  const auto selectedRowType = getRowType(kLineitem, selectedColumns);
+  const auto& fileColumnNames = getFileColumnNames(kLineitem);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemPlanNodeId;
+
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kLineitem, selectedRowType, fileColumnNames)
+          .captureScanNodeId(lineitemPlanNodeId)
+          .orderBy(sortKeys, false)
+          .planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format("q29_{}keys_{}cols", numSortKeys, numProjectionCols);
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q30: Join benchmark with R (build, 100M) and S (probe, 200M)
+// 4 Join keys: row_id, l_suppkey, l_returnflag, l_linestatus
+// Match ratio is controlled at data generation time (S.row_id values)
+// - Matched S rows: copy all 4 join keys from R
+// - Unmatched S rows: row_id = -1 (won't match any R row)
+//
+// probeSelectivityPct controls a filter on probe side to reduce
+// the number of probe rows being processed.
+//
+// Output: all columns from R (build side)
+TpchPlan TpchQueryBuilder::getQ30Plan(int probeSelectivityPct) const {
+  BOLT_CHECK(
+      probeSelectivityPct == 10 || probeSelectivityPct == 30 ||
+          probeSelectivityPct == 60 || probeSelectivityPct == 90 ||
+          probeSelectivityPct == 100,
+      "probeSelectivityPct must be 10, 30, 60, 90, or 100, got {}",
+      probeSelectivityPct);
+
+  // Build side columns: 4 join keys + payload
+  std::vector<std::string> buildColumns = {
+      // 4 Join keys
+      "row_id",
+      "l_suppkey",
+      "l_returnflag",
+      "l_linestatus",
+      // Payload columns
+      "l_orderkey",
+      "l_partkey",
+      "l_linenumber",
+      "l_quantity",
+      "l_extendedprice",
+      "l_discount",
+      "l_tax",
+      "l_shipdate",
+      "l_commitdate",
+      "l_receiptdate",
+      "l_shipinstruct",
+      "l_shipmode",
+      "l_comment"
+  };
+
+  // Probe side columns: 4 join keys + s_orderkey (for selectivity filter)
+  std::vector<std::string> probeColumns = {
+      // 4 Join keys
+      "row_id",
+      "l_suppkey",
+      "l_returnflag",
+      "l_linestatus",
+      // Probe payload
+      "s_orderkey"
+  };
+
+  // Output columns after join: all from build side
+  std::vector<std::string> outputColumns = buildColumns;
+
+  const auto buildRowType = getRowType(kR, buildColumns);
+  const auto probeRowType = getRowType(kS, probeColumns);
+  const auto& buildFileColumnNames = getFileColumnNames(kR);
+  const auto& probeFileColumnNames = getFileColumnNames(kS);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId buildScanNodeId;
+  core::PlanNodeId probeScanNodeId;
+
+  // Build side: R table (100M rows)
+  auto buildPlan = PlanBuilder(planNodeIdGenerator)
+                       .filtersAsNode(filtersAsNode_)
+                       .tableScan(kR, buildRowType, buildFileColumnNames)
+                       .captureScanNodeId(buildScanNodeId)
+                       .planNode();
+
+  // Probe side: S table (200M rows)
+  PlanBuilder probeBuilder(planNodeIdGenerator, pool_.get());
+  probeBuilder.filtersAsNode(filtersAsNode_)
+              .tableScan(kS, probeRowType, probeFileColumnNames)
+              .captureScanNodeId(probeScanNodeId);
+
+  // Apply selectivity filter if not 100%
+  if (probeSelectivityPct < 100) {
+    int threshold = probeSelectivityPct / 10;
+    std::string selectivityFilter =
+        fmt::format("(s_orderkey % 10) < {}", threshold);
+    probeBuilder.filter(selectivityFilter);
+  }
+
+  // Project to alias join keys to avoid duplicate column names in join output
+  probeBuilder.project({
+      "row_id AS p_row_id",
+      "l_suppkey AS p_suppkey",
+      "l_returnflag AS p_returnflag",
+      "l_linestatus AS p_linestatus"
+  });
+
+  auto plan = probeBuilder
+      .hashJoin(
+          // 4 Probe keys (aliased)
+          {"p_row_id", "p_suppkey", "p_returnflag", "p_linestatus"},
+          // 4 Build keys
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},
+          buildPlan,
+          "",
+          outputColumns)
+      .planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format("q30_sel{}pct", probeSelectivityPct);
+  context.plan = std::move(plan);
+  context.dataFiles[buildScanNodeId] = getTableFilePaths(kR);
+  context.dataFiles[probeScanNodeId] = getTableFilePaths(kS);
+  context.dataFileFormat = format_;
+  return context;
+}
+
 const std::vector<std::string> TpchQueryBuilder::kTableNames_ = {
     kLineitem,
     kOrders,
@@ -2566,7 +2802,9 @@ const std::vector<std::string> TpchQueryBuilder::kTableNames_ = {
     kRegion,
     kPart,
     kSupplier,
-    kPartsupp};
+    kPartsupp,
+    kR,
+    kS};
 
 const std::unordered_map<std::string, std::vector<std::string>>
     TpchQueryBuilder::kTables_ = {
@@ -2593,6 +2831,42 @@ const std::unordered_map<std::string, std::vector<std::string>>
             tpch::getTableSchema(tpch::Table::TBL_SUPPLIER, true)->names()),
         std::make_pair(
             "partsupp",
-            tpch::getTableSchema(tpch::Table::TBL_PARTSUPP, true)->names())};
+            tpch::getTableSchema(tpch::Table::TBL_PARTSUPP, true)->names()),
+        // Join benchmark tables:
+        // R: build side (100M rows) - 4 join keys + payload
+        // S: probe side (200M rows) - 4 join keys + s_orderkey
+        // Join keys: row_id, l_suppkey, l_returnflag, l_linestatus
+        std::make_pair(
+            "R",
+            std::vector<std::string>{
+                // 4 Join keys
+                "row_id",
+                "l_suppkey",
+                "l_returnflag",
+                "l_linestatus",
+                // Payload columns
+                "l_orderkey",
+                "l_partkey",
+                "l_linenumber",
+                "l_quantity",
+                "l_extendedprice",
+                "l_discount",
+                "l_tax",
+                "l_shipdate",
+                "l_commitdate",
+                "l_receiptdate",
+                "l_shipinstruct",
+                "l_shipmode",
+                "l_comment"}),
+        std::make_pair(
+            "S",
+            std::vector<std::string>{
+                // 4 Join keys (same as R)
+                "row_id",
+                "l_suppkey",
+                "l_returnflag",
+                "l_linestatus",
+                // Probe payload
+                "s_orderkey"})};
 
 } // namespace bytedance::bolt::exec::test

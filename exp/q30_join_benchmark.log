@@ -1,0 +1,68 @@
+nohup: ignoring input
+Starting Q30 Join Benchmark at Tue 17 Feb 2026 09:25:43 PM EST
+===========================================================
+Build (R): 25M rows | Probe (S): 100M rows
+Total runs: 48 (2 modes × 4 selectivities × 2 drivers × 3 repeats)
+Data: /home/jiang.2091/velox_join/data/join_benchmark
+Results: /home/jiang.2091/velox_join/bolt/exp/q30_join_results.csv
+Raw output: /home/jiang.2091/velox_join/bolt/exp/q30_join_raw
+
+
+Mode: baseline (Tue 17 Feb 2026 09:25:43 PM EST)
+-------------------------------------
+21:25:55 baseline | sel=10% | drv=1 | rep=1 | time=11.48s | rows=16815756
+21:26:07 baseline | sel=10% | drv=1 | rep=2 | time=11.70s | rows=16815756
+21:26:18 baseline | sel=10% | drv=1 | rep=3 | time=11.41s | rows=16815756
+21:26:23 baseline | sel=10% | drv=4 | rep=1 | time=4.14s | rows=16815756
+21:26:27 baseline | sel=10% | drv=4 | rep=2 | time=4.07s | rows=16815756
+21:26:32 baseline | sel=10% | drv=4 | rep=3 | time=4.11s | rows=16815756
+21:26:49 baseline | sel=30% | drv=1 | rep=1 | time=16.48s | rows=50372556
+21:27:06 baseline | sel=30% | drv=1 | rep=2 | time=16.49s | rows=50372556
+21:27:23 baseline | sel=30% | drv=1 | rep=3 | time=16.57s | rows=50372556
+21:27:29 baseline | sel=30% | drv=4 | rep=1 | time=5.72s | rows=50372556
+21:27:36 baseline | sel=30% | drv=4 | rep=2 | time=s | rows=
+21:27:42 baseline | sel=30% | drv=4 | rep=3 | time=5.75s | rows=50372556
+21:28:11 baseline | sel=60% | drv=1 | rep=1 | time=28.11s | rows=100757440
+21:28:36 baseline | sel=60% | drv=1 | rep=2 | time=24.32s | rows=100757440
+21:29:01 baseline | sel=60% | drv=1 | rep=3 | time=24.30s | rows=100757440
+21:29:11 baseline | sel=60% | drv=4 | rep=1 | time=8.21s | rows=100757440
+21:29:20 baseline | sel=60% | drv=4 | rep=2 | time=8.24s | rows=100757440
+21:29:29 baseline | sel=60% | drv=4 | rep=3 | time=8.29s | rows=100757440
+21:30:02 baseline | sel=90% | drv=1 | rep=1 | time=32.03s | rows=151148488
+21:30:36 baseline | sel=90% | drv=1 | rep=2 | time=32.10s | rows=151148488
+21:31:10 baseline | sel=90% | drv=1 | rep=3 | time=32.69s | rows=151148488
+21:31:22 baseline | sel=90% | drv=4 | rep=1 | time=10.86s | rows=151148488
+21:31:35 baseline | sel=90% | drv=4 | rep=2 | time=11.00s | rows=151148488
+21:31:47 baseline | sel=90% | drv=4 | rep=3 | time=10.89s | rows=151148488
+
+Mode: hybrid-opt (Tue 17 Feb 2026 09:31:47 PM EST)
+-------------------------------------
+21:31:58 hybrid-opt | sel=10% | drv=1 | rep=1 | time=11.08s | rows=16815756
+21:32:09 hybrid-opt | sel=10% | drv=1 | rep=2 | time=11.02s | rows=16815756
+21:32:21 hybrid-opt | sel=10% | drv=1 | rep=3 | time=10.98s | rows=16815756
+21:32:25 hybrid-opt | sel=10% | drv=4 | rep=1 | time=4.00s | rows=16815756
+21:32:29 hybrid-opt | sel=10% | drv=4 | rep=2 | time=3.99s | rows=16815756
+21:32:34 hybrid-opt | sel=10% | drv=4 | rep=3 | time=3.92s | rows=16815756
+21:32:51 hybrid-opt | sel=30% | drv=1 | rep=1 | time=16.90s | rows=50372556
+21:33:08 hybrid-opt | sel=30% | drv=1 | rep=2 | time=16.83s | rows=50372556
+21:33:26 hybrid-opt | sel=30% | drv=1 | rep=3 | time=17.17s | rows=50372556
+21:33:33 hybrid-opt | sel=30% | drv=4 | rep=1 | time=6.14s | rows=50372556
+21:33:40 hybrid-opt | sel=30% | drv=4 | rep=2 | time=6.10s | rows=50372556
+21:33:46 hybrid-opt | sel=30% | drv=4 | rep=3 | time=6.09s | rows=50372556
+21:34:14 hybrid-opt | sel=60% | drv=1 | rep=1 | time=26.50s | rows=100757440
+21:34:41 hybrid-opt | sel=60% | drv=1 | rep=2 | time=26.92s | rows=100757440
+21:35:09 hybrid-opt | sel=60% | drv=1 | rep=3 | time=26.22s | rows=100757440
+21:35:19 hybrid-opt | sel=60% | drv=4 | rep=1 | time=9.56s | rows=100757440
+21:35:30 hybrid-opt | sel=60% | drv=4 | rep=2 | time=9.61s | rows=100757440
+21:35:40 hybrid-opt | sel=60% | drv=4 | rep=3 | time=9.62s | rows=100757440
+21:36:16 hybrid-opt | sel=90% | drv=1 | rep=1 | time=35.10s | rows=151148488
+21:36:53 hybrid-opt | sel=90% | drv=1 | rep=2 | time=35.51s | rows=151148488
+21:37:31 hybrid-opt | sel=90% | drv=1 | rep=3 | time=36.62s | rows=151148488
+21:37:46 hybrid-opt | sel=90% | drv=4 | rep=1 | time=13.15s | rows=151148488
+21:38:00 hybrid-opt | sel=90% | drv=4 | rep=2 | time=13.22s | rows=151148488
+21:38:15 hybrid-opt | sel=90% | drv=4 | rep=3 | time=13.16s | rows=151148488
+
+===========================================================
+Benchmark completed at Tue 17 Feb 2026 09:38:15 PM EST
+Results saved to: /home/jiang.2091/velox_join/bolt/exp/q30_join_results.csv
+Raw outputs in: /home/jiang.2091/velox_join/bolt/exp/q30_join_raw
