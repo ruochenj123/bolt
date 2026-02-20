@@ -211,11 +211,19 @@ HashProbe::HashProbe(
   // Currently, probe side always comes from TableScan or other sources.
   isNWayLateMInput_ = false;
 
+  // Check if this probe has downstream build key channels (feeds into another HashBuild)
+  bool hasDownstreamHashBuild = 
+      driverCtx->downstreamBuildKeyChannels.find(planNodeId()) != 
+      driverCtx->downstreamBuildKeyChannels.end();
+
   // Output is N-way if there's a downstream HashBuild waiting for rowIds
-  // (i.e., we're not the final materialization point)
+  // (i.e., we're not the final materialization point).
+  // When Sort is the materialization point, only intermediate probes (that feed HashBuild)
+  // use late-m output. The final probe before Sort uses standard probe with filtering.
   isNWayLateMOutput_ = driverCtx->buildSideLateMEnabled &&
       !driverCtx->materializationPlanNodeId.empty() &&
-      driverCtx->materializationPlanNodeId != planNodeId();
+      driverCtx->materializationPlanNodeId != planNodeId() &&
+      hasDownstreamHashBuild;  // Only intermediate probes that feed HashBuild
 
   // Check if this is the final probe before Sort (Sort is the materialization point)
   // In this case, we use OUTPUT mode but pass sort key columns instead of build key columns
@@ -291,21 +299,30 @@ void HashProbe::initialize() {
     filterTableResult_.resize(1);
   }
 
-  // N-way late materialization: initialize ProbePayloadContainer and columnSourceMap
-  if (isNWayLateMOutput_ && !projectedInputColumns_.empty()) {
-    // Initialize ProbePayloadContainer with schema (shared ownership for downstream access)
-    probePayloadContainer_ = std::make_shared<ProbePayloadContainer>(pool());
-    probePayloadContainer_->setId(driverId_);
-
-    // Initialize allContainers_ with self for single-container mode (intra-pipeline fast path)
-    std::unordered_map<uint8_t, ProbePayloadContainer*> selfContainer;
-    selfContainer[driverId_] = probePayloadContainer_.get();
-    probePayloadContainer_->setAllContainers(selfContainer);
-
-    // Register container in DriverCtx for downstream HashBuild access
-    // This enables cross-driver extraction after table merge
+  // N-way late materialization OR final probe before Sort: initialize late-m state
+  // This block runs when:
+  // - isNWayLateMOutput_: intermediate probe that feeds another HashBuild
+  // - isFinalProbeBeforeSort_: final probe before Sort materialization point
+  // AND there are columns to track (either probe-side or build-side)
+  if ((isNWayLateMOutput_ || isFinalProbeBeforeSort_) && 
+      (!projectedInputColumns_.empty() || !tableOutputProjections_.empty())) {
+    
     auto* driverCtx = operatorCtx_->driverCtx();
-    driverCtx->buildSideLateMUpstreamProbePayloads[driverId_] = probePayloadContainer_;
+    
+    // Initialize ProbePayloadContainer only if there are probe columns in output
+    if (!projectedInputColumns_.empty()) {
+      probePayloadContainer_ = std::make_shared<ProbePayloadContainer>(pool());
+      probePayloadContainer_->setId(driverId_);
+
+      // Initialize allContainers_ with self for single-container mode (intra-pipeline fast path)
+      std::unordered_map<uint8_t, ProbePayloadContainer*> selfContainer;
+      selfContainer[driverId_] = probePayloadContainer_.get();
+      probePayloadContainer_->setAllContainers(selfContainer);
+
+      // Register container in DriverCtx for downstream HashBuild access
+      // This enables cross-driver extraction after table merge
+      driverCtx->buildSideLateMUpstreamProbePayloads[driverId_] = probePayloadContainer_;
+    }
 
     // Precompute which output channels are keys for downstream HashBuild or Sort
     auto keyMapIt = driverCtx->downstreamBuildKeyChannels.find(planNodeId());
@@ -323,37 +340,48 @@ void HashProbe::initialize() {
     // If empty, all columns will be materialized (conservative fallback)
 
     // Precompute probe-side key vs payload (non-key) projections
-    for (const auto& projection : projectedInputColumns_) {
-      if (downstreamKeyOutputChannels_.empty() ||
-          downstreamKeyOutputChannels_.count(projection.outputChannel) > 0) {
-        probeKeyProjections_.push_back(projection);
-      } else {
-        // Non-key columns: only stored in ProbePayloadContainer
-        probePayloadProjections_.push_back(projection);
+    if (!projectedInputColumns_.empty()) {
+      for (const auto& projection : projectedInputColumns_) {
+        if (downstreamKeyOutputChannels_.empty() ||
+            downstreamKeyOutputChannels_.count(projection.outputChannel) > 0) {
+          probeKeyProjections_.push_back(projection);
+        } else {
+          // Non-key columns: only stored in ProbePayloadContainer
+          probePayloadProjections_.push_back(projection);
+        }
       }
     }
 
     // Precompute build-side key projections and channel mapping
+    LOG(INFO) << "HashProbe " << planNodeId() << " isNWayLateMOutput_=" << isNWayLateMOutput_
+              << " isFinalProbeBeforeSort_=" << isFinalProbeBeforeSort_ << ": "
+              << "downstreamKeyOutputChannels_.size()=" << downstreamKeyOutputChannels_.size()
+              << ", tableOutputProjections_.size()=" << tableOutputProjections_.size();
     for (const auto& projection : tableOutputProjections_) {
-      if (downstreamKeyOutputChannels_.empty() ||
-          downstreamKeyOutputChannels_.count(projection.outputChannel) > 0) {
+      bool isKey = downstreamKeyOutputChannels_.empty() ||
+          downstreamKeyOutputChannels_.count(projection.outputChannel) > 0;
+      LOG(INFO) << "  tableOutputProjection input=" << projection.inputChannel
+                << " output=" << projection.outputChannel << " isKey=" << isKey;
+      if (isKey) {
         buildKeyProjections_.push_back(projection);
         buildKeyChannelMapping_.emplace_back(
             projection.inputChannel, projection.outputChannel);
       }
     }
 
-    // Now compute payload schema for ProbePayloadContainer (non-key probe columns only)
-    std::vector<std::string> payloadNames;
-    std::vector<TypePtr> payloadTypes;
-    payloadNames.reserve(probePayloadProjections_.size());
-    payloadTypes.reserve(probePayloadProjections_.size());
+    // Compute payload schema for ProbePayloadContainer (non-key probe columns only)
+    if (!projectedInputColumns_.empty()) {
+      std::vector<std::string> payloadNames;
+      std::vector<TypePtr> payloadTypes;
+      payloadNames.reserve(probePayloadProjections_.size());
+      payloadTypes.reserve(probePayloadProjections_.size());
 
-    for (const auto& projection : probePayloadProjections_) {
-      payloadNames.push_back(probeType_->nameOf(projection.inputChannel));
-      payloadTypes.push_back(probeType_->childAt(projection.inputChannel));
+      for (const auto& projection : probePayloadProjections_) {
+        payloadNames.push_back(probeType_->nameOf(projection.inputChannel));
+        payloadTypes.push_back(probeType_->childAt(projection.inputChannel));
+      }
+      probePayloadType_ = ROW(std::move(payloadNames), std::move(payloadTypes));
     }
-    probePayloadType_ = ROW(std::move(payloadNames), std::move(payloadTypes));
     // Note: columnSourceMap is updated in updateColumnSourceMapForOutput() when table_ is available
   }
 }
@@ -1007,6 +1035,17 @@ void HashProbe::fillOutput(vector_size_t size) {
   // N-way late materialization paths - flags precomputed in asyncWaitForHashTable()
   if (useLateMOutputPath_) {
     // Intermediate probe: pass rowIds downstream instead of materializing
+    LOG(INFO) << "HashProbe " << planNodeId() << " fillOutput: useLateMOutputPath_=true"
+              << ", size=" << size;
+    fillOutputLateMaterialization(size);
+    return;
+  }
+
+  if (isFinalProbeBeforeSort_) {
+    // Final probe before Sort: use late-m style output (pass rowIds to Sort)
+    // but normal probe filtering has already selected matching rows
+    LOG(INFO) << "HashProbe " << planNodeId() << " fillOutput: isFinalProbeBeforeSort_=true"
+              << ", size=" << size;
     fillOutputLateMaterialization(size);
     return;
   }

@@ -138,6 +138,10 @@ class TpchQueryBuilder {
   TpchPlan getQ28Plan() const;  // 2-way: different join keys vs sort key
   TpchPlan getQ29Plan() const;  // Ideal late-m: sort key = join key, large payloads
   TpchPlan getQ30Plan() const;  // N-way join WITHOUT Sort (for testing N-way late-m correctness)
+  // Custom join benchmark queries using R, S, T tables
+  TpchPlan getQ31Plan() const;  // S JOIN R -> Sort (2-way, 16 output cols)
+  TpchPlan getQ32Plan() const;  // T JOIN (S JOIN R) -> Sort (3-way N-way, 16 output cols)
+  TpchPlan getQ33Plan() const;  // T JOIN (S JOIN R) (3-way N-way without Sort, 16 output cols)
 
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {
@@ -172,6 +176,10 @@ class TpchQueryBuilder {
   static constexpr const char* kPart = "part";
   static constexpr const char* kSupplier = "supplier";
   static constexpr const char* kPartsupp = "partsupp";
+  // Custom join benchmark tables
+  static constexpr const char* kTableR = "R";
+  static constexpr const char* kTableS = "S";
+  static constexpr const char* kTableT = "T";
   std::shared_ptr<memory::MemoryPool> pool_ =
       memory::memoryManager()->addLeafPool();
   const bool filtersAsNode_;

@@ -217,6 +217,12 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ29Plan();
     case 30:
       return getQ30Plan();
+    case 31:
+      return getQ31Plan();
+    case 32:
+      return getQ32Plan();
+    case 33:
+      return getQ33Plan();
     default:
       BOLT_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -3292,6 +3298,371 @@ TpchPlan TpchQueryBuilder::getQ30Plan() const {
   return context;
 }
 
+// Q31: Single join S x R with Sort (for late-m testing with custom tables)
+// Uses join_benchmark_v2 data: R (100M rows, 17 cols) and S (200M rows, 5 cols)
+// Pattern: S (probe) JOIN R (build) -> Sort by (row_id, l_suppkey, l_returnflag, l_linestatus)
+// Output: 16 columns from R (4 keys + 12 payloads, excluding l_comment)
+TpchPlan TpchQueryBuilder::getQ31Plan() const {
+  // Build-side columns (R) - 4 join keys + 12 payload columns (16 total)
+  std::vector<std::string> rColumns = {
+      "row_id",           // join key + sort key
+      "l_suppkey",        // join key + sort key
+      "l_returnflag",     // join key
+      "l_linestatus",     // join key
+      "l_orderkey",       // payload
+      "l_partkey",        // payload
+      "l_linenumber",     // payload
+      "l_quantity",       // payload
+      "l_extendedprice",  // payload
+      "l_discount",       // payload
+      "l_tax",            // payload
+      "l_shipdate",       // payload
+      "l_commitdate",     // payload
+      "l_receiptdate",    // payload
+      "l_shipinstruct",   // payload (VARCHAR)
+      "l_shipmode"        // payload (VARCHAR)
+      // l_comment excluded to get 16 columns
+  };
+
+  // Probe-side columns (S) - only join keys (will be renamed to avoid conflicts)
+  std::vector<std::string> sColumns = {
+      "row_id",           // join key
+      "l_suppkey",        // join key
+      "l_returnflag",     // join key
+      "l_linestatus"      // join key
+  };
+
+  auto rSelectedRowType = getRowType(kTableR, rColumns);
+  const auto& rFileColumns = getFileColumnNames(kTableR);
+  auto sSelectedRowType = getRowType(kTableS, sColumns);
+  const auto& sFileColumns = getFileColumnNames(kTableS);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId rPlanNodeId;
+  core::PlanNodeId sPlanNodeId;
+
+  // Build side: R (has the payloads)
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, rSelectedRowType, rFileColumns)
+               .captureScanNodeId(rPlanNodeId)
+               .planNode();
+
+  // HashJoin: S (probe) x R (build) on 4 join keys
+  // Rename S columns to avoid duplicate names with R
+  // Sort by (row_id, l_suppkey) - 2 sort keys
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kTableS, sSelectedRowType, sFileColumns)
+          .captureScanNodeId(sPlanNodeId)
+          .project({"row_id AS s_row_id",
+                    "l_suppkey AS s_suppkey",
+                    "l_returnflag AS s_returnflag",
+                    "l_linestatus AS s_linestatus"})
+          .hashJoin(
+              {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},  // probe keys (4)
+              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},     // build keys (4)
+              r,
+              "",                          // no filter
+              {"row_id",                   // build-side (sort key 1)
+               "l_suppkey",                // build-side (sort key 2)
+               "l_returnflag",             // (sort key 3)
+               "l_linestatus",             // (sort key 4)
+               "l_orderkey",               // payload
+               "l_partkey",                // payload
+               "l_linenumber",             // payload
+               "l_quantity",               // payload
+               "l_extendedprice",          // payload
+               "l_discount",               // payload
+               "l_tax",                    // payload
+               "l_shipdate",               // payload
+               "l_commitdate",             // payload
+               "l_receiptdate",            // payload
+               "l_shipinstruct",           // payload
+               "l_shipmode"})              // payload (16 columns total)
+          .orderBy({"row_id", "l_suppkey", "l_returnflag", "l_linestatus"}, false)  // Sort by 4 keys
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q31";
+  context.plan = std::move(plan);
+  context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
+  context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q32: N-way join with custom R, S, T tables following Q27 pattern
+// Pattern: T (probe₂) × (S × R) (build₂) → Sort
+// Uses 4 join keys for both joins, 16 output columns total
+//
+// Data characteristics:
+// - R: 100M rows, 17 columns (4 join keys + 13 payloads)
+// - S: 200M rows, 5 columns (4 join keys + 1 payload)
+// - T: 200M rows, 9 columns (4 join keys + 5 payloads)
+// - S×R produces ~50M rows
+// - T×(S×R) produces ~25M rows (matching T rows)
+//
+// Output: 16 columns (4 R keys + 8 R payloads + 4 T payloads)
+TpchPlan TpchQueryBuilder::getQ32Plan() const {
+  // R columns (build₁) - 4 keys + payloads
+  std::vector<std::string> rColumns = {
+      "row_id",           // join key + sort key
+      "l_suppkey",        // join key + sort key
+      "l_returnflag",     // join key
+      "l_linestatus",     // join key
+      "l_orderkey",       // payload
+      "l_partkey",        // payload
+      "l_linenumber",     // payload
+      "l_quantity",       // payload
+      "l_extendedprice",  // payload
+      "l_discount",       // payload
+      "l_tax",            // payload
+      "l_shipdate"        // payload
+      // Only 8 payloads to leave room for T payloads
+  };
+
+  // S columns (probe₁) - only join keys, will be renamed
+  std::vector<std::string> sColumns = {
+      "row_id",           // join key
+      "l_suppkey",        // join key
+      "l_returnflag",     // join key
+      "l_linestatus"      // join key
+  };
+
+  // T columns (probe₂) - 4 join keys + 4 payloads (for 16 total output)
+  std::vector<std::string> tColumns = {
+      "t_row_id",         // join key (matches row_id from S×R)
+      "t_suppkey",        // join key (matches l_suppkey from S×R)
+      "t_returnflag",     // join key (matches l_returnflag from S×R)
+      "t_linestatus",     // join key (matches l_linestatus from S×R)
+      "t_payload1",       // payload
+      "t_payload2",       // payload
+      "t_payload3",       // payload
+      "t_payload4"        // payload (VARCHAR)
+  };
+
+  auto rSelectedRowType = getRowType(kTableR, rColumns);
+  const auto& rFileColumns = getFileColumnNames(kTableR);
+  auto sSelectedRowType = getRowType(kTableS, sColumns);
+  const auto& sFileColumns = getFileColumnNames(kTableS);
+  auto tSelectedRowType = getRowType(kTableT, tColumns);
+  const auto& tFileColumns = getFileColumnNames(kTableT);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId rPlanNodeId;
+  core::PlanNodeId sPlanNodeId;
+  core::PlanNodeId tPlanNodeId;
+
+  // Build side for first join: R (has payloads)
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, rSelectedRowType, rFileColumns)
+               .captureScanNodeId(rPlanNodeId)
+               .planNode();
+
+  // First join: S (probe₁) × R (build₁) on 4 keys
+  // Rename S columns to avoid conflicts, output becomes build₂
+  auto sJoinR =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kTableS, sSelectedRowType, sFileColumns)
+          .captureScanNodeId(sPlanNodeId)
+          // Rename S columns to avoid duplicate names
+          .project({"row_id AS s_row_id",
+                    "l_suppkey AS s_suppkey",
+                    "l_returnflag AS s_returnflag",
+                    "l_linestatus AS s_linestatus"})
+          .hashJoin(
+              {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},  // 4 probe keys
+              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},    // 4 build keys
+              r,
+              "",
+              {"row_id",           // from R (sort key 1 & join key for T)
+               "l_suppkey",        // from R (sort key 2 & join key for T)
+               "l_returnflag",     // from R (join key for T)
+               "l_linestatus",     // from R (join key for T)
+               "l_orderkey",       // from R (payload)
+               "l_partkey",        // from R (payload)
+               "l_linenumber",     // from R (payload)
+               "l_quantity",       // from R (payload)
+               "l_extendedprice",  // from R (payload)
+               "l_discount",       // from R (payload)
+               "l_tax",            // from R (payload)
+               "l_shipdate"})      // from R (payload) - 12 columns from R
+          .planNode();
+
+  // Second join: T (probe₂) × sJoinR (build₂) on 4 keys
+  // Then sort by (row_id, l_suppkey) - 2 sort keys
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kTableT, tSelectedRowType, tFileColumns)
+          .captureScanNodeId(tPlanNodeId)
+          .hashJoin(
+              {"t_row_id", "t_suppkey", "t_returnflag", "t_linestatus"},  // 4 probe keys from T
+              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},    // 4 build keys from S×R
+              sJoinR,              // <-- First join result as BUILD side (N-way pattern!)
+              "",
+              {"row_id",           // from R (via S×R) - sort key 1
+               "l_suppkey",        // from R - sort key 2
+               "l_returnflag",     // from R
+               "l_linestatus",     // from R
+               "l_orderkey",       // from R (payload)
+               "l_partkey",        // from R (payload)
+               "l_linenumber",     // from R (payload)
+               "l_quantity",       // from R (payload)
+               "l_extendedprice",  // from R (payload)
+               "l_discount",       // from R (payload)
+               "l_tax",            // from R (payload)
+               "l_shipdate",       // from R (payload)
+               "t_payload1",       // from T (payload)
+               "t_payload2",       // from T (payload)
+               "t_payload3",       // from T (payload)
+               "t_payload4"})      // from T (payload) - 16 columns total
+          .orderBy({"row_id", "l_suppkey", "l_returnflag", "l_linestatus"}, false)  // Sort by 4 keys
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q32";
+  context.plan = std::move(plan);
+  context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
+  context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
+  context.dataFiles[tPlanNodeId] = getTableFilePaths(kTableT);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q33: N-way join WITHOUT Sort (for testing N-way join without late-m sort)
+// Pattern: T (probe₂) × (S × R) (build₂) - no Sort
+// Same as Q32 but without the final Sort operation
+// Uses 4 join keys for both joins, 16 output columns total
+TpchPlan TpchQueryBuilder::getQ33Plan() const {
+  // R columns (build₁) - 4 keys + payloads
+  std::vector<std::string> rColumns = {
+      "row_id",           // join key
+      "l_suppkey",        // join key
+      "l_returnflag",     // join key
+      "l_linestatus",     // join key
+      "l_orderkey",       // payload
+      "l_partkey",        // payload
+      "l_linenumber",     // payload
+      "l_quantity",       // payload
+      "l_extendedprice",  // payload
+      "l_discount",       // payload
+      "l_tax",            // payload
+      "l_shipdate"        // payload
+  };
+
+  // S columns (probe₁) - only join keys, will be renamed
+  std::vector<std::string> sColumns = {
+      "row_id",           // join key
+      "l_suppkey",        // join key
+      "l_returnflag",     // join key
+      "l_linestatus"      // join key
+  };
+
+  // T columns (probe₂) - 4 join keys + 4 payloads (for 16 total output)
+  std::vector<std::string> tColumns = {
+      "t_row_id",         // join key
+      "t_suppkey",        // join key
+      "t_returnflag",     // join key
+      "t_linestatus",     // join key
+      "t_payload1",       // payload
+      "t_payload2",       // payload
+      "t_payload3",       // payload
+      "t_payload4"        // payload
+  };
+
+  auto rSelectedRowType = getRowType(kTableR, rColumns);
+  const auto& rFileColumns = getFileColumnNames(kTableR);
+  auto sSelectedRowType = getRowType(kTableS, sColumns);
+  const auto& sFileColumns = getFileColumnNames(kTableS);
+  auto tSelectedRowType = getRowType(kTableT, tColumns);
+  const auto& tFileColumns = getFileColumnNames(kTableT);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId rPlanNodeId;
+  core::PlanNodeId sPlanNodeId;
+  core::PlanNodeId tPlanNodeId;
+
+  // Build side for first join: R (has payloads)
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, rSelectedRowType, rFileColumns)
+               .captureScanNodeId(rPlanNodeId)
+               .planNode();
+
+  // First join: S (probe₁) × R (build₁) on 4 keys
+  auto sJoinR =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kTableS, sSelectedRowType, sFileColumns)
+          .captureScanNodeId(sPlanNodeId)
+          .project({"row_id AS s_row_id",
+                    "l_suppkey AS s_suppkey",
+                    "l_returnflag AS s_returnflag",
+                    "l_linestatus AS s_linestatus"})
+          .hashJoin(
+              {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},  // 4 probe keys
+              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},    // 4 build keys
+              r,
+              "",
+              {"row_id",           // from R (join key for T)
+               "l_suppkey",        // from R (join key for T)
+               "l_returnflag",     // from R (join key for T)
+               "l_linestatus",     // from R (join key for T)
+               "l_orderkey",       // from R (payload)
+               "l_partkey",        // from R (payload)
+               "l_linenumber",     // from R (payload)
+               "l_quantity",       // from R (payload)
+               "l_extendedprice",  // from R (payload)
+               "l_discount",       // from R (payload)
+               "l_tax",            // from R (payload)
+               "l_shipdate"})      // from R (payload)
+          .planNode();
+
+  // Second join: T (probe₂) × sJoinR (build₂) on 4 keys
+  // NO Sort - results directly from join
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kTableT, tSelectedRowType, tFileColumns)
+          .captureScanNodeId(tPlanNodeId)
+          .hashJoin(
+              {"t_row_id", "t_suppkey", "t_returnflag", "t_linestatus"},  // 4 probe keys from T
+              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},    // 4 build keys from S×R
+              sJoinR,
+              "",
+              {"row_id",           // from R
+               "l_suppkey",        // from R
+               "l_returnflag",     // from R
+               "l_linestatus",     // from R
+               "l_orderkey",       // from R (payload)
+               "l_partkey",        // from R (payload)
+               "l_linenumber",     // from R (payload)
+               "l_quantity",       // from R (payload)
+               "l_extendedprice",  // from R (payload)
+               "l_discount",       // from R (payload)
+               "l_tax",            // from R (payload)
+               "l_shipdate",       // from R (payload)
+               "t_payload1",       // from T (payload)
+               "t_payload2",       // from T (payload)
+               "t_payload3",       // from T (payload)
+               "t_payload4"})      // from T (payload) - 16 columns total
+          .planNode();                     // NO Sort!
+
+  TpchPlan context;
+  context.planName = "q33";
+  context.plan = std::move(plan);
+  context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
+  context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
+  context.dataFiles[tPlanNodeId] = getTableFilePaths(kTableT);
+  context.dataFileFormat = format_;
+  return context;
+}
+
 const std::vector<std::string> TpchQueryBuilder::kTableNames_ = {
     kLineitem,
     kOrders,
@@ -3300,7 +3671,10 @@ const std::vector<std::string> TpchQueryBuilder::kTableNames_ = {
     kRegion,
     kPart,
     kSupplier,
-    kPartsupp};
+    kPartsupp,
+    kTableR,
+    kTableS,
+    kTableT};
 
 const std::unordered_map<std::string, std::vector<std::string>>
     TpchQueryBuilder::kTables_ = {
@@ -3327,6 +3701,23 @@ const std::unordered_map<std::string, std::vector<std::string>>
             tpch::getTableSchema(tpch::Table::TBL_SUPPLIER, true)->names()),
         std::make_pair(
             "partsupp",
-            tpch::getTableSchema(tpch::Table::TBL_PARTSUPP, true)->names())};
+            tpch::getTableSchema(tpch::Table::TBL_PARTSUPP, true)->names()),
+        // Custom join benchmark tables R and S
+        std::make_pair(
+            "R",
+            std::vector<std::string>{
+                "row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+                "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+                "l_extendedprice", "l_discount", "l_tax", "l_shipdate",
+                "l_commitdate", "l_receiptdate", "l_shipinstruct", "l_shipmode", "l_comment"}),
+        std::make_pair(
+            "S",
+            std::vector<std::string>{
+                "row_id", "l_suppkey", "l_returnflag", "l_linestatus", "s_orderkey"}),
+        std::make_pair(
+            "T",
+            std::vector<std::string>{
+                "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
+                "t_payload1", "t_payload2", "t_payload3", "t_payload4", "t_payload5"})};  // 4 join keys + 5 payloads
 
 } // namespace bytedance::bolt::exec::test

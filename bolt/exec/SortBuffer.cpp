@@ -161,8 +161,10 @@ SortBuffer::SortBuffer(
     primaryUpstreamHashTable_ = driverCtx_->primaryUpstreamHashTable;
     upstreamProbePayloads_ = driverCtx_->buildSideLateMUpstreamProbePayloads;
     columnSourceMap_ = driverCtx_->columnSourceMap;
-    LOG(INFO) << "SortBuffer: late materialization enabled, columnSourceMap size: " 
-              << columnSourceMap_.size();
+    LOG(INFO) << "SortBuffer: late materialization init: columnSourceMap size=" 
+              << columnSourceMap_.size()
+              << ", upstreamProbePayloads_.size()=" << upstreamProbePayloads_.size()
+              << ", hasHashTable=" << (primaryUpstreamHashTable_ != nullptr);
   }
 }
 
@@ -182,6 +184,11 @@ void SortBuffer::addInput(const VectorPtr& input) {
   if (lateMaterializationEnabled_ && driverCtx_) {
     const auto& buildRowPtrs = driverCtx_->buildSideLateMBuildRowPtrs;
     const auto& probeRowIds = driverCtx_->buildSideLateMProbeRowIds;
+    
+    LOG(INFO) << "SortBuffer::addInput late-m: buildRowPtrs.size()=" << buildRowPtrs.size()
+              << ", probeRowIds.size()=" << probeRowIds.size()
+              << ", driverCtx columnSourceMap.size()=" << driverCtx_->columnSourceMap.size()
+              << ", driverCtx probePayloads.size()=" << driverCtx_->buildSideLateMUpstreamProbePayloads.size();
     
     // Append row references for this batch
     lateMBuildRowPtrs_.insert(
