@@ -102,12 +102,6 @@ DEFINE_bool(
     false,
     "Enable late materialization optimization for HashJoin->Sort pattern");
 
-DEFINE_bool(
-    hybrid_join_extraction_optimized,
-    true,
-    "Enable extraction optimizations for hybrid join (coalesceBatches, sortByContainerId, prefetch). "
-    "Disable for benchmarking baseline performance.");
-
 DEFINE_int32(
     max_output_batch_rows,
     10000,
@@ -284,10 +278,6 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       if (FLAGS_late_materialization_enabled) {
         params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
             "true";
-      }
-      if (!FLAGS_hybrid_join_extraction_optimized) {
-        params.queryConfigs
-            [core::QueryConfig::kHybridJoinExtractionOptimized] = "false";
       }
       if (FLAGS_max_output_batch_rows != 10000) {
         params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =

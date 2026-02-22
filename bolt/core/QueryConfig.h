@@ -588,13 +588,11 @@ class QueryConfig {
 
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
-  /// If true (default), enable extraction optimizations for hybrid join:
-  /// - Sort rows by containerId before extraction (better cache locality)
-  /// - Coalesce payload batches into single batch (contiguous memory access)
-  /// - Use prefetch in extraction loops
-  /// When false, use simple extraction path for benchmarking baseline.
-  static constexpr const char* kHybridJoinExtractionOptimized =
-      "hybrid_join_extraction_optimized";
+  /// If true, enable pointer reuse optimization for N-way late materialization.
+  /// In pointer reuse mode, downstream joins reuse row pointers from upstream
+  /// joins instead of copying keys, reducing memory usage for multi-way joins.
+  static constexpr const char* kHybridJoinPointerReuseEnabled =
+      "hybrid_join_pointer_reuse_enabled";
 
   /// If true, enable late materialization optimization for HashJoin->Sort
   /// pattern when they share the same keys. This avoids redundant layout
@@ -1027,11 +1025,11 @@ class QueryConfig {
     return get<bool>(kHybridSortEnabled, false);
   }
 
-  /// Returns whether extraction optimizations are enabled for hybrid join.
-  /// When true (default): sortByContainerId, coalesceBatches, prefetch enabled.
-  /// When false: use simple extraction path for benchmarking baseline.
-  bool hybridJoinExtractionOptimized() const {
-    return get<bool>(kHybridJoinExtractionOptimized, true);
+  /// Returns whether pointer reuse optimization is enabled for N-way late-m.
+  /// When enabled, downstream joins reuse row pointers from upstream joins
+  /// instead of copying keys, reducing memory usage for multi-way joins.
+  bool hybridJoinPointerReuseEnabled() const {
+    return get<bool>(kHybridJoinPointerReuseEnabled, false);
   }
 
   /// Returns whether late materialization optimization is enabled.
