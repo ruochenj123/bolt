@@ -102,6 +102,11 @@ DEFINE_bool(
     false,
     "Enable late materialization optimization for HashJoin->Sort pattern");
 
+DEFINE_bool(
+    hybrid_join_pointer_reuse_enabled,
+    false,
+    "Enable pointer reuse optimization for N-way late materialization");
+
 DEFINE_int32(
     max_output_batch_rows,
     10000,
@@ -277,6 +282,10 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       }
       if (FLAGS_late_materialization_enabled) {
         params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
+            "true";
+      }
+      if (FLAGS_hybrid_join_pointer_reuse_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] =
             "true";
       }
       if (FLAGS_max_output_batch_rows != 10000) {

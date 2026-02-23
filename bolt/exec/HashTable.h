@@ -302,6 +302,14 @@ class BaseHashTable {
       bool dropDuplicates = false,
       int8_t spillInputStartPartitionBit = kNoSpillInputStartPartitionBit) = 0;
 
+  /// Builds the hash table from external row pointers (pointer reuse mode).
+  /// Used for N-way joins where keys already exist in upstream containers.
+  /// @param rowPtrs External row pointers to use directly (ownership transferred)
+  /// @param keySource RowContainer that rowPtrs point into (used for hash/compare)
+  virtual void buildFromExternalPointers(
+      std::vector<char*> rowPtrs,
+      RowContainer* keySource) = 0;
+
   /// The hash table used for join build in left semi and anti join does not
   /// retain duplicate join keys by default. This is achieved by constructing
   /// the hash table in the addInput phase to eliminate duplicate join keys.
@@ -723,6 +731,25 @@ class HashTable : public BaseHashTable {
       bool dropDuplicates = false,
       int8_t spillInputStartPartitionBit =
           kNoSpillInputStartPartitionBit) override;
+
+  /// Build hash table from external row pointers.
+  /// External rows must have compatible schema (same key columns at same offsets).
+  /// This is used for pointer reuse in N-way late materialization.
+  /// @param rowPtrs Pointers to rows in an external RowContainer
+  /// @param keySource The RowContainer where rowPtrs point into (for hash/compare)
+  void buildFromExternalPointers(
+      std::vector<char*> rowPtrs,
+      RowContainer* keySource) override;
+
+  /// Check if hash table is in external row mode.
+  bool isExternalRowMode() const {
+    return externalRowMode_;
+  }
+
+  /// Get external row pointers (only valid when isExternalRowMode() is true).
+  const std::vector<char*>& getExternalRowPtrs() const {
+    return externalRowPtrs_;
+  }
 
   uint64_t hashTableSizeIncrease(int32_t numNewDistinct) const override {
     if (numDistinct_ + numNewDistinct > rehashSize()) {
@@ -1159,6 +1186,12 @@ class HashTable : public BaseHashTable {
 
   // If true, avoids using VectorHasher value ranges with kArray hash mode.
   bool disableRangeArrayHash_{false};
+
+  // External row mode: hash table built from external row pointers
+  // instead of rows in rows_ RowContainer.
+  bool externalRowMode_{false};
+  std::vector<char*> externalRowPtrs_;
+  RowContainer* externalKeySource_{nullptr};
 
   friend class ProbeState;
   friend test::HashTableTestHelper<ignoreNullKeys>;

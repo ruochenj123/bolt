@@ -32,6 +32,7 @@ DEFINE_int32(max_batch_rows, 10000, "Max output batch rows");
 DEFINE_bool(hybrid_join, true, "Enable hybrid join");
 DEFINE_bool(hybrid_sort, true, "Enable hybrid sort");
 DEFINE_bool(late_m, false, "Enable late materialization");
+DEFINE_bool(pointer_reuse, false, "Enable pointer reuse for N-way late-m");
 DEFINE_int32(query, 23, "Query to run (23, 24, 27, or 28)");
 
 using namespace bytedance::bolt;
@@ -95,6 +96,7 @@ void runQ23(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
   queryConfigs[core::QueryConfig::kHybridJoinEnabled] = hybridJoin ? "true" : "false";
   queryConfigs[core::QueryConfig::kHybridSortEnabled] = hybridSort ? "true" : "false";
   queryConfigs[core::QueryConfig::kLateMaterializationEnabled] = lateM ? "true" : "false";
+  queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] = FLAGS_pointer_reuse ? "true" : "false";
   queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] = std::to_string(preferredBatchRows);
   queryConfigs[core::QueryConfig::kMaxOutputBatchRows] = std::to_string(maxBatchRows);
 
@@ -166,6 +168,7 @@ void runQ24(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
   queryConfigs[core::QueryConfig::kHybridJoinEnabled] = hybridJoin ? "true" : "false";
   queryConfigs[core::QueryConfig::kHybridSortEnabled] = hybridSort ? "true" : "false";
   queryConfigs[core::QueryConfig::kLateMaterializationEnabled] = lateM ? "true" : "false";
+  queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] = FLAGS_pointer_reuse ? "true" : "false";
   queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] = std::to_string(preferredBatchRows);
   queryConfigs[core::QueryConfig::kMaxOutputBatchRows] = std::to_string(maxBatchRows);
 
@@ -269,6 +272,7 @@ void runQ27(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
   queryConfigs[core::QueryConfig::kHybridJoinEnabled] = hybridJoin ? "true" : "false";
   queryConfigs[core::QueryConfig::kHybridSortEnabled] = hybridSort ? "true" : "false";
   queryConfigs[core::QueryConfig::kLateMaterializationEnabled] = lateM ? "true" : "false";
+  queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] = FLAGS_pointer_reuse ? "true" : "false";
   queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] = std::to_string(preferredBatchRows);
   queryConfigs[core::QueryConfig::kMaxOutputBatchRows] = std::to_string(maxBatchRows);
 
@@ -355,6 +359,7 @@ void runQ28(double scaleFactor, int numDrivers, int preferredBatchRows, int maxB
   queryConfigs[core::QueryConfig::kHybridJoinEnabled] = hybridJoin ? "true" : "false";
   queryConfigs[core::QueryConfig::kHybridSortEnabled] = hybridSort ? "true" : "false";
   queryConfigs[core::QueryConfig::kLateMaterializationEnabled] = lateM ? "true" : "false";
+  queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] = FLAGS_pointer_reuse ? "true" : "false";
   queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] = std::to_string(preferredBatchRows);
   queryConfigs[core::QueryConfig::kMaxOutputBatchRows] = std::to_string(maxBatchRows);
 

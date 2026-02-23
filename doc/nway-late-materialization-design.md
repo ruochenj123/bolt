@@ -982,15 +982,441 @@ The following files were **removed** as part of the N-way late-m cleanup:
 
 ## Appendix: Benchmark Commands
 
-\`\`\`bash
+```bash
 # Run with late-m enabled (optimized)
-./bolt_tpch_benchmark --run_query_verbose=27 \\
-    --late_materialization_enabled=true \\
+./bolt_tpch_benchmark --run_query_verbose=27 \
+    --late_materialization_enabled=true \
     --data_path=/path/to/tpch_parquet/sf30_hive
 
 # Run with late-m disabled (baseline)
-./bolt_tpch_benchmark --run_query_verbose=29 \\
-    --late_materialization_enabled=false \\
-    --hybrid_join_enabled=true \\
+./bolt_tpch_benchmark --run_query_verbose=29 \
+    --late_materialization_enabled=false \
+    --hybrid_join_enabled=true \
     --data_path=/path/to/tpch_parquet/sf3_hive
-\`\`\`
+```
+
+---
+
+## Appendix: Pointer Reuse Implementation Plan
+
+### Motivation
+
+In N-way joins with the same join key (e.g., Q33: lineitem ⋈ partsupp ⋈ part on `partkey`), 
+intermediate joins currently copy key columns into their local `RowContainer`. This is wasteful 
+because the key data already exists in the base table's `HybridContainer`.
+
+**Goal**: Avoid key copy by building hash table directly from external row pointers.
+
+### Key Insight: Schema Compatibility
+
+External rows from upstream's `keys_` RowContainer have the **same schema** as local rows would:
+```
+Row layout: [key1 | key2 | ... | next_ptr | hybridRowId]
+```
+
+This means:
+- **Existing `hashRows()`** can hash external rows directly (same column offsets)
+- **Existing `compareKeys()`** can compare external rows directly
+- **No schema translation needed!**
+
+### Key Insight: Next Pointer for Distinct Keys
+
+For **distinct keys** (no duplicates in build side):
+- Each row has a unique key
+- `compareKeys()` never finds a match → `pushNext()` is never called
+- **Next pointers are not needed!**
+
+We can pass external row pointers directly to hash table build, and the existing 
+hash/compare logic works unchanged.
+
+### Assumption
+
+**Q33 has distinct join keys** - no duplicate `partkey` values in build side results.
+This simplifies the implementation. Duplicate key handling is left as future work.
+
+---
+
+## Phase 1: HashTable Infrastructure
+
+### Goal
+Enable HashTable to build from a list of external row pointers instead of iterating 
+its internal `rows_` RowContainer.
+
+### 1.1 Add External Row Mode
+
+Add new members to `HashTable`:
+
+```cpp
+// bolt/exec/HashTable.h
+private:
+  bool externalRowMode_ = false;
+  std::vector<char*> externalRowPtrs_;
+  RowContainer* externalKeySource_ = nullptr;  // For hash/compare operations
+```
+
+### 1.2 New API: Build from External Pointers
+
+```cpp
+// bolt/exec/HashTable.h
+/// Build hash table from external row pointers.
+/// External rows must have compatible schema (same key columns at same offsets).
+/// @param rowPtrs Pointers to rows in an external RowContainer
+/// @param keySource The RowContainer where rowPtrs point into (for hash/compare)
+void buildFromExternalPointers(
+    std::vector<char*> rowPtrs,
+    RowContainer* keySource);
+```
+
+### 1.3 Implementation
+
+```cpp
+// bolt/exec/HashTable.cpp
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::buildFromExternalPointers(
+    std::vector<char*> rowPtrs,
+    RowContainer* keySource) {
+  
+  externalRowMode_ = true;
+  externalRowPtrs_ = std::move(rowPtrs);
+  externalKeySource_ = keySource;
+  
+  // Set numDistinct for capacity calculation
+  numDistinct_ = externalRowPtrs_.size();
+  
+  // Determine hash mode and allocate table
+  decideHashMode(0);
+  
+  // Build hash table - reuse existing insertBatch logic
+  buildFromExternalPointersInternal();
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::buildFromExternalPointersInternal() {
+  constexpr int32_t kBatchSize = 1024;
+  raw_vector<uint64_t> hashes;
+  hashes.resize(kBatchSize);
+  
+  for (size_t i = 0; i < externalRowPtrs_.size(); i += kBatchSize) {
+    size_t batchEnd = std::min(i + kBatchSize, externalRowPtrs_.size());
+    size_t batchSize = batchEnd - i;
+    
+    // Hash the external rows
+    // Use externalKeySource_ for hash computation
+    hashExternalRows(
+        folly::Range<char**>(externalRowPtrs_.data() + i, batchSize),
+        hashes);
+    
+    // Insert into hash table
+    insertForJoin(externalRowPtrs_.data() + i, hashes.data(), batchSize, nullptr);
+  }
+}
+```
+
+### 1.4 Hash External Rows
+
+```cpp
+// Compute hashes for external rows using externalKeySource_
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::hashExternalRows(
+    folly::Range<char**> rows,
+    raw_vector<uint64_t>& hashes) {
+  
+  // Use externalKeySource_ instead of rows_ for hash computation
+  for (int32_t i = 0; i < hashers_.size(); ++i) {
+    if (hashMode_ == HashMode::kHash) {
+      externalKeySource_->hash(i, rows, i > 0, hashes.data());
+    } else {
+      auto column = externalKeySource_->columnAt(i);
+      hashers_[i]->computeValueIdsForRows(
+          rows.data(), rows.size(),
+          column.offset(), column.nullByte(),
+          ignoreNullKeys ? 0 : column.nullMask(),
+          hashes);
+    }
+  }
+}
+```
+
+### 1.5 Compare Keys for External Mode
+
+Modify `compareKeys()` to use correct RowContainer:
+
+```cpp
+template <bool ignoreNullKeys>
+bool HashTable<ignoreNullKeys>::compareKeys(
+    const char* group,
+    const char* inserted) {
+  
+  // Use externalKeySource_ if in external row mode
+  auto* keyContainer = externalRowMode_ ? externalKeySource_ : rows_.get();
+  
+  auto numKeys = hashers_.size();
+  int32_t i = 0;
+  do {
+    if (keyContainer->compare(group, inserted, i, CompareFlags{true, true})) {
+      return false;
+    }
+  } while (++i < numKeys);
+  return true;
+}
+```
+
+### 1.6 Probe-side Compare
+
+```cpp
+template <bool ignoreNullKeys>
+bool HashTable<ignoreNullKeys>::compareKeys(
+    const char* group,
+    HashLookup& lookup,
+    vector_size_t row) {
+  
+  // Use externalKeySource_ if in external row mode
+  auto* keyContainer = externalRowMode_ ? externalKeySource_ : rows_.get();
+  
+  int32_t numKeys = lookup.hashers.size();
+  int32_t i = 0;
+  do {
+    auto& hasher = lookup.hashers[i];
+    if (!keyContainer->equals<!ignoreNullKeys>(
+            group, keyContainer->columnAt(i), hasher->decodedVector(), row)) {
+      return false;
+    }
+  } while (++i < numKeys);
+  return true;
+}
+```
+
+### 1.7 Accessor Methods
+
+```cpp
+// bolt/exec/HashTable.h
+bool isExternalRowMode() const { return externalRowMode_; }
+const std::vector<char*>& getExternalRowPtrs() const { return externalRowPtrs_; }
+```
+
+---
+
+## Phase 2: HashBuild Integration
+
+### Goal
+Make HashBuild use external row pointers when pointer reuse is enabled.
+
+### 2.1 Configuration Flag
+
+Already exists:
+```cpp
+// bolt/core/QueryConfig.h
+static constexpr const char* kHybridJoinPointerReuseEnabled =
+    "hybrid_join_pointer_reuse_enabled";
+```
+
+### 2.2 Modify addInputLateMaterialization
+
+Skip local row allocation entirely - just collect external pointers:
+
+```cpp
+void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
+  auto* driverCtx = operatorCtx_->driverCtx();
+  
+  const bool pointerReuseEnabled = 
+      driverCtx->queryConfig().hybridJoinPointerReuseEnabled() &&
+      !driverCtx->buildSideLateMBuildRowPtrs.empty();
+  
+  if (pointerReuseEnabled) {
+    // Pointer reuse path: just collect external pointers, no local storage
+    // Accumulate in a member variable for later use in noMoreInputInternal
+    externalBuildRowPtrs_.insert(
+        externalBuildRowPtrs_.end(),
+        driverCtx->buildSideLateMBuildRowPtrs.begin(),
+        driverCtx->buildSideLateMBuildRowPtrs.end());
+    
+    // Also store probe row IDs for extraction
+    table_->hybridData()->appendUpstreamRefs(
+        driverCtx->buildSideLateMBuildRowPtrs,
+        driverCtx->buildSideLateMProbeRowIds);
+    
+    driverCtx->clearBatchState();
+    return;
+  }
+  
+  // Normal path: store keys locally (existing code)
+  // ...
+}
+```
+
+### 2.3 Modify noMoreInputInternal
+
+Use `buildFromExternalPointers()` when pointer reuse is enabled:
+
+```cpp
+void HashBuild::noMoreInputInternal() {
+  auto* driverCtx = operatorCtx_->driverCtx();
+  
+  const bool pointerReuseEnabled = 
+      driverCtx->queryConfig().hybridJoinPointerReuseEnabled() &&
+      !externalBuildRowPtrs_.empty();
+  
+  if (pointerReuseEnabled) {
+    // Get the key source (upstream's keys_ RowContainer)
+    auto* keySource = driverCtx->primaryUpstreamBuildContainer->getKeys();
+    
+    // Build hash table from external pointers
+    table_->buildFromExternalPointers(
+        std::move(externalBuildRowPtrs_),
+        keySource);
+    
+    // Update columnSourceMap for extraction
+    updateSourceMapForNWay();
+  } else {
+    // Normal path (existing code)
+    table_->prepareJoinTable(...);
+  }
+  
+  // ... rest of noMoreInputInternal
+}
+```
+
+### 2.4 New Member Variable
+
+```cpp
+// bolt/exec/HashBuild.h
+private:
+  // For pointer reuse mode: accumulated external row pointers
+  std::vector<char*> externalBuildRowPtrs_;
+```
+
+---
+
+## Phase 3: HashProbe Integration
+
+### Goal
+Ensure probe side works correctly with external row mode.
+
+### 3.1 No Changes Needed for Probe Logic
+
+The probe logic uses `compareKeys()` which we already modified to use 
+`externalKeySource_` when in external row mode.
+
+### 3.2 Extraction Uses columnSourceMap
+
+Extraction already uses `columnSourceMap` which points to upstream containers.
+No changes needed.
+
+---
+
+## Testing
+
+### Test Cases
+
+1. **Q33**: 3-way join with distinct keys
+2. **Q34**: Q33 + Sort for deterministic result verification
+
+### Commands
+
+```bash
+# Baseline (no late-m)
+./bolt_tpch_benchmark -run_query_verbose=34 \
+    --hybrid_join_enabled=true \
+    --data_path=/path/to/data
+
+# Late-m without pointer reuse
+./bolt_tpch_benchmark -run_query_verbose=34 \
+    --late_materialization_enabled=true \
+    --data_path=/path/to/data
+
+# Late-m with pointer reuse
+./bolt_tpch_benchmark -run_query_verbose=34 \
+    --late_materialization_enabled=true \
+    --nway_pointer_reuse_enabled=true \
+    --data_path=/path/to/data
+```
+
+### Verification
+
+Compare sorted output between all three modes - should be identical.
+
+---
+
+## Implementation Status
+
+### Completed (2026-02-22)
+
+**Phase 1: HashTable Infrastructure** ✅
+- Added `buildFromExternalPointers()` method to HashTable
+- Added `externalRowMode_`, `externalRowPtrs_`, `externalKeySource_` members
+- Modified `compareKeys()` and `hashRows()` to use `externalKeySource_` in external mode
+
+**Phase 2: HashBuild Integration** ✅  
+- Added `pointerReuseEnabled_`, `externalRowPtrs_`, `externalKeySource_` members to HashBuild
+- Modified `addInputLateMaterialization()` to collect external pointers instead of copying keys
+- Modified `finishHashBuild()` to call `buildFromExternalPointers()` when pointer reuse enabled
+
+**Phase 3: Extraction Support** ✅
+- Modified `extractColumnsFromUpstream()` to use `getEffectiveKeyContainer()` for key extraction
+- This allows extraction to work correctly when row pointers come from upstream container
+
+### Testing
+
+**Q23 (2-way join)** ✅ Works correctly
+```bash
+./bolt_hybrid_late_m_benchmark --late_m=true --pointer_reuse=true --query=23
+# Result: 600572 rows (matches baseline)
+```
+
+**Q27 (3-way join)** ❌ Fails - intermediate level payload extraction issue
+- Intermediate levels need `hybridRowId` for payload extraction
+- In pointer reuse mode, local rows don't exist, so `hybridRowId` is not available
+- See "Known Limitations" below
+
+### Known Limitations
+
+1. **Intermediate level payloads**: Pointer reuse works for final join level but not for 
+   intermediate levels that need to extract payload columns. This is because `getRowIds()` 
+   expects to read the `hybridRowId` from local rows, but in pointer reuse mode, the rows 
+   are external.
+
+2. **Duplicate keys**: Current implementation assumes distinct keys. See "Future Work" section.
+
+### Configuration
+
+Enable pointer reuse with the `hybrid_join_pointer_reuse_enabled` config:
+```cpp
+// In QueryConfig.h
+static constexpr const char* kHybridJoinPointerReuseEnabled =
+    "hybrid_join_pointer_reuse_enabled";
+```
+
+Command line flag: `--hybrid_join_pointer_reuse_enabled=true`
+
+---
+
+## Future Work
+
+### Handle Duplicate Keys
+
+Current implementation assumes distinct keys. For duplicate keys:
+- Same row pointer may appear multiple times
+- `compareKeys()` returns true → `pushNext()` is called
+- Setting `row->next = row` causes infinite loop!
+
+**Solution**: Use external next chain instead of in-row next pointer:
+```cpp
+std::vector<int32_t> externalNextChain_;  // index → next index (-1 = end)
+```
+
+### Fix Intermediate Level Payloads
+
+To support N-way joins (3+ joins) with pointer reuse, need to:
+1. Store `hybridRowId` separately for pointer reuse mode, OR
+2. Modify `getRowIds()` to traverse to the effective key container, OR  
+3. Update columnSourceMap to point directly to upstream container
+
+### Memory Tracking
+
+Account for shared data in memory usage reporting.
+
+### Spill Support
+
+Handle spilling when using external row pointers.
+
+

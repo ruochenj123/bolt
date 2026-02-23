@@ -694,7 +694,8 @@ void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
   const int32_t numRows = input->size();
   LOG(INFO) << "HashBuild " << planNodeId() << " addInputLateMaterialization: numRows=" << numRows
             << ", input->childrenSize()=" << input->childrenSize()
-            << ", keyChannels_.size()=" << keyChannels_.size();
+            << ", keyChannels_.size()=" << keyChannels_.size()
+            << ", pointerReuseEnabled_=" << pointerReuseEnabled_;
   for (size_t i = 0; i < keyChannels_.size(); ++i) {
     LOG(INFO) << "  keyChannels_[" << i << "]=" << keyChannels_[i];
   }
@@ -703,44 +704,75 @@ void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
     return;
   }
 
-  auto& hashers = table_->hashers();
-
-  // Resize activeRows for keys
-  activeRows_.resize(numRows);
-  activeRows_.setAll();
-
-  // Decode keys directly from input vector
-  // keyChannels_ maps to input column positions
-  for (size_t i = 0; i < hashers.size(); ++i) {
-    int32_t inputChannel = keyChannels_[i];
-    BOLT_CHECK(
-        inputChannel < input->childrenSize() && input->childAt(inputChannel),
-        "N-way late-m: key channel {} not found in input (has {} children)",
-        inputChannel, input->childrenSize());
-    auto key = input->childAt(inputChannel)->loadedVector();
-    hashers[i]->decode(*key, activeRows_);
+  // Initialize pointer reuse mode on first batch if config enabled
+  if (!pointerReuseEnabled_ && driverCtx->queryConfig().hybridJoinPointerReuseEnabled() 
+      && driverCtx->primaryUpstreamBuildContainer) {
+    pointerReuseEnabled_ = true;
+    externalKeySource_ = driverCtx->primaryUpstreamBuildContainer->getKeys();
+    LOG(INFO) << "HashBuild " << planNodeId() 
+              << " enabling pointer reuse mode, externalKeySource_=" << externalKeySource_;
   }
 
-  // Store keys in RowContainer with hybridRowId
-  auto rows = table_->rows();
-  auto nextOffset = rows->nextOffset();
-  auto baseRow = table_->hybridData()->getNumRows();
+  if (pointerReuseEnabled_) {
+    // Pointer reuse mode: collect external row pointers instead of copying keys
+    BOLT_CHECK(
+        !driverCtx->buildSideLateMBuildRowPtrs.empty(),
+        "Pointer reuse mode requires buildSideLateMBuildRowPtrs from upstream");
+    BOLT_CHECK_EQ(
+        driverCtx->buildSideLateMBuildRowPtrs.size(),
+        numRows,
+        "buildSideLateMBuildRowPtrs size mismatch");
 
-  for (int32_t rowIndex = 0; rowIndex < numRows; ++rowIndex) {
-    char* newRow = rows->newRow();
-    if (nextOffset) {
-      *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
+    // Collect external pointers
+    externalRowPtrs_.insert(
+        externalRowPtrs_.end(),
+        driverCtx->buildSideLateMBuildRowPtrs.begin(),
+        driverCtx->buildSideLateMBuildRowPtrs.end());
+
+    LOG(INFO) << "HashBuild " << planNodeId() 
+              << " pointer reuse: collected " << numRows << " external pointers"
+              << ", total=" << externalRowPtrs_.size();
+  } else {
+    // Standard mode: decode and store keys locally
+    auto& hashers = table_->hashers();
+
+    // Resize activeRows for keys
+    activeRows_.resize(numRows);
+    activeRows_.setAll();
+
+    // Decode keys directly from input vector
+    // keyChannels_ maps to input column positions
+    for (size_t i = 0; i < hashers.size(); ++i) {
+      int32_t inputChannel = keyChannels_[i];
+      BOLT_CHECK(
+          inputChannel < input->childrenSize() && input->childAt(inputChannel),
+          "N-way late-m: key channel {} not found in input (has {} children)",
+          inputChannel, input->childrenSize());
+      auto key = input->childAt(inputChannel)->loadedVector();
+      hashers[i]->decode(*key, activeRows_);
     }
 
-    // Store key columns
-    for (auto i = 0; i < hashers.size(); ++i) {
-      rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
-    }
+    // Store keys in RowContainer with hybridRowId
+    auto rows = table_->rows();
+    auto nextOffset = rows->nextOffset();
+    auto baseRow = table_->hybridData()->getNumRows();
 
-    // Store hybridRowId
-    uint64_t encodedId = (static_cast<uint64_t>(driverId_) << 56) |
-        (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
-    rows->storeSingleRowId(encodedId, newRow);
+    for (int32_t rowIndex = 0; rowIndex < numRows; ++rowIndex) {
+      char* newRow = rows->newRow();
+      if (nextOffset) {
+        *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
+      }
+
+      // Store key columns
+      for (auto i = 0; i < hashers.size(); ++i) {
+        rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
+      }
+
+      // Store hybridRowId
+      uint64_t encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+          (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+      rows->storeSingleRowId(encodedId, newRow);
+    }
   }
 
   // Store upstream refs for later extraction (used for payload columns)
@@ -1285,17 +1317,52 @@ bool HashBuild::finishHashBuild() {
   }
   recordSpillStats();
 
-  // TODO: re-enable parallel join build with spilling triggered after
-  // https://github.com/facebookincubator/velox/issues/3567 is fixed.
-  const bool allowParallelJoinBuild =
-      !otherTables.empty() && spillPartitions.empty();
-  table_->prepareJoinTable(
-      std::move(otherTables),
-      allowParallelJoinBuild ? operatorCtx_->task()->queryCtx()->executor()
-                             : nullptr,
-      dropDuplicates_,
-      isInputFromSpill() ? spillConfig()->startPartitionBit
-                         : BaseHashTable::kNoSpillInputStartPartitionBit);
+  // Check if we're in pointer reuse mode
+  bool pointerReuseMode = pointerReuseEnabled_;
+  if (pointerReuseMode) {
+    // Collect external pointers from all peer builds
+    std::vector<char*> allExternalPtrs = std::move(externalRowPtrs_);
+    RowContainer* keySource = externalKeySource_;
+    
+    for (auto* build : otherBuilds) {
+      std::lock_guard<std::mutex> l(build->intermediateStateMutex_);
+      if (build->pointerReuseEnabled_) {
+        allExternalPtrs.insert(
+            allExternalPtrs.end(),
+            build->externalRowPtrs_.begin(),
+            build->externalRowPtrs_.end());
+        // All drivers should have the same keySource (same upstream container)
+        BOLT_CHECK(
+            build->externalKeySource_ == keySource,
+            "Pointer reuse mode: keySource mismatch between drivers");
+      } else {
+        // Mixed mode not supported
+        BOLT_CHECK(
+            build->externalRowPtrs_.empty(),
+            "Pointer reuse mode: some drivers have external pointers, others don't");
+      }
+    }
+    
+    LOG(INFO) << "HashBuild " << planNodeId() << " buildFromExternalPointers: "
+              << "totalPtrs=" << allExternalPtrs.size()
+              << ", keySource=" << keySource;
+    
+    BOLT_CHECK_NOT_NULL(keySource, "Pointer reuse mode: keySource cannot be null");
+    table_->buildFromExternalPointers(std::move(allExternalPtrs), keySource);
+  } else {
+    // Standard mode: use prepareJoinTable
+    // TODO: re-enable parallel join build with spilling triggered after
+    // https://github.com/facebookincubator/velox/issues/3567 is fixed.
+    const bool allowParallelJoinBuild =
+        !otherTables.empty() && spillPartitions.empty();
+    table_->prepareJoinTable(
+        std::move(otherTables),
+        allowParallelJoinBuild ? operatorCtx_->task()->queryCtx()->executor()
+                               : nullptr,
+        dropDuplicates_,
+        isInputFromSpill() ? spillConfig()->startPartitionBit
+                           : BaseHashTable::kNoSpillInputStartPartitionBit);
+  }
   addRuntimeStats();
 
   // [Morsel-driven] early capture empty hashtable and stop build side

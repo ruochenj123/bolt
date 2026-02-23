@@ -478,6 +478,20 @@ class HashBuild final : public Operator {
   /// Updates the ColumnSourceMap for N-way path.
   /// Transforms inputChannel → storageChannel mapping for extracted keys.
   void updateSourceMapForNWay();
+
+  // === Pointer Reuse Mode (N-way optimization) ===
+  
+  /// When enabled, we reuse external row pointers from upstream instead of copying keys.
+  /// This avoids key duplication at intermediate join levels.
+  bool pointerReuseEnabled_{false};
+  
+  /// External row pointers collected from upstream (for pointer reuse mode).
+  /// These point directly into upstream keys_ RowContainer.
+  std::vector<char*> externalRowPtrs_;
+  
+  /// The upstream RowContainer that externalRowPtrs_ points into.
+  /// Used for hash/compare operations during hash table building.
+  RowContainer* externalKeySource_{nullptr};
 };
 
 inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {

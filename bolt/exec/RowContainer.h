@@ -4090,7 +4090,9 @@ inline void HybridContainer::extractColumnsFromUpstream(
         }
 
         // Extract keys using the correct level's row pointers
-        hybridContainer->getKeys()->extractColumn(
+        // Use getEffectiveKeyContainer() to handle pointer reuse mode where
+        // row pointers point to upstream container's rows (via keyDataSource_)
+        hybridContainer->getEffectiveKeyContainer()->getKeys()->extractColumn(
             levelBuildPtrs->data(),
             numRows,
             source.columnIndex,
@@ -4277,7 +4279,8 @@ inline void HybridContainer::extractColumnsFromUpstream(
         if (levelIt != hybridContainerToLevel.end()) {
           levelBuildPtrs = &levels[levelIt->second].buildRowPtrs;
         }
-        hybridContainer->getKeys()->extractColumn(
+        // Use getEffectiveKeyContainer() to handle pointer reuse mode
+        hybridContainer->getEffectiveKeyContainer()->getKeys()->extractColumn(
             levelBuildPtrs->data(),
             numRows,
             source.columnIndex,
