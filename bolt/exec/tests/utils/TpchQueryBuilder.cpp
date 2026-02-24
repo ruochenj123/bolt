@@ -225,6 +225,8 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ33Plan();
     case 34:
       return getQ34Plan();
+    case 35:
+      return getQ35Plan();
     default:
       BOLT_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -3785,6 +3787,116 @@ TpchPlan TpchQueryBuilder::getQ34Plan() const {
 
   TpchPlan context;
   context.planName = "q34";
+  context.plan = std::move(plan);
+  context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
+  context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
+  context.dataFiles[tPlanNodeId] = getTableFilePaths(kTableT);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q35: Minimal columns for pointer reuse testing
+// Pattern: T (probe₂) × (S × R) (build₂) -> Sort
+// Only join keys + 1 payload for verification
+// Q35: N-way join with DIFFERENT keys for J2 (to test pointer reuse is DISABLED)
+// Pattern: T (probe₂) × (S × R) (build₂) -> Sort
+// J1 uses R's key columns (row_id, l_suppkey, l_returnflag, l_linestatus)
+// J2 uses R's PAYLOAD column (l_orderkey) as key - NOT in J1's keys!
+// This should DISABLE pointer reuse since J2 build keys are NOT in R's keys
+TpchPlan TpchQueryBuilder::getQ35Plan() const {
+  // q35: Test case where J2 uses only 2 of J1's 4 keys  
+  // This tests that pointer reuse requires EXACT same keys
+  // J1: 4 keys (row_id, l_suppkey, l_returnflag, l_linestatus)
+  // J2: 2 keys (row_id, l_suppkey) - subset of J1's keys
+  // Expected: pointer reuse DISABLED (exact match required)
+
+  // R columns: 4 join keys + payload  
+  std::vector<std::string> rColumns = {
+      "row_id",           // join key for J1 AND J2
+      "l_suppkey",        // join key for J1 AND J2
+      "l_returnflag",     // join key for J1 only
+      "l_linestatus",     // join key for J1 only
+      "l_orderkey"        // payload
+  };
+
+  // S columns: 4 keys for J1
+  std::vector<std::string> sColumns = {
+      "row_id",           // join key
+      "l_suppkey",        // join key
+      "l_returnflag",     // join key
+      "l_linestatus"      // join key
+  };
+
+  // T columns: only 2 keys (subset of J1's 4 keys)
+  std::vector<std::string> tColumns = {
+      "t_row_id",         // join key for J2
+      "t_suppkey"         // join key for J2
+  };
+
+  auto rSelectedRowType = getRowType(kTableR, rColumns);
+  const auto& rFileColumns = getFileColumnNames(kTableR);
+  auto sSelectedRowType = getRowType(kTableS, sColumns);
+  const auto& sFileColumns = getFileColumnNames(kTableS);
+  auto tSelectedRowType = getRowType(kTableT, tColumns);
+  const auto& tFileColumns = getFileColumnNames(kTableT);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId rPlanNodeId;
+  core::PlanNodeId sPlanNodeId;
+  core::PlanNodeId tPlanNodeId;
+
+  // Build side for first join: R
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, rSelectedRowType, rFileColumns)
+               .captureScanNodeId(rPlanNodeId)
+               .planNode();
+
+  // First join: S (probe₁) × R (build₁) on 4 keys
+  auto sJoinR =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kTableS, sSelectedRowType, sFileColumns)
+          .captureScanNodeId(sPlanNodeId)
+          .project({"row_id AS s_row_id",
+                    "l_suppkey AS s_suppkey",
+                    "l_returnflag AS s_returnflag",
+                    "l_linestatus AS s_linestatus"})
+          .hashJoin(
+              {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},  // 4 probe keys  
+              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},    // 4 build keys (R's keys)
+              r,
+              "",
+              {"row_id",           // from R
+               "l_suppkey",        // from R  
+               "l_returnflag",     // from R
+               "l_linestatus",     // from R
+               "l_orderkey"})      // from R (payload)
+          .planNode();
+
+  // Second join: T (probe₂) × sJoinR (build₂)
+  // J2 keys: (row_id, l_suppkey) - only 2 of J1's 4 keys!
+  // This should DISABLE pointer reuse (requires exact same keys)
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kTableT, tSelectedRowType, tFileColumns)
+          .captureScanNodeId(tPlanNodeId)
+          .hashJoin(
+              {"t_row_id", "t_suppkey"},  // T's keys: 2 keys only
+              {"row_id", "l_suppkey"},    // Build keys: 2 keys (subset of J1's 4)
+              sJoinR,
+              "",
+              {"row_id",           // from R
+               "l_suppkey",        // from R
+               "l_returnflag",     // from R
+               "l_linestatus",     // from R
+               "l_orderkey"})      // from R
+          .orderBy({"row_id", "l_suppkey", "l_returnflag", "l_linestatus"}, false)
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q35";
   context.plan = std::move(plan);
   context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
   context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);

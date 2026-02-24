@@ -238,6 +238,15 @@ HashProbe::HashProbe(
       !driverCtx->materializationPlanNodeId.empty() &&
       driverCtx->materializationPlanNodeId == planNodeId() &&
       !driverCtx->sortMaterializationEnabled;
+  
+  LOG(INFO) << "HashProbe " << planNodeId() << " constructor:"
+            << " buildSideLateMEnabled=" << driverCtx->buildSideLateMEnabled
+            << ", materializationPlanNodeId=" << driverCtx->materializationPlanNodeId
+            << ", isNWayLateMOutput_=" << isNWayLateMOutput_
+            << ", isFinalProbeBeforeSort_=" << isFinalProbeBeforeSort_
+            << ", isFinalMaterializationProbe_=" << isFinalMaterializationProbe_
+            << ", hasDownstreamHashBuild=" << hasDownstreamHashBuild
+            << ", pointerReuseEligibleNodeIds.size()=" << driverCtx->pointerReuseEligibleNodeIds.size();
 }
 
 void HashProbe::initialize() {
@@ -570,6 +579,23 @@ void HashProbe::asyncWaitForHashTable() {
 
   useLateMOutputPath_ = isNWayLateMOutput_ && tableHasLateMMetadata;
   useFinalMaterializationPath_ = isFinalMaterializationProbe_ && tableHasLateMMetadata;
+
+  // Check if pointer reuse mode should be enabled for intermediate late-m output.
+  // This requires: config enabled, planner detected same keys, intermediate late-m mode,
+  // valid container, and a join type that doesn't need right-side iteration.
+  const bool joinTypeSupportsPointerReuse = !isRightJoin(joinType_) &&
+      !isFullJoin(joinType_) && !isRightSemiFilterJoin(joinType_) &&
+      !isRightSemiProjectJoin(joinType_);
+  pointerReuseEnabled_ = useLateMOutputPath_ &&
+      operatorCtx_->driverCtx()->queryConfig().hybridJoinPointerReuseEnabled() &&
+      (operatorCtx_->driverCtx()->pointerReuseEligibleNodeIds.count(planNodeId()) > 0) &&  // Planner detected same keys for THIS join
+      table_->hybridData() && joinTypeSupportsPointerReuse;
+  
+  LOG(ERROR) << "HashProbe " << planNodeId() << " setHashTable:"
+            << " useLateMOutputPath_=" << useLateMOutputPath_
+            << ", useFinalMaterializationPath_=" << useFinalMaterializationPath_
+            << ", pointerReuseEnabled_=" << pointerReuseEnabled_
+            << ", hybridData=" << (table_->hybridData() ? "yes" : "no");
 
   maybeSetupSpillInput(
       hashBuildResult->restoredPartitionId,
@@ -2144,10 +2170,19 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
   // 4. Update columnSourceMap (once only, tracked by flag)
   updateColumnSourceMapForOutput();
 
-  // 4. Prepare output and fill with selective materialization
+  // 5. For pointer reuse mode: skip output materialization entirely.
+  // Just pass row pointers through driverCtx; return nullptr to indicate no vectors.
+  if (pointerReuseEnabled_) {
+    output_ = nullptr;
+    LOG(INFO) << "HashProbe " << planNodeId() << " fillOutputLateMaterialization:"
+              << " pointer reuse mode, skipping output materialization, size=" << size;
+    return;
+  }
+
+  // 6. Standard late-m path: Prepare output and fill with selective materialization
   prepareOutput(size);
   
-  // 4a. Probe-side KEY columns: materialize directly into output_
+  // 6a. Probe-side KEY columns: materialize directly into output_
   for (const auto& projection : probeKeyProjections_) {
     ensureLoadedIfNotAtEnd(projection.inputChannel);
     output_->childAt(projection.outputChannel) = wrapChild(
@@ -2155,7 +2190,7 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
   }
   // Non-key probe columns: in ProbePayloadContainer, output_ child stays nullptr
   
-  // 4b. Build-side KEY columns: extract directly into output_ using precomputed mapping
+  // 6b. Build-side KEY columns: extract directly into output_ using precomputed mapping
   if (!buildKeyChannelMapping_.empty()) {
     // Pre-allocate output columns for build keys
     for (const auto& projection : buildKeyProjections_) {
@@ -2245,26 +2280,86 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
   // Final probe: extract all columns from their sources using columnSourceMap
   auto* driverCtx = operatorCtx_->driverCtx();
 
+  LOG(INFO) << "HashProbe " << planNodeId() << " fillOutputFinalMaterialization:"
+            << " size=" << size
+            << ", columnSourceMap.size()=" << driverCtx->columnSourceMap.size()
+            << ", tableOutputProjections_.size()=" << tableOutputProjections_.size();
+
+  // Build initial row pointers vector for build-side extraction
+  std::vector<char*> buildRowPtrs(outputTableRows_.begin(),
+                                   outputTableRows_.begin() + size);
+
+  // Pointer reuse expansion: when pointer reuse is enabled, each R_ptr may map
+  // to multiple intermediate rows. We need to expand the output accordingly.
+  std::vector<vector_size_t> expandedProbeMapping;
+  std::vector<size_t> intermediateIndices;
+
+  auto* hybridData = table_->hybridData();
+  const bool doPointerReuseExpansion = hybridData && hybridData->isPointerReuseMode();
+
+  if (doPointerReuseExpansion) {
+    std::vector<char*> expandedBuildRowPtrs;
+    const auto& ptrToIndex = hybridData->getPtrToIndexMap();
+    // Expand: for each hit R_ptr, output one row per intermediate index
+    for (vector_size_t i = 0; i < size; ++i) {
+      char* ptr = buildRowPtrs[i];
+      auto range = ptrToIndex.equal_range(ptr);
+      if (range.first == range.second) {
+        // Should not happen, but handle gracefully
+        expandedProbeMapping.push_back(outputRowMapping_->as<vector_size_t>()[i]);
+        expandedBuildRowPtrs.push_back(ptr);
+        intermediateIndices.push_back(SIZE_MAX);
+      } else {
+        for (auto it = range.first; it != range.second; ++it) {
+          expandedProbeMapping.push_back(outputRowMapping_->as<vector_size_t>()[i]);
+          expandedBuildRowPtrs.push_back(ptr);
+          intermediateIndices.push_back(it->second);
+        }
+      }
+    }
+
+    LOG(ERROR) << "HashProbe " << planNodeId()
+               << " fillOutputFinalMaterialization: pointer reuse expansion from "
+               << size << " to " << expandedBuildRowPtrs.size() << " rows";
+
+    // Update variables to use expanded data
+    size = expandedBuildRowPtrs.size();
+    buildRowPtrs = std::move(expandedBuildRowPtrs);
+  }
+
+  // Prepare output with (potentially expanded) size
   prepareOutput(size);
 
   // For probe-side columns: wrap as dictionary over current input
   for (auto projection : projectedInputColumns_) {
     ensureLoadedIfNotAtEnd(projection.inputChannel);
   }
-  wrapIndirectChildren(
-      projectedInputColumns_,
-      input_->children(),
-      size,
-      outputRowMapping_,
-      output_->children());
+
+  if (doPointerReuseExpansion) {
+    // Use expanded probe mapping
+    BufferPtr expandedMappingBuffer =
+        AlignedBuffer::allocate<vector_size_t>(size, pool());
+    auto* expandedMappingData = expandedMappingBuffer->asMutable<vector_size_t>();
+    std::copy(expandedProbeMapping.begin(), expandedProbeMapping.end(), expandedMappingData);
+    wrapIndirectChildren(
+        projectedInputColumns_,
+        input_->children(),
+        size,
+        expandedMappingBuffer,
+        output_->children());
+  } else {
+    wrapIndirectChildren(
+        projectedInputColumns_,
+        input_->children(),
+        size,
+        outputRowMapping_,
+        output_->children());
+  }
 
   // For build-side columns: use columnSourceMap to extract from correct sources
-  // Note: For final probe, sourceMap is keyed by storageChannel (from HashBuild)
-  // For N-way intermediate, sourceMap is keyed by outputChannel (from updateColumnSourceMapForOutput)
   const auto& sourceMap = driverCtx->columnSourceMap;
 
-  // Collect channels to extract from sourceMap
-  // Note: In final probe, the map is keyed by storageChannel (= inputChannel in tableOutputProjections_)
+  // Collect channels to extract
   std::vector<column_index_t> channelsToExtract;
   for (auto projection : tableOutputProjections_) {
     channelsToExtract.push_back(projection.inputChannel);
@@ -2273,10 +2368,6 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
   if (channelsToExtract.empty()) {
     return;
   }
-
-  // Build row pointers vector for build-side extraction
-  std::vector<char*> buildRowPtrs(outputTableRows_.begin(),
-                                   outputTableRows_.begin() + size);
 
   // Create result vector for extracted columns
   std::vector<std::string> names;
@@ -2292,19 +2383,27 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
   auto extractedResult = std::make_shared<RowVector>(
       pool(), extractedType, nullptr, size, std::move(children));
 
-  // Extract build-side columns from their sources using N-way pre-compute approach
-  // table_->hybridData() is the current level's HybridContainer for chain traversal
-  // Pass empty probeRowIds for level 0 since current probe is handled separately
-  // (PROBE_PAYLOAD entries in sourceMap reference upstream ProbePayloadContainers,
-  //  which are accessed via getUpstreamProbePayloads() during chain traversal)
-  HybridContainer::extractColumnsFromUpstream(
-      channelsToExtract,
-      buildRowPtrs,
-      std::vector<uint64_t>{}, // No level 0 probeRowIds - current probe handled by wrapIndirectChildren
-      table_->hybridData(),
-      nullptr, // currentProbePayload - current probe handled separately
-      sourceMap,
-      extractedResult);
+  // Extract build-side columns using N-way pre-compute approach
+  if (doPointerReuseExpansion) {
+    // Use intermediateIndices for accurate probe side lookups
+    HybridContainer::extractColumnsFromUpstreamWithIndices(
+        channelsToExtract,
+        buildRowPtrs,
+        intermediateIndices,
+        hybridData,
+        nullptr, // currentProbePayload - current probe handled separately
+        sourceMap,
+        extractedResult);
+  } else {
+    HybridContainer::extractColumnsFromUpstream(
+        channelsToExtract,
+        buildRowPtrs,
+        std::vector<uint64_t>{}, // No level 0 probeRowIds - current probe handled by wrapIndirectChildren
+        hybridData,
+        nullptr, // currentProbePayload - current probe handled separately
+        sourceMap,
+        extractedResult);
+  }
 
   // Copy extracted columns to output
   for (size_t i = 0; i < tableOutputProjections_.size(); ++i) {

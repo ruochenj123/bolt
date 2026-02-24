@@ -349,6 +349,10 @@ struct DriverCtx {
   std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
       downstreamSortKeyChannels;
 
+  /// Set of plan node IDs eligible for pointer reuse optimization.
+  /// Only operators with their planNodeId in this set should enable pointer reuse.
+  std::set<core::PlanNodeId> pointerReuseEligibleNodeIds;
+
   /// Clear batch-level state between batches
   void clearBatchState() {
     buildSideLateMBuildRowPtrs.clear();
@@ -725,6 +729,10 @@ struct DriverFactory {
   /// The final HashProbe materializes sort key columns for OrderBy to sort.
   std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
       nWayDownstreamSortKeyChannels;
+
+  /// Set of plan node IDs eligible for pointer reuse optimization in this factory.
+  /// Operators check if their planNodeId is in this set before enabling pointer reuse.
+  std::set<core::PlanNodeId> nWayPointerReuseEligibleNodeIds;
 
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,

@@ -32,6 +32,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 #include <boost/sort/pdqsort/pdqsort.hpp>
@@ -389,17 +390,13 @@ bool HashTable<ignoreNullKeys>::compareKeys(
     HashLookup& lookup,
     vector_size_t row) {
   int32_t numKeys = lookup.hashers.size();
-  
-  // Use externalKeySource_ if in external row mode, otherwise use rows_
-  auto* keyContainer = externalRowMode_ ? externalKeySource_ : rows_.get();
-  
   // The loop runs at least once. Allow for first comparison to fail
   // before loop end check.
   int32_t i = 0;
   do {
     auto& hasher = lookup.hashers[i];
-    if (!keyContainer->equals<!ignoreNullKeys>(
-            group, keyContainer->columnAt(i), hasher->decodedVector(), row)) {
+    if (!rows_->equals<!ignoreNullKeys>(
+            group, rows_->columnAt(i), hasher->decodedVector(), row)) {
       return false;
     }
   } while (++i < numKeys);
@@ -410,15 +407,11 @@ template <bool ignoreNullKeys>
 bool HashTable<ignoreNullKeys>::compareKeys(
     const char* group,
     const char* inserted) {
-  
-  // Use externalKeySource_ if in external row mode, otherwise use rows_
-  auto* keyContainer = externalRowMode_ ? externalKeySource_ : rows_.get();
-  
   auto scalarCmp = [&]() -> bool {
     auto numKeys = hashers_.size();
     int32_t i = 0;
     do {
-      if (keyContainer->compare(group, inserted, i, CompareFlags{true, true})) {
+      if (rows_->compare(group, inserted, i, CompareFlags{true, true})) {
         return false;
       }
     } while (++i < numKeys);
@@ -432,8 +425,8 @@ bool HashTable<ignoreNullKeys>::compareKeys(
       std::stringstream ss;
       ss << " build cmp expected: " << (int)expected
          << " jitEqual: " << (int)jitEqual
-         << " row:  " << keyContainer->toString(group)
-         << " insert: " << keyContainer->toString(inserted) << std::endl;
+         << " row:  " << rows_->toString(group)
+         << " insert: " << rows_->toString(inserted) << std::endl;
       std::cerr << ss.str() << std::endl;
       BOLT_CHECK(false);
     }
@@ -934,16 +927,13 @@ bool HashTable<ignoreNullKeys>::hashRows(
     return true;
   }
 
-  // Use externalKeySource_ if in external row mode, otherwise use rows_
-  auto* keyContainer = externalRowMode_ ? externalKeySource_ : rows_.get();
-
   for (int32_t i = 0; i < hashers_.size(); ++i) {
     auto& hasher = hashers_[i];
     if (hashMode_ == HashMode::kHash) {
-      keyContainer->hash(i, rows, i > 0, hashes.data());
+      rows_->hash(i, rows, i > 0, hashes.data());
     } else {
       // Array or normalized key.
-      auto column = keyContainer->columnAt(i);
+      auto column = rows_->columnAt(i);
       if (!hasher->computeValueIdsForRows(
               rows.data(),
               rows.size(),
@@ -1939,60 +1929,6 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
 }
 
 template <bool ignoreNullKeys>
-void HashTable<ignoreNullKeys>::buildFromExternalPointers(
-    std::vector<char*> rowPtrs,
-    RowContainer* keySource) {
-  BOLT_CHECK(
-      isJoinBuild_,
-      "buildFromExternalPointers only supported for join build");
-  BOLT_CHECK(
-      keySource != nullptr,
-      "keySource cannot be null for external pointer mode");
-  
-  LOG(INFO) << "HashTable::buildFromExternalPointers: numRows=" << rowPtrs.size();
-  
-  // Set external row mode
-  externalRowMode_ = true;
-  externalRowPtrs_ = std::move(rowPtrs);
-  externalKeySource_ = keySource;
-  
-  // Set numDistinct for capacity calculation
-  numDistinct_ = externalRowPtrs_.size();
-  
-  if (numDistinct_ == 0) {
-    return;
-  }
-  
-  // Decide hash mode and allocate table
-  // For external mode, we use kHash mode for simplicity (no normalized keys)
-  hashMode_ = HashMode::kHash;
-  checkSize(0, true);
-  
-  // Build hash table by inserting external pointers
-  constexpr int32_t kBatchSize = 1024;
-  raw_vector<uint64_t> hashes;
-  hashes.resize(kBatchSize);
-  
-  for (size_t i = 0; i < externalRowPtrs_.size(); i += kBatchSize) {
-    size_t batchEnd = std::min(i + kBatchSize, externalRowPtrs_.size());
-    size_t batchSize = batchEnd - i;
-    
-    // Hash the external rows using externalKeySource_
-    auto rowRange = folly::Range<char**>(externalRowPtrs_.data() + i, batchSize);
-    if (!hashRows(rowRange, false, hashes)) {
-      // Should not happen in kHash mode
-      BOLT_CHECK(false, "hashRows failed in external pointer mode");
-    }
-    
-    // Insert into hash table
-    insertForJoin(externalRowPtrs_.data() + i, hashes.data(), batchSize, nullptr);
-  }
-  
-  LOG(INFO) << "HashTable::buildFromExternalPointers complete: capacity_=" 
-            << capacity_ << ", numDistinct_=" << numDistinct_;
-}
-
-template <bool ignoreNullKeys>
 int32_t HashTable<ignoreNullKeys>::listJoinResults(
     JoinResultIterator& iter,
     bool includeMisses,
@@ -2465,6 +2401,93 @@ void BaseHashTable::prepareForJoinProbe(
   }
 
   populateLookupRows(rows, lookup.rows);
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::buildFromExternalPointers(
+    std::vector<char*> rowPtrs,
+    RowContainer* keySource) {
+  BOLT_CHECK(
+      isJoinBuild_,
+      "buildFromExternalPointers only supported for join build");
+  BOLT_CHECK(
+      keySource != nullptr,
+      "keySource cannot be null for external pointer mode");
+  
+  LOG(ERROR) << "HashTable::buildFromExternalPointers: numRows=" << rowPtrs.size();
+  
+  // Set external row mode
+  externalRowMode_ = true;
+  externalRowPtrs_ = std::move(rowPtrs);
+  externalKeySource_ = keySource;
+  
+  // CRITICAL: Use keySource's nextOffset for external pointers!
+  // External pointers point to rows in keySource's RowContainer (R rows).
+  // The chain pointer location is determined by R's row layout, not J2's.
+  // Without this, nextRow(ptr) would access wrong offset and corrupt data.
+  nextOffset_ = keySource->nextOffset();
+  
+  LOG(ERROR) << "HashTable::buildFromExternalPointers: using keySource nextOffset=" 
+             << nextOffset_;
+  
+  // Deduplicate pointers - each unique pointer is inserted exactly once.
+  // This prevents cycles when the same pointer appears multiple times.
+  std::unordered_set<char*> seenPtrs;
+  std::vector<char*> uniquePtrs;
+  uniquePtrs.reserve(externalRowPtrs_.size());
+  
+  for (char* ptr : externalRowPtrs_) {
+    if (seenPtrs.find(ptr) == seenPtrs.end()) {
+      seenPtrs.insert(ptr);
+      uniquePtrs.push_back(ptr);
+    }
+  }
+  
+  LOG(ERROR) << "HashTable::buildFromExternalPointers: deduped from " 
+             << externalRowPtrs_.size() << " to " << uniquePtrs.size() << " unique ptrs";
+  
+  // Set numDistinct for capacity calculation
+  numDistinct_ = uniquePtrs.size();
+  
+  if (numDistinct_ == 0) {
+    return;
+  }
+  
+  // CRITICAL: Reset nextRow for each unique ptr to nullptr.
+  // These pointers may have pre-existing chains from J1's hash table build.
+  // Without resetting, pushNext() can create cycles when inserting R_ptr_1
+  // after R_ptr_0 if R_ptr_0 already points to R_ptr_1 from J1.
+  for (char* ptr : uniquePtrs) {
+    nextRow(ptr) = nullptr;
+  }
+  
+  // Decide hash mode and allocate table
+  // For external mode, we use kHash mode for simplicity (no normalized keys)
+  hashMode_ = HashMode::kHash;
+  checkSize(0, true);
+  
+  // Build hash table by inserting unique external pointers
+  constexpr int32_t kBatchSize = 1024;
+  raw_vector<uint64_t> hashes;
+  hashes.resize(kBatchSize);
+  
+  for (size_t i = 0; i < uniquePtrs.size(); i += kBatchSize) {
+    size_t batchEnd = std::min(i + kBatchSize, uniquePtrs.size());
+    size_t batchSize = batchEnd - i;
+    
+    // Hash the external rows using externalKeySource_
+    auto rowRange = folly::Range<char**>(uniquePtrs.data() + i, batchSize);
+    if (!hashRows(rowRange, false, hashes)) {
+      // Should not happen in kHash mode
+      BOLT_CHECK(false, "hashRows failed in external pointer mode");
+    }
+    
+    // Insert into hash table
+    insertForJoin(uniquePtrs.data() + i, hashes.data(), batchSize, nullptr);
+  }
+  
+  LOG(ERROR) << "HashTable::buildFromExternalPointers complete: capacity_=" 
+            << capacity_ << ", numDistinct_=" << numDistinct_;
 }
 
 } // namespace bytedance::bolt::exec

@@ -159,6 +159,13 @@ HashBuild::HashBuild(
        numDependents > 0)) &&
       !joinNode_->isLeftSemiFilterJoin() &&
       !joinNode_->isLeftSemiProjectJoin() && !joinNode_->isAntiJoin();
+  
+  LOG(INFO) << "HashBuild " << planNodeId() << " constructor:"
+            << " isNWayLateMEnabled_=" << isNWayLateMEnabled_
+            << ", hybridJoin_=" << hybridJoin_
+            << ", numKeys=" << numKeys
+            << ", numDependents=" << numDependents
+            << ", pointerReuseEligibleNodeIds.size()=" << driverCtx->pointerReuseEligibleNodeIds.size();
 
   // For N-way late-m, we still need decoders for the base build case.
   // At constructor time, we don't know if we're base or intermediate.
@@ -687,51 +694,81 @@ void HashBuild::addInput(RowVectorPtr input) {
 
 void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
   // N-way late-m path: input comes from upstream HashProbe
-  // All key columns are already materialized in input by HashProbe
-  // (both probe-side and build-side keys are extracted/wrapped into output)
+  // For pointer reuse mode: input is nullptr/empty, row count from driverCtx
+  // For standard mode: input contains materialized keys from upstream HashProbe
 
   auto* driverCtx = operatorCtx_->driverCtx();
-  const int32_t numRows = input->size();
-  LOG(INFO) << "HashBuild " << planNodeId() << " addInputLateMaterialization: numRows=" << numRows
-            << ", input->childrenSize()=" << input->childrenSize()
-            << ", keyChannels_.size()=" << keyChannels_.size()
-            << ", pointerReuseEnabled_=" << pointerReuseEnabled_;
-  for (size_t i = 0; i < keyChannels_.size(); ++i) {
-    LOG(INFO) << "  keyChannels_[" << i << "]=" << keyChannels_[i];
+
+  // Initialize pointer reuse mode on first batch if config enabled
+  // Note: Pointer reuse is NOT supported for right/full/right-semi joins because
+  // those need to iterate/modify rows in the local RowContainer (listNotProbedRows,
+  // setProbedFlag, etc.), which doesn't work with external pointers.
+  // Also requires: planner detected same keys (ctx->pointerReuseEnabled) AND
+  // upstream container exists (we're in an N-way chain).
+  const bool joinTypeSupportsPointerReuse = 
+      !isRightJoin(joinType_) && 
+      !isFullJoin(joinType_) &&
+      !isRightSemiFilterJoin(joinType_) && 
+      !isRightSemiProjectJoin(joinType_);
+  
+  // Check if THIS operator's plan node is eligible for pointer reuse
+  const bool plannerEligible = 
+      driverCtx->pointerReuseEligibleNodeIds.count(planNodeId()) > 0;
+      
+  // Log all conditions for debugging
+  LOG(ERROR) << "HashBuild " << planNodeId() << " pointer reuse check:"
+            << " configEnabled=" << driverCtx->queryConfig().hybridJoinPointerReuseEnabled()
+            << ", plannerEligible=" << plannerEligible
+            << ", hasUpstream=" << (driverCtx->primaryUpstreamBuildContainer != nullptr)
+            << ", joinTypeSupports=" << joinTypeSupportsPointerReuse
+            << ", alreadyEnabled=" << pointerReuseEnabled_;
+      
+  if (!pointerReuseEnabled_ && driverCtx->queryConfig().hybridJoinPointerReuseEnabled() 
+      && plannerEligible  // Planner detected same keys for THIS join
+      && driverCtx->primaryUpstreamBuildContainer
+      && joinTypeSupportsPointerReuse) {
+    pointerReuseEnabled_ = true;
+    // Use getEffectiveKeyContainer() to follow the chain for chained pointer reuse.
+    // If upstream is also in pointer reuse mode, this will get the ultimate key source.
+    externalKeySource_ = driverCtx->primaryUpstreamBuildContainer->getEffectiveKeyContainer()->getKeys();
+    LOG(ERROR) << "HashBuild " << planNodeId() 
+              << " enabling pointer reuse mode, externalKeySource_=" << externalKeySource_;
   }
+
+  // Compute numRows based on mode:
+  // - Pointer reuse: from buildSideLateMBuildRowPtrs (input is empty)
+  // - Standard: from input vector
+  const int32_t numRows = pointerReuseEnabled_
+      ? driverCtx->buildSideLateMBuildRowPtrs.size()
+      : (input ? input->size() : 0);
+
+  LOG(INFO) << "HashBuild " << planNodeId() << " addInputLateMaterialization: numRows=" << numRows
+            << ", pointerReuseEnabled_=" << pointerReuseEnabled_
+            << ", input=" << (input ? "non-null" : "null")
+            << ", keyChannels_.size()=" << keyChannels_.size();
+
   if (numRows == 0) {
     driverCtx->clearBatchState();
     return;
   }
 
-  // Initialize pointer reuse mode on first batch if config enabled
-  if (!pointerReuseEnabled_ && driverCtx->queryConfig().hybridJoinPointerReuseEnabled() 
-      && driverCtx->primaryUpstreamBuildContainer) {
-    pointerReuseEnabled_ = true;
-    externalKeySource_ = driverCtx->primaryUpstreamBuildContainer->getKeys();
-    LOG(INFO) << "HashBuild " << planNodeId() 
-              << " enabling pointer reuse mode, externalKeySource_=" << externalKeySource_;
-  }
-
   if (pointerReuseEnabled_) {
-    // Pointer reuse mode: collect external row pointers instead of copying keys
+    // Pointer reuse mode: don't copy keys locally, but still store upstream refs
+    // for unified traversal. The external pointers ARE upstream pointers.
     BOLT_CHECK(
         !driverCtx->buildSideLateMBuildRowPtrs.empty(),
         "Pointer reuse mode requires buildSideLateMBuildRowPtrs from upstream");
-    BOLT_CHECK_EQ(
-        driverCtx->buildSideLateMBuildRowPtrs.size(),
-        numRows,
-        "buildSideLateMBuildRowPtrs size mismatch");
 
-    // Collect external pointers
-    externalRowPtrs_.insert(
-        externalRowPtrs_.end(),
-        driverCtx->buildSideLateMBuildRowPtrs.begin(),
-        driverCtx->buildSideLateMBuildRowPtrs.end());
+    LOG(ERROR) << "HashBuild " << planNodeId() 
+              << " pointer reuse: storing " << numRows << " upstream refs"
+              << ", buildSideLateMBuildRowPtrs.size()=" << driverCtx->buildSideLateMBuildRowPtrs.size();
 
-    LOG(INFO) << "HashBuild " << planNodeId() 
-              << " pointer reuse: collected " << numRows << " external pointers"
-              << ", total=" << externalRowPtrs_.size();
+    // Store upstream refs using unified storage (same as standard mode).
+    // This enables unified traversal in extractColumnsFromUpstream().
+    // The difference from standard mode is just that we don't copy keys.
+    table_->hybridData()->appendUpstreamRefs(
+        driverCtx->buildSideLateMBuildRowPtrs,
+        driverCtx->buildSideLateMProbeRowIds);
   } else {
     // Standard mode: decode and store keys locally
     auto& hashers = table_->hashers();
@@ -776,9 +813,9 @@ void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
   }
 
   // Store upstream refs for later extraction (used for payload columns)
-  // buildSideLateMBuildRowPtrs: row pointers into upstream HybridContainer
-  // buildSideLateMProbeRowIds: row IDs for upstream ProbePayloadContainer
-  if (!driverCtx->buildSideLateMBuildRowPtrs.empty()) {
+  // Standard mode: store upstream refs for chain traversal
+  // (Pointer reuse mode already stored refs above)
+  if (!pointerReuseEnabled_ && !driverCtx->buildSideLateMBuildRowPtrs.empty()) {
     table_->hybridData()->appendUpstreamRefs(
         driverCtx->buildSideLateMBuildRowPtrs,
         driverCtx->buildSideLateMProbeRowIds);
@@ -1155,13 +1192,18 @@ void HashBuild::noMoreInputInternal() {
           table_->hybridData()->setPrimaryUpstreamBuildContainer(
               driverCtx->primaryUpstreamBuildContainer);
           
-          // For pointer reuse mode: set keyDataSource_ to upstream container
-          // so extraction and hash table operations use the real data source
+          // For pointer reuse mode: set keyDataSource_ to the ultimate key source.
+          // If upstream also has a keyDataSource_ (chained pointer reuse), use that.
+          // This ensures J3 -> J2 -> J1 chain resolves to J1 (actual key owner).
           if (driverCtx->queryConfig().hybridJoinPointerReuseEnabled()) {
-            table_->hybridData()->setKeyDataSource(
-                driverCtx->primaryUpstreamBuildContainer.get());
+            auto* upstreamKeySource = driverCtx->primaryUpstreamBuildContainer->getKeyDataSource();
+            HybridContainer* ultimateKeySource = upstreamKeySource
+                ? upstreamKeySource
+                : driverCtx->primaryUpstreamBuildContainer.get();
+            table_->hybridData()->setKeyDataSource(ultimateKeySource);
             LOG(INFO) << "HashBuild " << planNodeId()
-                      << " pointer reuse enabled: keyDataSource set to upstream container";
+                      << " pointer reuse enabled: keyDataSource set to "
+                      << (upstreamKeySource ? "chained upstream" : "direct upstream");
           }
         }
       }
@@ -1320,17 +1362,33 @@ bool HashBuild::finishHashBuild() {
   // Check if we're in pointer reuse mode
   bool pointerReuseMode = pointerReuseEnabled_;
   if (pointerReuseMode) {
-    // Collect external pointers from all peer builds
-    std::vector<char*> allExternalPtrs = std::move(externalRowPtrs_);
+    // Collect external pointers AND probe row IDs from all drivers.
+    // Each driver collected data via appendUpstreamRefs() in addInputLateMaterialization().
+    // We need to merge all drivers' data into the winning driver's hybridData
+    // so that setPointerReuseMode() can build the complete ptrToIndex_ map.
+    std::vector<char*> allExternalPtrs;
+    std::vector<uint64_t> allExternalProbeRowIds;
     RowContainer* keySource = externalKeySource_;
     
-    for (auto* build : otherBuilds) {
-      std::lock_guard<std::mutex> l(build->intermediateStateMutex_);
+    // Collect from this driver's hybridData
+    if (table_->hybridData()) {
+      const auto& myPtrs = table_->hybridData()->getUpstreamBuildRowPtrs();
+      const auto& myProbeIds = table_->hybridData()->getUpstreamProbeRowIds();
+      allExternalPtrs.insert(allExternalPtrs.end(), myPtrs.begin(), myPtrs.end());
+      allExternalProbeRowIds.insert(allExternalProbeRowIds.end(), myProbeIds.begin(), myProbeIds.end());
+    }
+    
+    // Collect from peer drivers' hybridData (otherTables already moved)
+    for (size_t i = 0; i < otherBuilds.size(); ++i) {
+      auto* build = otherBuilds[i];
       if (build->pointerReuseEnabled_) {
-        allExternalPtrs.insert(
-            allExternalPtrs.end(),
-            build->externalRowPtrs_.begin(),
-            build->externalRowPtrs_.end());
+        // otherTables[i] has the moved table
+        if (otherTables[i] && otherTables[i]->hybridData()) {
+          const auto& peerPtrs = otherTables[i]->hybridData()->getUpstreamBuildRowPtrs();
+          const auto& peerProbeIds = otherTables[i]->hybridData()->getUpstreamProbeRowIds();
+          allExternalPtrs.insert(allExternalPtrs.end(), peerPtrs.begin(), peerPtrs.end());
+          allExternalProbeRowIds.insert(allExternalProbeRowIds.end(), peerProbeIds.begin(), peerProbeIds.end());
+        }
         // All drivers should have the same keySource (same upstream container)
         BOLT_CHECK(
             build->externalKeySource_ == keySource,
@@ -1338,16 +1396,30 @@ bool HashBuild::finishHashBuild() {
       } else {
         // Mixed mode not supported
         BOLT_CHECK(
-            build->externalRowPtrs_.empty(),
-            "Pointer reuse mode: some drivers have external pointers, others don't");
+            !build->pointerReuseEnabled_,
+            "Pointer reuse mode: some drivers have pointer reuse enabled, others don't");
       }
     }
     
-    LOG(INFO) << "HashBuild " << planNodeId() << " buildFromExternalPointers: "
+    LOG(ERROR) << "HashBuild " << planNodeId() << " buildFromExternalPointers: "
               << "totalPtrs=" << allExternalPtrs.size()
+              << ", totalProbeIds=" << allExternalProbeRowIds.size()
               << ", keySource=" << keySource;
     
     BOLT_CHECK_NOT_NULL(keySource, "Pointer reuse mode: keySource cannot be null");
+    
+    // Merge all drivers' upstream refs into winning driver's hybridData.
+    // This ensures setPointerReuseMode() builds the complete ptrToIndex_ map.
+    if (table_->hybridData()) {
+      // Clear and repopulate with merged data
+      table_->hybridData()->clearUpstreamRefs();
+      table_->hybridData()->appendUpstreamRefs(allExternalPtrs, allExternalProbeRowIds);
+      
+      // Now set pointer reuse mode - this builds ptrToIndex_ from the merged data
+      table_->hybridData()->setPointerReuseMode(true);
+    }
+    
+    // Now build the hash table (this moves allExternalPtrs)
     table_->buildFromExternalPointers(std::move(allExternalPtrs), keySource);
   } else {
     // Standard mode: use prepareJoinTable

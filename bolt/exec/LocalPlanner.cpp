@@ -446,6 +446,9 @@ void detectNWayJoinChains(
   // Set of materialization point IDs that are OrderBy nodes (Sort materialization)
   std::unordered_set<core::PlanNodeId> sortMaterializationNodeIds;
 
+  // Set of join nodes where pointer reuse is eligible (downstream keys match upstream keys)
+  std::unordered_set<core::PlanNodeId> pointerReuseEligibleNodeIds;
+
   // First pass: identify N-way join chains
   // We look for patterns where a HashJoinNode's source[1] (build side)
   // contains or leads to another HashJoinNode, OR where an OrderBy sits
@@ -568,6 +571,34 @@ void detectNWayJoinChains(
                               << "') is key for downstream " << parentJoin->id();
                   }
                 }
+                
+                // Check if pointer reuse is eligible: parent's rightKeys must be
+                // EXACTLY the same as inner's rightKeys (same key columns).
+                // This allows the downstream join to reuse hash table pointers
+                // instead of rebuilding.
+                // TODO: Consider supporting subset keys (parent keys ⊆ inner keys)
+                // which could still benefit from pointer reuse with additional
+                // hash table lookups on the extra inner keys.
+                std::unordered_set<std::string> innerRightKeyNames;
+                for (const auto& key : innerJoin->rightKeys()) {
+                  innerRightKeyNames.insert(key->name());
+                }
+                std::unordered_set<std::string> parentRightKeyNames;
+                for (const auto& key : parentJoin->rightKeys()) {
+                  parentRightKeyNames.insert(key->name());
+                }
+                bool exactKeysMatch = (innerRightKeyNames == parentRightKeyNames);
+                if (!exactKeysMatch) {
+                  LOG(INFO) << "detectNWayJoinChains: Parent " << parentJoin->id()
+                            << " keys differ from inner " << innerJoin->id()
+                            << " - no pointer reuse (inner has " << innerRightKeyNames.size()
+                            << " keys, parent has " << parentRightKeyNames.size() << " keys)";
+                }
+                if (exactKeysMatch && !parentJoin->rightKeys().empty()) {
+                  pointerReuseEligibleNodeIds.insert(parentJoin->id());
+                  LOG(INFO) << "detectNWayJoinChains: Parent " << parentJoin->id()
+                            << " eligible for pointer reuse (exact same keys as " << innerJoin->id() << ")";
+                }
               }
               probeToDownstreamKeyChannels[innerJoin->id()] = keyChannels;
               
@@ -654,6 +685,22 @@ void detectNWayJoinChains(
                     << " has " << sortKeyIt->second.size() << " downstream sort key channels";
         }
         
+        // NOTE: Pointer reuse should ONLY be set for the BUILD side factory,
+        // which is identified by consumerNode being the pointer-reuse-eligible join.
+        // Do NOT set it based on node->id() here because that's the PROBE side.
+        
+        // Check if THIS factory feeds into (consumerNode) a pointer-reuse-eligible join.
+        // If so, this factory contains the HashBuild that should do pointer reuse.
+        // Add the consumerNode's ID to the set of pointer-reuse-eligible nodes.
+        if (factories[i]->consumerNode &&
+            pointerReuseEligibleNodeIds.count(factories[i]->consumerNode->id()) > 0) {
+          factories[i]->nWayPointerReuseEligibleNodeIds.insert(
+              factories[i]->consumerNode->id());
+          LOG(ERROR) << "detectNWayJoinChains: Factory " << i 
+                    << " consumerNode " << factories[i]->consumerNode->id()
+                    << " enabled for pointer reuse (build side)";
+        }
+        
         factoryMarked = true;
         break; // Factory marked, move to next factory
       }
@@ -662,8 +709,14 @@ void detectNWayJoinChains(
     // Also check if this factory's consumer is an N-way chain node (for base build factories)
     // These factories feed into HashBuild for an N-way join and need late-m enabled
     // so that the base hash table gets its columnSourceMap populated.
+    LOG(ERROR) << "detectNWayJoinChains: Factory " << i 
+               << " factoryMarked=" << factoryMarked
+               << " consumerNode=" << (factories[i]->consumerNode ? factories[i]->consumerNode->id() : "null");
     if (!factoryMarked && factories[i]->consumerNode) {
       auto consumerIt = nodeToMaterializationPoint.find(factories[i]->consumerNode->id());
+      LOG(ERROR) << "  consumerNode " << factories[i]->consumerNode->id() 
+                 << " in nodeToMaterializationPoint=" << (consumerIt != nodeToMaterializationPoint.end())
+                 << " in pointerReuseEligibleNodeIds=" << (pointerReuseEligibleNodeIds.count(factories[i]->consumerNode->id()) > 0);
       if (consumerIt != nodeToMaterializationPoint.end()) {
         factories[i]->nWayJoinLateMEnabled = true;
         factories[i]->nWayMaterializationPlanNodeId = consumerIt->second;
@@ -671,6 +724,16 @@ void detectNWayJoinChains(
         // Check if materialization point is an OrderBy (Sort materialization)
         if (sortMaterializationNodeIds.count(consumerIt->second) > 0) {
           factories[i]->nWaySortMaterializationEnabled = true;
+        }
+        
+        // Check if this build factory's consumer (the HashJoin) is eligible for pointer reuse.
+        // This is where HashBuild runs, so we need the pointer reuse flag here.
+        if (pointerReuseEligibleNodeIds.count(factories[i]->consumerNode->id()) > 0) {
+          factories[i]->nWayPointerReuseEligibleNodeIds.insert(
+              factories[i]->consumerNode->id());
+          LOG(ERROR) << "detectNWayJoinChains: Factory " << i 
+                    << " (build side for HashJoin " << factories[i]->consumerNode->id()
+                    << ") enabled for pointer reuse";
         }
         
         LOG(INFO) << "detectNWayJoinChains: Factory " << i 
@@ -893,6 +956,11 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     ctx->sortMaterializationEnabled = nWaySortMaterializationEnabled;
     ctx->downstreamBuildKeyChannels = nWayDownstreamBuildKeyChannels;
     ctx->downstreamSortKeyChannels = nWayDownstreamSortKeyChannels;
+    ctx->pointerReuseEligibleNodeIds = nWayPointerReuseEligibleNodeIds;
+    LOG(ERROR) << "DriverFactory::createDriver: ctx->buildSideLateMEnabled=true"
+              << ", materializationPlanNodeId=" << nWayMaterializationPlanNodeId
+              << ", sortMaterializationEnabled=" << nWaySortMaterializationEnabled
+              << ", pointerReuseEligibleNodeIds.size()=" << nWayPointerReuseEligibleNodeIds.size();
   }
 
   std::vector<std::unique_ptr<Operator>> operators;

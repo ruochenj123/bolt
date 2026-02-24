@@ -700,6 +700,10 @@ class HashProbe : public Operator {
   bool useLateMOutputPath_{false};
   bool useFinalMaterializationPath_{false};
 
+  /// True if pointer reuse mode is enabled for late-m output.
+  /// When true, we pass row pointers without materializing key columns.
+  bool pointerReuseEnabled_{false};
+
   /// Driver ID for encoding probe row IDs
   uint8_t driverId_{0};
 

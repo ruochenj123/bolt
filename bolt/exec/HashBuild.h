@@ -485,11 +485,7 @@ class HashBuild final : public Operator {
   /// This avoids key duplication at intermediate join levels.
   bool pointerReuseEnabled_{false};
   
-  /// External row pointers collected from upstream (for pointer reuse mode).
-  /// These point directly into upstream keys_ RowContainer.
-  std::vector<char*> externalRowPtrs_;
-  
-  /// The upstream RowContainer that externalRowPtrs_ points into.
+  /// The upstream RowContainer that the external pointers point into.
   /// Used for hash/compare operations during hash table building.
   RowContainer* externalKeySource_{nullptr};
 };

@@ -143,6 +143,7 @@ class TpchQueryBuilder {
   TpchPlan getQ32Plan() const;  // T JOIN (S JOIN R) -> Sort (3-way N-way, 16 output cols)
   TpchPlan getQ33Plan() const;  // T JOIN (S JOIN R) (3-way N-way without Sort, 16 output cols)
   TpchPlan getQ34Plan() const;  // Q33 + Sort (for correctness verification)
+  TpchPlan getQ35Plan() const;  // Minimal columns for pointer reuse testing (join keys + 1 payload)
 
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {
