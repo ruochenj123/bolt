@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <unordered_map>
 #include <folly/CPortability.h>
@@ -2119,15 +2120,22 @@ class HybridContainer {
     upstreamProbeRowIds_.clear();
   }
 
-  /// Set pointer reuse mode and build ptrToIndex_ map from current upstream refs
-  void setPointerReuseMode(bool enabled) {
+  /// Set pointer reuse mode.
+  /// @param enabled Whether pointer reuse mode is enabled
+  /// @param skipPtrToIndex If true, skip building ptrToIndex_ map (used when VirtualRow mode is active)
+  void setPointerReuseMode(bool enabled, bool skipPtrToIndex = false) {
     pointerReuseMode_ = enabled;
     ptrToIndex_.clear();
-    if (enabled) {
+    if (enabled && !skipPtrToIndex) {
+      auto startTime = std::chrono::steady_clock::now();
       // Build multimap from ptr -> index for probe-side expansion
       for (size_t i = 0; i < upstreamBuildRowPtrs_.size(); ++i) {
         ptrToIndex_.emplace(upstreamBuildRowPtrs_[i], i);
       }
+      auto endTime = std::chrono::steady_clock::now();
+      auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+      LOG(INFO) << "[PointerReuse] setPointerReuseMode: built ptrToIndex_ map with "
+                << upstreamBuildRowPtrs_.size() << " entries in " << durationMs << "ms";
     }
   }
 
@@ -2293,16 +2301,36 @@ class HybridContainer {
 
   // Coalesce all payload batches into a single batch to improve locality.
   void coalesceBatches() {
-    // Only skip if no payload columns or no batches to coalesce.
-    // Always flatten even for single batch, as input may be dictionary-encoded
-    // or other non-flat encodings. Extraction expects FlatVectors.
-    if (payloadTypes_.empty() || owningInputs_.empty()) {
+    // Skip if no payload columns defined.
+    if (payloadTypes_.empty()) {
       return;
     }
 
     auto* pool = keys_->pool();
-    const auto totalRows = totalRows_;
     const auto numPayloadCols = payloadTypes_.size();
+    
+    // Handle empty container: create an empty batch to maintain single-batch invariant.
+    // This ensures getSingleContainerData() works even when no data was added.
+    if (owningInputs_.empty()) {
+      std::vector<VectorPtr> emptyChildren;
+      emptyChildren.reserve(numPayloadCols);
+      std::vector<std::string> payloadNames;
+      payloadNames.reserve(numPayloadCols);
+      for (int32_t col = 0; col < numPayloadCols; ++col) {
+        payloadNames.push_back(fmt::format("c{}", col));
+        emptyChildren.push_back(BaseVector::create(payloadTypes_[col], 0, pool));
+      }
+      owningInputs_.push_back(std::make_shared<RowVector>(
+          pool,
+          ROW(std::move(payloadNames), std::vector<TypePtr>(payloadTypes_)),
+          BufferPtr(nullptr),
+          0,
+          std::move(emptyChildren)));
+      totalBatches_ = 1;
+      return;
+    }
+
+    const auto totalRows = totalRows_;
 
     std::vector<VectorPtr> newChildren;
     newChildren.reserve(numPayloadCols);
@@ -4019,6 +4047,7 @@ inline void HybridContainer::extractColumnsFromUpstream(
       const auto& currentLevelPtrs = levels.back().buildRowPtrs;
       const auto& ptrToIndex = levelHybrid->getPtrToIndexMap();
 
+      auto startTime = std::chrono::steady_clock::now();
       for (int32_t i = 0; i < numRows; ++i) {
         char* ptr = currentLevelPtrs[i];
         // Build side: same pointer (R ptr stays R ptr)
@@ -4033,6 +4062,17 @@ inline void HybridContainer::extractColumnsFromUpstream(
         } else {
           nextLevel.probeRowIds[i] = 0;
         }
+      }
+      auto endTime = std::chrono::steady_clock::now();
+      auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+      static thread_local int64_t totalLookupMs = 0;
+      static thread_local int64_t totalLookupRows = 0;
+      totalLookupMs += durationMs;
+      totalLookupRows += numRows;
+      // Log every 5M rows
+      if (totalLookupRows % 5000000 < static_cast<int64_t>(numRows)) {
+        LOG(ERROR) << "[PointerReuse] ptrToIndex lookup: " << numRows << " rows in " << durationMs << "ms"
+                   << ", cumulative: " << totalLookupRows << " rows in " << totalLookupMs << "ms";
       }
     } else {
       // Standard mode: decode rows to get localIdx, then look up upstream

@@ -389,14 +389,22 @@ bool HashTable<ignoreNullKeys>::compareKeys(
     const char* group,
     HashLookup& lookup,
     vector_size_t row) {
+  // In VirtualRow mode, group is a VirtualRow*, we need to compare against sourcePtr
+  const char* actualGroup = useVirtualRows_ 
+      ? reinterpret_cast<const VirtualRow*>(group)->sourcePtr 
+      : group;
+  
   int32_t numKeys = lookup.hashers.size();
   // The loop runs at least once. Allow for first comparison to fail
   // before loop end check.
   int32_t i = 0;
+  // In VirtualRow/external mode, use externalKeySource_ for comparison
+  RowContainer* compareContainer = externalKeySource_ ? externalKeySource_ : rows_.get();
+  
   do {
     auto& hasher = lookup.hashers[i];
-    if (!rows_->equals<!ignoreNullKeys>(
-            group, rows_->columnAt(i), hasher->decodedVector(), row)) {
+    if (!compareContainer->equals<!ignoreNullKeys>(
+            actualGroup, compareContainer->columnAt(i), hasher->decodedVector(), row)) {
       return false;
     }
   } while (++i < numKeys);
@@ -407,26 +415,38 @@ template <bool ignoreNullKeys>
 bool HashTable<ignoreNullKeys>::compareKeys(
     const char* group,
     const char* inserted) {
+  // In VirtualRow mode, both group and inserted are VirtualRow*, compare sourcePtrs
+  const char* actualGroup = useVirtualRows_
+      ? reinterpret_cast<const VirtualRow*>(group)->sourcePtr
+      : group;
+  const char* actualInserted = useVirtualRows_
+      ? reinterpret_cast<const VirtualRow*>(inserted)->sourcePtr
+      : inserted;
+  
+  // In VirtualRow/external mode, use externalKeySource_ for comparison
+  RowContainer* compareContainer = externalKeySource_ ? externalKeySource_ : rows_.get();
+  
   auto scalarCmp = [&]() -> bool {
     auto numKeys = hashers_.size();
     int32_t i = 0;
     do {
-      if (rows_->compare(group, inserted, i, CompareFlags{true, true})) {
+      if (compareContainer->compare(actualGroup, actualInserted, i, CompareFlags{true, true})) {
         return false;
       }
     } while (++i < numKeys);
     return true;
   };
 #if DEBUG
-  if (rowEqRowFunc_) {
-    auto jitEqual = rowEqRowFunc_(group, inserted);
+  if (rowEqRowFunc_ && !useVirtualRows_) {
+    // JIT comparison not supported in VirtualRow mode
+    auto jitEqual = rowEqRowFunc_(actualGroup, actualInserted);
     auto expected = scalarCmp();
     if ((expected && !jitEqual) || (!expected && jitEqual)) {
       std::stringstream ss;
       ss << " build cmp expected: " << (int)expected
          << " jitEqual: " << (int)jitEqual
-         << " row:  " << rows_->toString(group)
-         << " insert: " << rows_->toString(inserted) << std::endl;
+         << " row:  " << compareContainer->toString(actualGroup)
+         << " insert: " << compareContainer->toString(actualInserted) << std::endl;
       std::cerr << ss.str() << std::endl;
       BOLT_CHECK(false);
     }
@@ -435,8 +455,9 @@ bool HashTable<ignoreNullKeys>::compareKeys(
   return scalarCmp();
 #else
 
-  if (rowEqRowFunc_) {
-    return rowEqRowFunc_(group, inserted);
+  if (rowEqRowFunc_ && !useVirtualRows_) {
+    // JIT comparison not supported in VirtualRow mode
+    return rowEqRowFunc_(actualGroup, actualInserted);
   }
   return scalarCmp();
 #endif
@@ -471,6 +492,10 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::fullProbe(
       *this,
       0,
       [&](char* group, int32_t row) {
+        // In VirtualRow mode, always use compareKeys (JIT doesn't understand VirtualRow)
+        if (useVirtualRows_) {
+          return compareKeys(group, lookup, row);
+        }
 #if DEBUG
         if (rowEqVectorsFunc_) {
           auto expected = compareKeys(group, lookup, row);
@@ -668,6 +693,7 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
   incrementProbes(lookup.rows.size());
+  
   if (hashMode_ == HashMode::kArray) {
     arrayJoinProbe(lookup);
     return;
@@ -927,13 +953,16 @@ bool HashTable<ignoreNullKeys>::hashRows(
     return true;
   }
 
+  // In VirtualRow/external mode, use externalKeySource_ for column layout
+  RowContainer* hashContainer = externalKeySource_ ? externalKeySource_ : rows_.get();
+
   for (int32_t i = 0; i < hashers_.size(); ++i) {
     auto& hasher = hashers_[i];
     if (hashMode_ == HashMode::kHash) {
-      rows_->hash(i, rows, i > 0, hashes.data());
+      hashContainer->hash(i, rows, i > 0, hashes.data());
     } else {
       // Array or normalized key.
-      auto column = rows_->columnAt(i);
+      auto column = hashContainer->columnAt(i);
       if (!hasher->computeValueIdsForRows(
               rows.data(),
               rows.size(),
@@ -2414,80 +2443,69 @@ void HashTable<ignoreNullKeys>::buildFromExternalPointers(
       keySource != nullptr,
       "keySource cannot be null for external pointer mode");
   
-  LOG(ERROR) << "HashTable::buildFromExternalPointers: numRows=" << rowPtrs.size();
+  const size_t numRows = rowPtrs.size();
   
   // Set external row mode
   externalRowMode_ = true;
   externalRowPtrs_ = std::move(rowPtrs);
   externalKeySource_ = keySource;
   
-  // CRITICAL: Use keySource's nextOffset for external pointers!
-  // External pointers point to rows in keySource's RowContainer (R rows).
-  // The chain pointer location is determined by R's row layout, not J2's.
-  // Without this, nextRow(ptr) would access wrong offset and corrupt data.
-  nextOffset_ = keySource->nextOffset();
-  
-  LOG(ERROR) << "HashTable::buildFromExternalPointers: using keySource nextOffset=" 
-             << nextOffset_;
-  
-  // Deduplicate pointers - each unique pointer is inserted exactly once.
-  // This prevents cycles when the same pointer appears multiple times.
-  std::unordered_set<char*> seenPtrs;
-  std::vector<char*> uniquePtrs;
-  uniquePtrs.reserve(externalRowPtrs_.size());
-  
-  for (char* ptr : externalRowPtrs_) {
-    if (seenPtrs.find(ptr) == seenPtrs.end()) {
-      seenPtrs.insert(ptr);
-      uniquePtrs.push_back(ptr);
-    }
-  }
-  
-  LOG(ERROR) << "HashTable::buildFromExternalPointers: deduped from " 
-             << externalRowPtrs_.size() << " to " << uniquePtrs.size() << " unique ptrs";
-  
-  // Set numDistinct for capacity calculation
-  numDistinct_ = uniquePtrs.size();
-  
-  if (numDistinct_ == 0) {
+  if (numRows == 0) {
     return;
   }
   
-  // CRITICAL: Reset nextRow for each unique ptr to nullptr.
-  // These pointers may have pre-existing chains from J1's hash table build.
-  // Without resetting, pushNext() can create cycles when inserting R_ptr_1
-  // after R_ptr_0 if R_ptr_0 already points to R_ptr_1 from J1.
-  for (char* ptr : uniquePtrs) {
-    nextRow(ptr) = nullptr;
+  // Use VirtualRow mode: create a lightweight wrapper for each input row.
+  // This eliminates both dedup overhead and ptrToIndex lookup overhead.
+  // - No dedup needed: each VirtualRow has its own nextRow field
+  // - No ptrToIndex needed: originalIndex is stored in VirtualRow
+  useVirtualRows_ = true;
+  virtualRows_.resize(numRows);
+  for (size_t i = 0; i < numRows; ++i) {
+    virtualRows_[i].sourcePtr = externalRowPtrs_[i];
+    virtualRows_[i].originalIndex = i;
+    virtualRows_[i].nextRow = nullptr;
   }
+
+  // Set nextOffset_ to VirtualRow::nextRow offset
+  // This allows the hash table's nextRow() function to work correctly
+  nextOffset_ = offsetof(VirtualRow, nextRow);
+  
+  // All rows are "distinct" in terms of hash table slots (no dedup)
+  // But they may have duplicate keys - that's handled by chaining
+  numDistinct_ = numRows;
   
   // Decide hash mode and allocate table
-  // For external mode, we use kHash mode for simplicity (no normalized keys)
   hashMode_ = HashMode::kHash;
   checkSize(0, true);
   
-  // Build hash table by inserting unique external pointers
+  // Build hash table by inserting VirtualRows.
+  // Hash is computed from sourcePtr (the original R row).
+  // But we insert VirtualRow* into the hash table.
   constexpr int32_t kBatchSize = 1024;
   raw_vector<uint64_t> hashes;
   hashes.resize(kBatchSize);
-  
-  for (size_t i = 0; i < uniquePtrs.size(); i += kBatchSize) {
-    size_t batchEnd = std::min(i + kBatchSize, uniquePtrs.size());
+  std::vector<char*> sourcePtrBatch(kBatchSize);
+  std::vector<char*> virtualRowPtrBatch(kBatchSize);
+
+  for (size_t i = 0; i < numRows; i += kBatchSize) {
+    size_t batchEnd = std::min(i + kBatchSize, numRows);
     size_t batchSize = batchEnd - i;
     
-    // Hash the external rows using externalKeySource_
-    auto rowRange = folly::Range<char**>(uniquePtrs.data() + i, batchSize);
-    if (!hashRows(rowRange, false, hashes)) {
-      // Should not happen in kHash mode
-      BOLT_CHECK(false, "hashRows failed in external pointer mode");
+    // Prepare batch: collect sourcePtr for hashing, VirtualRow* for insertion
+    for (size_t j = 0; j < batchSize; ++j) {
+      sourcePtrBatch[j] = virtualRows_[i + j].sourcePtr;
+      virtualRowPtrBatch[j] = reinterpret_cast<char*>(&virtualRows_[i + j]);
     }
     
-    // Insert into hash table
-    insertForJoin(uniquePtrs.data() + i, hashes.data(), batchSize, nullptr);
+    // Hash using sourcePtr (original R rows)
+    auto rowRange = folly::Range<char**>(sourcePtrBatch.data(), batchSize);
+    if (!hashRows(rowRange, false, hashes)) {
+      BOLT_CHECK(false, "hashRows failed in virtual row mode");
+    }
+    
+    // Insert VirtualRow* into hash table
+    insertForJoin(virtualRowPtrBatch.data(), hashes.data(), batchSize, nullptr);
   }
-  
-  LOG(ERROR) << "HashTable::buildFromExternalPointers complete: capacity_=" 
-            << capacity_ << ", numDistinct_=" << numDistinct_;
 }
 
 } // namespace bytedance::bolt::exec

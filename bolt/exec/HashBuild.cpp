@@ -714,15 +714,7 @@ void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
   // Check if THIS operator's plan node is eligible for pointer reuse
   const bool plannerEligible = 
       driverCtx->pointerReuseEligibleNodeIds.count(planNodeId()) > 0;
-      
-  // Log all conditions for debugging
-  LOG(ERROR) << "HashBuild " << planNodeId() << " pointer reuse check:"
-            << " configEnabled=" << driverCtx->queryConfig().hybridJoinPointerReuseEnabled()
-            << ", plannerEligible=" << plannerEligible
-            << ", hasUpstream=" << (driverCtx->primaryUpstreamBuildContainer != nullptr)
-            << ", joinTypeSupports=" << joinTypeSupportsPointerReuse
-            << ", alreadyEnabled=" << pointerReuseEnabled_;
-      
+
   if (!pointerReuseEnabled_ && driverCtx->queryConfig().hybridJoinPointerReuseEnabled() 
       && plannerEligible  // Planner detected same keys for THIS join
       && driverCtx->primaryUpstreamBuildContainer
@@ -731,8 +723,6 @@ void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
     // Use getEffectiveKeyContainer() to follow the chain for chained pointer reuse.
     // If upstream is also in pointer reuse mode, this will get the ultimate key source.
     externalKeySource_ = driverCtx->primaryUpstreamBuildContainer->getEffectiveKeyContainer()->getKeys();
-    LOG(ERROR) << "HashBuild " << planNodeId() 
-              << " enabling pointer reuse mode, externalKeySource_=" << externalKeySource_;
   }
 
   // Compute numRows based on mode:
@@ -758,10 +748,6 @@ void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
     BOLT_CHECK(
         !driverCtx->buildSideLateMBuildRowPtrs.empty(),
         "Pointer reuse mode requires buildSideLateMBuildRowPtrs from upstream");
-
-    LOG(ERROR) << "HashBuild " << planNodeId() 
-              << " pointer reuse: storing " << numRows << " upstream refs"
-              << ", buildSideLateMBuildRowPtrs.size()=" << driverCtx->buildSideLateMBuildRowPtrs.size();
 
     // Store upstream refs using unified storage (same as standard mode).
     // This enables unified traversal in extractColumnsFromUpstream().
@@ -1400,26 +1386,23 @@ bool HashBuild::finishHashBuild() {
             "Pointer reuse mode: some drivers have pointer reuse enabled, others don't");
       }
     }
-    
-    LOG(ERROR) << "HashBuild " << planNodeId() << " buildFromExternalPointers: "
-              << "totalPtrs=" << allExternalPtrs.size()
-              << ", totalProbeIds=" << allExternalProbeRowIds.size()
-              << ", keySource=" << keySource;
-    
+
     BOLT_CHECK_NOT_NULL(keySource, "Pointer reuse mode: keySource cannot be null");
     
     // Merge all drivers' upstream refs into winning driver's hybridData.
-    // This ensures setPointerReuseMode() builds the complete ptrToIndex_ map.
+    // NOTE: With VirtualRow mode, we no longer need setPointerReuseMode() to build ptrToIndex_.
+    // The originalIndex is stored directly in VirtualRow.
+    // We still need to store upstreamProbeRowIds_ for probe side expansion.
     if (table_->hybridData()) {
       // Clear and repopulate with merged data
       table_->hybridData()->clearUpstreamRefs();
       table_->hybridData()->appendUpstreamRefs(allExternalPtrs, allExternalProbeRowIds);
       
-      // Now set pointer reuse mode - this builds ptrToIndex_ from the merged data
-      table_->hybridData()->setPointerReuseMode(true);
+      // Mark as pointer reuse mode, but skip building ptrToIndex_ (VirtualRow mode uses originalIndex directly)
+      table_->hybridData()->setPointerReuseMode(true, /*skipPtrToIndex=*/true);
     }
     
-    // Now build the hash table (this moves allExternalPtrs)
+    // Now build the hash table using VirtualRow mode
     table_->buildFromExternalPointers(std::move(allExternalPtrs), keySource);
   } else {
     // Standard mode: use prepareJoinTable

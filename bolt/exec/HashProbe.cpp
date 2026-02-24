@@ -590,12 +590,6 @@ void HashProbe::asyncWaitForHashTable() {
       operatorCtx_->driverCtx()->queryConfig().hybridJoinPointerReuseEnabled() &&
       (operatorCtx_->driverCtx()->pointerReuseEligibleNodeIds.count(planNodeId()) > 0) &&  // Planner detected same keys for THIS join
       table_->hybridData() && joinTypeSupportsPointerReuse;
-  
-  LOG(ERROR) << "HashProbe " << planNodeId() << " setHashTable:"
-            << " useLateMOutputPath_=" << useLateMOutputPath_
-            << ", useFinalMaterializationPath_=" << useFinalMaterializationPath_
-            << ", pointerReuseEnabled_=" << pointerReuseEnabled_
-            << ", hybridData=" << (table_->hybridData() ? "yes" : "no");
 
   maybeSetupSpillInput(
       hashBuildResult->restoredPartitionId,
@@ -2289,15 +2283,30 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
   std::vector<char*> buildRowPtrs(outputTableRows_.begin(),
                                    outputTableRows_.begin() + size);
 
-  // Pointer reuse expansion: when pointer reuse is enabled, each R_ptr may map
-  // to multiple intermediate rows. We need to expand the output accordingly.
+  // Pointer reuse mode handling
   std::vector<vector_size_t> expandedProbeMapping;
   std::vector<size_t> intermediateIndices;
 
   auto* hybridData = table_->hybridData();
-  const bool doPointerReuseExpansion = hybridData && hybridData->isPointerReuseMode();
+  const bool isPointerReuseMode = hybridData && hybridData->isPointerReuseMode();
+  const bool useVirtualRows = table_->isUsingVirtualRows();
 
-  if (doPointerReuseExpansion) {
+  std::vector<char*> sourcePtrs;  // For VirtualRow mode: actual R row pointers
+
+  if (useVirtualRows) {
+    // VirtualRow mode: hits are VirtualRow*, not R_ptrs
+    // No expansion needed - each VirtualRow already has its unique originalIndex
+    // Just extract sourcePtr and originalIndex from each VirtualRow
+    sourcePtrs.resize(size);
+    intermediateIndices.resize(size);
+    for (vector_size_t i = 0; i < size; ++i) {
+      char* hitPtr = buildRowPtrs[i];
+      const VirtualRow* vrow = table_->getVirtualRow(hitPtr);
+      sourcePtrs[i] = vrow->sourcePtr;
+      intermediateIndices[i] = vrow->originalIndex;
+    }
+  } else if (isPointerReuseMode) {
+    // Old pointer reuse mode: expand using ptrToIndex (fallback)
     std::vector<char*> expandedBuildRowPtrs;
     const auto& ptrToIndex = hybridData->getPtrToIndexMap();
     // Expand: for each hit R_ptr, output one row per intermediate index
@@ -2318,13 +2327,10 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
       }
     }
 
-    LOG(ERROR) << "HashProbe " << planNodeId()
-               << " fillOutputFinalMaterialization: pointer reuse expansion from "
-               << size << " to " << expandedBuildRowPtrs.size() << " rows";
-
     // Update variables to use expanded data
     size = expandedBuildRowPtrs.size();
     buildRowPtrs = std::move(expandedBuildRowPtrs);
+    sourcePtrs = buildRowPtrs;  // In old mode, buildRowPtrs ARE the source ptrs
   }
 
   // Prepare output with (potentially expanded) size
@@ -2335,8 +2341,16 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
     ensureLoadedIfNotAtEnd(projection.inputChannel);
   }
 
-  if (doPointerReuseExpansion) {
-    // Use expanded probe mapping
+  if (useVirtualRows) {
+    // VirtualRow mode: no probe mapping expansion needed
+    wrapIndirectChildren(
+        projectedInputColumns_,
+        input_->children(),
+        size,
+        outputRowMapping_,
+        output_->children());
+  } else if (isPointerReuseMode) {
+    // Old mode: use expanded probe mapping
     BufferPtr expandedMappingBuffer =
         AlignedBuffer::allocate<vector_size_t>(size, pool());
     auto* expandedMappingData = expandedMappingBuffer->asMutable<vector_size_t>();
@@ -2384,11 +2398,14 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
       pool(), extractedType, nullptr, size, std::move(children));
 
   // Extract build-side columns using N-way pre-compute approach
-  if (doPointerReuseExpansion) {
+  // Use sourcePtrs (actual R row pointers) for data extraction
+  const std::vector<char*>& extractionPtrs = useVirtualRows ? sourcePtrs : buildRowPtrs;
+  
+  if (useVirtualRows || isPointerReuseMode) {
     // Use intermediateIndices for accurate probe side lookups
     HybridContainer::extractColumnsFromUpstreamWithIndices(
         channelsToExtract,
-        buildRowPtrs,
+        extractionPtrs,
         intermediateIndices,
         hybridData,
         nullptr, // currentProbePayload - current probe handled separately
@@ -2397,7 +2414,7 @@ void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
   } else {
     HybridContainer::extractColumnsFromUpstream(
         channelsToExtract,
-        buildRowPtrs,
+        extractionPtrs,
         std::vector<uint64_t>{}, // No level 0 probeRowIds - current probe handled by wrapIndirectChildren
         hybridData,
         nullptr, // currentProbePayload - current probe handled separately

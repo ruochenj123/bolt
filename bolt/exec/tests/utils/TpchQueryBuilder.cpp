@@ -3541,22 +3541,29 @@ TpchPlan TpchQueryBuilder::getQ32Plan() const {
 // Q33: N-way join WITHOUT Sort (for testing N-way join without late-m sort)
 // Pattern: T (probe₂) × (S × R) (build₂) - no Sort
 // Same as Q32 but without the final Sort operation
-// Uses 4 join keys for both joins, 16 output columns total
+// Uses 4 join keys for both joins, 21 output columns total (17 from R + 4 from T)
 TpchPlan TpchQueryBuilder::getQ33Plan() const {
-  // R columns (build₁) - 4 keys + payloads
+  // R columns (build₁) - 4 keys + 13 payloads (same as Q30 in hybrid-design)
   std::vector<std::string> rColumns = {
-      "row_id",           // join key
-      "l_suppkey",        // join key
-      "l_returnflag",     // join key
-      "l_linestatus",     // join key
-      "l_orderkey",       // payload
-      "l_partkey",        // payload
-      "l_linenumber",     // payload
-      "l_quantity",       // payload
-      "l_extendedprice",  // payload
-      "l_discount",       // payload
-      "l_tax",            // payload
-      "l_shipdate"        // payload
+      // 4 Join keys
+      "row_id",
+      "l_suppkey",
+      "l_returnflag",
+      "l_linestatus",
+      // 13 Payload columns (same as Q30)
+      "l_orderkey",
+      "l_partkey",
+      "l_linenumber",
+      "l_quantity",
+      "l_extendedprice",
+      "l_discount",
+      "l_tax",
+      "l_shipdate",
+      "l_commitdate",
+      "l_receiptdate",
+      "l_shipinstruct",
+      "l_shipmode",
+      "l_comment"
   };
 
   // S columns (probe₁) - only join keys, will be renamed
@@ -3624,7 +3631,12 @@ TpchPlan TpchQueryBuilder::getQ33Plan() const {
                "l_extendedprice",  // from R (payload)
                "l_discount",       // from R (payload)
                "l_tax",            // from R (payload)
-               "l_shipdate"})      // from R (payload)
+               "l_shipdate",       // from R (payload)
+               "l_commitdate",     // from R (payload)
+               "l_receiptdate",    // from R (payload)
+               "l_shipinstruct",   // from R (payload)
+               "l_shipmode",       // from R (payload)
+               "l_comment"})       // from R (payload) - 17 columns
           .planNode();
 
   // Second join: T (probe₂) × sJoinR (build₂) on 4 keys
@@ -3651,10 +3663,15 @@ TpchPlan TpchQueryBuilder::getQ33Plan() const {
                "l_discount",       // from R (payload)
                "l_tax",            // from R (payload)
                "l_shipdate",       // from R (payload)
+               "l_commitdate",     // from R (payload)
+               "l_receiptdate",    // from R (payload)
+               "l_shipinstruct",   // from R (payload)
+               "l_shipmode",       // from R (payload)
+               "l_comment",        // from R (payload)
                "t_payload1",       // from T (payload)
                "t_payload2",       // from T (payload)
                "t_payload3",       // from T (payload)
-               "t_payload4"})      // from T (payload) - 16 columns total
+               "t_payload4"})      // from T (payload) - 21 columns total
           .planNode();                     // NO Sort!
 
   TpchPlan context;
