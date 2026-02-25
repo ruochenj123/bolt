@@ -1,0 +1,67 @@
+nohup: ignoring input
+========================================
+Q33 Benchmark Comparison
+Data: /home/jiang.2091/velox_join/data/join_benchmark_v2
+Raw outputs: /home/jiang.2091/velox_join/bolt/late-m-exps/raw_outputs
+Date: Tue 24 Feb 2026 05:32:35 PM EST
+========================================
+
+========== 1. BASELINE (vanilla bolt) ==========
+
+>>> baseline
+    hybrid=false, late_m=false, reuse=false
+PROFILE: interrupts/evictions/bytes = 10727/4141/820936
+    E2E: 3m 57s | CPU: 32.19s | Wall: 32.62s | Rows: 50000000 | Memory: 10.62GB
+    Raw: /home/jiang.2091/velox_join/bolt/late-m-exps/raw_outputs/baseline.log
+
+========== 2. HYBRID-ONLY ==========
+
+>>> hybrid-only
+    hybrid=true, late_m=false, reuse=false
+PROFILE: interrupts/evictions/bytes = 10947/3411/758648
+    E2E: 3m 2s | CPU: 40.32s | Wall: 40.76s | Rows: 50000000 | Memory: 10.65GB
+    Raw: /home/jiang.2091/velox_join/bolt/late-m-exps/raw_outputs/hybrid-only.log
+
+========== 3. LATE-M-STANDARD ==========
+
+>>> late-m-standard
+    hybrid=true, late_m=true, reuse=false
+E20260224 17:39:38.717813 139757657377088 LocalPlanner.cpp:712] detectNWayJoinChains: Factory 0 factoryMarked=1 consumerNode=null
+E20260224 17:39:38.751862 139757657377088 LocalPlanner.cpp:699] detectNWayJoinChains: Factory 1 consumerNode 5 enabled for pointer reuse (build side)
+E20260224 17:39:38.751875 139757657377088 LocalPlanner.cpp:712] detectNWayJoinChains: Factory 1 factoryMarked=1 consumerNode=5
+E20260224 17:39:38.751883 139757657377088 LocalPlanner.cpp:712] detectNWayJoinChains: Factory 2 factoryMarked=0 consumerNode=3
+E20260224 17:39:38.751891 139757657377088 LocalPlanner.cpp:717]   consumerNode 3 in nodeToMaterializationPoint=1 in pointerReuseEligibleNodeIds=0
+E20260224 17:39:38.751949 139757657377088 LocalPlanner.cpp:960] DriverFactory::createDriver: ctx->buildSideLateMEnabled=true, materializationPlanNodeId=5, sortMaterializationEnabled=0, pointerReuseEligibleNodeIds.size()=0
+E20260224 17:39:38.752003 139757657377088 LocalPlanner.cpp:960] DriverFactory::createDriver: ctx->buildSideLateMEnabled=true, materializationPlanNodeId=5, sortMaterializationEnabled=0, pointerReuseEligibleNodeIds.size()=1
+E20260224 17:39:38.764046 139757657377088 LocalPlanner.cpp:960] DriverFactory::createDriver: ctx->buildSideLateMEnabled=true, materializationPlanNodeId=5, sortMaterializationEnabled=0, pointerReuseEligibleNodeIds.size()=0
+PROFILE: interrupts/evictions/bytes = 11466/3632/794448
+    E2E: 2m 35s | CPU: 52.28s | Wall: 54.77s | Rows: 50000000 | Memory: 4.09GB
+    Raw: /home/jiang.2091/velox_join/bolt/late-m-exps/raw_outputs/late-m-standard.log
+
+========== 4. LATE-M-REUSE (VirtualRow) ==========
+
+>>> late-m-reuse
+    hybrid=true, late_m=true, reuse=true
+E20260224 17:42:18.345012 140112144968000 LocalPlanner.cpp:712] detectNWayJoinChains: Factory 0 factoryMarked=1 consumerNode=null
+E20260224 17:42:18.346776 140112144968000 LocalPlanner.cpp:699] detectNWayJoinChains: Factory 1 consumerNode 5 enabled for pointer reuse (build side)
+E20260224 17:42:18.346793 140112144968000 LocalPlanner.cpp:712] detectNWayJoinChains: Factory 1 factoryMarked=1 consumerNode=5
+E20260224 17:42:18.346808 140112144968000 LocalPlanner.cpp:712] detectNWayJoinChains: Factory 2 factoryMarked=0 consumerNode=3
+E20260224 17:42:18.346823 140112144968000 LocalPlanner.cpp:717]   consumerNode 3 in nodeToMaterializationPoint=1 in pointerReuseEligibleNodeIds=0
+E20260224 17:42:18.346912 140112144968000 LocalPlanner.cpp:960] DriverFactory::createDriver: ctx->buildSideLateMEnabled=true, materializationPlanNodeId=5, sortMaterializationEnabled=0, pointerReuseEligibleNodeIds.size()=0
+E20260224 17:42:18.346994 140112144968000 LocalPlanner.cpp:960] DriverFactory::createDriver: ctx->buildSideLateMEnabled=true, materializationPlanNodeId=5, sortMaterializationEnabled=0, pointerReuseEligibleNodeIds.size()=1
+E20260224 17:42:18.390334 140112144968000 LocalPlanner.cpp:960] DriverFactory::createDriver: ctx->buildSideLateMEnabled=true, materializationPlanNodeId=5, sortMaterializationEnabled=0, pointerReuseEligibleNodeIds.size()=0
+PROFILE: interrupts/evictions/bytes = 12060/4496/888768
+    E2E: 2m 39s | CPU: 59.12s | Wall: 59.67s | Rows: 50000000 | Memory: 512.68MB
+    Raw: /home/jiang.2091/velox_join/bolt/late-m-exps/raw_outputs/late-m-reuse.log
+
+========================================
+Benchmark Complete: Tue 24 Feb 2026 05:44:58 PM EST
+Raw outputs saved to: /home/jiang.2091/velox_join/bolt/late-m-exps/raw_outputs
+========================================
+total 40
+drwxr-xr-x 2 jiang.2091 10000 4096 Feb 24 17:42 .
+drwxr-xr-x 3 jiang.2091 10000 4096 Feb 24 17:32 ..
+-rw-r--r-- 1 jiang.2091 10000 4619 Feb 24 17:36 baseline.log
+-rw-r--r-- 1 jiang.2091 10000 4614 Feb 24 17:39 hybrid-only.log
+-rw-r--r-- 1 jiang.2091 10000 4622 Feb 24 17:44 late-m-reuse.log
+-rw-r--r-- 1 jiang.2091 10000 4616 Feb 24 17:42 late-m-standard.log

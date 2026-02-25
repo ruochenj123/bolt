@@ -732,11 +732,6 @@ void HashBuild::addInputLateMaterialization(const RowVectorPtr& input) {
       ? driverCtx->buildSideLateMBuildRowPtrs.size()
       : (input ? input->size() : 0);
 
-  LOG(INFO) << "HashBuild " << planNodeId() << " addInputLateMaterialization: numRows=" << numRows
-            << ", pointerReuseEnabled_=" << pointerReuseEnabled_
-            << ", input=" << (input ? "non-null" : "null")
-            << ", keyChannels_.size()=" << keyChannels_.size();
-
   if (numRows == 0) {
     driverCtx->clearBatchState();
     return;

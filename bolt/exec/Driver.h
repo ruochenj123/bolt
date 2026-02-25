@@ -337,6 +337,11 @@ struct DriverCtx {
   /// When set, the final HashProbe uses OUTPUT mode (passing row refs to Sort),
   /// and OrderBy performs final materialization after sorting.
   bool sortMaterializationEnabled = false;
+  
+  /// If true, Sort can use pointer reuse optimization: directly sort the passed
+  /// row pointers without rebuilding rows in its own RowContainer.
+  /// This is enabled when Sort's keys match the upstream join's keys.
+  bool sortPointerReuseEnabled = false;
 
   /// For N-way late-m: output channels that are keys for downstream HashBuild.
   /// Keyed by HashProbe's plan node ID. Only these channels need to be materialized
@@ -718,6 +723,10 @@ struct DriverFactory {
   /// When set, the final HashProbe in the chain uses OUTPUT mode (passing
   /// row references to Sort), and OrderBy performs final materialization.
   bool nWaySortMaterializationEnabled{false};
+  
+  /// If true, OrderBy can use Sort pointer reuse: directly sort the passed
+  /// row pointers without rebuilding rows. Enabled when Sort's keys match join's keys.
+  bool nWaySortPointerReuseEnabled{false};
 
   /// For N-way late-m: output channels of HashProbe that are keys for downstream
   /// HashBuild. Keyed by the HashProbe's plan node ID.
