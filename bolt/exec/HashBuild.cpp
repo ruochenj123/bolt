@@ -1398,7 +1398,12 @@ bool HashBuild::finishHashBuild() {
     }
     
     // Now build the hash table using VirtualRow mode
-    table_->buildFromExternalPointers(std::move(allExternalPtrs), keySource);
+    // Use parallel build if we have multiple tables (drivers) and no spill
+    const bool allowParallelBuild = !otherTables.empty() && spillPartitions.empty();
+    table_->buildFromExternalPointers(
+        std::move(allExternalPtrs),
+        keySource,
+        allowParallelBuild ? operatorCtx_->task()->queryCtx()->executor() : nullptr);
   } else {
     // Standard mode: use prepareJoinTable
     // TODO: re-enable parallel join build with spilling triggered after

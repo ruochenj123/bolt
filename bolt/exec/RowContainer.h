@@ -696,6 +696,11 @@ class RowContainer {
     normalizedKeySize_ = 0;
   }
 
+  /// Returns true if this container stores normalized keys with each row.
+  bool hasNormalizedKeys() const {
+    return hasNormalizedKeys_;
+  }
+
   FOLLY_ALWAYS_INLINE RowColumn columnAt(int32_t index) const {
     return rowColumns_[index];
   }

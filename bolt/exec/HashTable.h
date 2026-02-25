@@ -320,9 +320,11 @@ class BaseHashTable {
   /// Used for N-way joins where keys already exist in upstream containers.
   /// @param rowPtrs External row pointers to use directly (ownership transferred)
   /// @param keySource RowContainer that rowPtrs point into (used for hash/compare)
+  /// @param executor Optional executor for parallel hash table building
   virtual void buildFromExternalPointers(
       std::vector<char*> rowPtrs,
-      RowContainer* keySource) = 0;
+      RowContainer* keySource,
+      folly::Executor* executor = nullptr) = 0;
 
   /// Check if hash table is using VirtualRow mode.
   /// In VirtualRow mode, hash hits return VirtualRow* instead of raw row pointers.
@@ -765,9 +767,11 @@ class HashTable : public BaseHashTable {
   /// This is used for pointer reuse in N-way late materialization.
   /// @param rowPtrs Pointers to rows in an external RowContainer
   /// @param keySource The RowContainer where rowPtrs point into (for hash/compare)
+  /// @param executor Optional executor for parallel hash table building
   void buildFromExternalPointers(
       std::vector<char*> rowPtrs,
-      RowContainer* keySource) override;
+      RowContainer* keySource,
+      folly::Executor* executor = nullptr) override;
 
   /// Check if hash table is in external row mode.
   bool isExternalRowMode() const {
