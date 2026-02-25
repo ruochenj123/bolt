@@ -70,6 +70,14 @@ DEFINE_int32(
     "Percentage of lineitem columns to "
     "include in IO meter query. The columns are sorted by name and the n% first "
     "are scanned");
+DEFINE_int32(
+    s_selectivity_pct,
+    100,
+    "Selectivity percentage for S table in Q34 (10, 30, 60, 90, or 100)");
+DEFINE_int32(
+    t_selectivity_pct,
+    100,
+    "Selectivity percentage for T table in Q34 (10, 30, 60, 90, or 100)");
 
 std::shared_ptr<TpchQueryBuilder> queryBuilder;
 

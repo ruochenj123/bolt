@@ -362,15 +362,9 @@ void HashProbe::initialize() {
     }
 
     // Precompute build-side key projections and channel mapping
-    LOG(INFO) << "HashProbe " << planNodeId() << " isNWayLateMOutput_=" << isNWayLateMOutput_
-              << " isFinalProbeBeforeSort_=" << isFinalProbeBeforeSort_ << ": "
-              << "downstreamKeyOutputChannels_.size()=" << downstreamKeyOutputChannels_.size()
-              << ", tableOutputProjections_.size()=" << tableOutputProjections_.size();
     for (const auto& projection : tableOutputProjections_) {
       bool isKey = downstreamKeyOutputChannels_.empty() ||
           downstreamKeyOutputChannels_.count(projection.outputChannel) > 0;
-      LOG(INFO) << "  tableOutputProjection input=" << projection.inputChannel
-                << " output=" << projection.outputChannel << " isKey=" << isKey;
       if (isKey) {
         buildKeyProjections_.push_back(projection);
         buildKeyChannelMapping_.emplace_back(
@@ -1055,8 +1049,6 @@ void HashProbe::fillOutput(vector_size_t size) {
   // N-way late materialization paths - flags precomputed in asyncWaitForHashTable()
   if (useLateMOutputPath_) {
     // Intermediate probe: pass rowIds downstream instead of materializing
-    LOG(INFO) << "HashProbe " << planNodeId() << " fillOutput: useLateMOutputPath_=true"
-              << ", size=" << size;
     fillOutputLateMaterialization(size);
     return;
   }
@@ -1064,8 +1056,6 @@ void HashProbe::fillOutput(vector_size_t size) {
   if (isFinalProbeBeforeSort_) {
     // Final probe before Sort: use late-m style output (pass rowIds to Sort)
     // but normal probe filtering has already selected matching rows
-    LOG(INFO) << "HashProbe " << planNodeId() << " fillOutput: isFinalProbeBeforeSort_=true"
-              << ", size=" << size;
     fillOutputLateMaterialization(size);
     return;
   }
@@ -2113,6 +2103,18 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
 
   auto* driverCtx = operatorCtx_->driverCtx();
 
+  // 0. Unwrap VirtualRow pointers once at the beginning.
+  // In pointer reuse mode, outputTableRows_ contains VirtualRow* pointers.
+  // We unwrap them here so all subsequent code sees pure row pointers.
+  std::vector<char*> buildRowPtrs(outputTableRows_.begin(),
+                                   outputTableRows_.begin() + size);
+  if (table_->isUsingVirtualRows()) {
+    for (vector_size_t i = 0; i < size; ++i) {
+      const VirtualRow* vrow = table_->getVirtualRow(buildRowPtrs[i]);
+      buildRowPtrs[i] = vrow->sourcePtr;
+    }
+  }
+
   // 1. Store only NON-KEY probe columns in ProbePayloadContainer
   //    (key columns are materialized in output, no need to duplicate)
   if (!probePayloadProjections_.empty() && probePayloadContainer_) {
@@ -2141,7 +2143,8 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
   driverCtx->buildSideLateMProbeRowIds.resize(size);
 
   for (vector_size_t i = 0; i < size; ++i) {
-    driverCtx->buildSideLateMBuildRowPtrs[i] = outputTableRows_[i];
+    // Use already-unwrapped buildRowPtrs (VirtualRow handled in step 0)
+    driverCtx->buildSideLateMBuildRowPtrs[i] = buildRowPtrs[i];
     // probeRowId is a sequential index into probePayloadContainer_
     // (not an index into the input vector)
     uint64_t probeRowId = (static_cast<uint64_t>(driverId_) << 56) |
@@ -2168,8 +2171,6 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
   // Just pass row pointers through driverCtx; return nullptr to indicate no vectors.
   if (pointerReuseEnabled_) {
     output_ = nullptr;
-    LOG(INFO) << "HashProbe " << planNodeId() << " fillOutputLateMaterialization:"
-              << " pointer reuse mode, skipping output materialization, size=" << size;
     return;
   }
 
@@ -2192,11 +2193,7 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
           outputType_->childAt(projection.outputChannel), size, pool());
     }
 
-    // Build row pointers for extraction
-    std::vector<char*> buildRowPtrs(outputTableRows_.begin(),
-                                     outputTableRows_.begin() + size);
-
-    // Extract key columns directly into output_ using channel mapping
+    // Extract key columns using already-unwrapped buildRowPtrs (from step 0)
     HybridContainer::extractColumnsFromUpstream(
         buildKeyChannelMapping_,
         buildRowPtrs,
@@ -2273,11 +2270,6 @@ void HashProbe::updateColumnSourceMapForOutput() {
 void HashProbe::fillOutputFinalMaterialization(vector_size_t size) {
   // Final probe: extract all columns from their sources using columnSourceMap
   auto* driverCtx = operatorCtx_->driverCtx();
-
-  LOG(INFO) << "HashProbe " << planNodeId() << " fillOutputFinalMaterialization:"
-            << " size=" << size
-            << ", columnSourceMap.size()=" << driverCtx->columnSourceMap.size()
-            << ", tableOutputProjections_.size()=" << tableOutputProjections_.size();
 
   // Build initial row pointers vector for build-side extraction
   std::vector<char*> buildRowPtrs(outputTableRows_.begin(),

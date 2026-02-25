@@ -56,6 +56,12 @@ namespace bytedance::bolt::exec {
 /// - addInput() stores sort key columns plus captures row references from DriverCtx
 /// - noMoreInput() sorts and reorders row references to match sorted order
 /// - getOutput() materializes full rows from upstream containers using columnSourceMap
+///
+/// Sort Pointer Reuse Mode:
+/// When pointerReuseEnabled is true AND sort keys match upstream join keys:
+/// - addInput() directly stores passed row pointers without rebuilding
+/// - noMoreInput() sorts using upstream RowContainer for comparison
+/// - This avoids the overhead of copying sort keys into Sort's own RowContainer
 class SortBuffer {
  public:
   SortBuffer(
@@ -69,7 +75,8 @@ class SortBuffer {
       OperatorCtx* operatorCtx = nullptr,
       bool hybridSortEnabled = false,
       bool lateMaterializationEnabled = false,
-      DriverCtx* driverCtx = nullptr);
+      DriverCtx* driverCtx = nullptr,
+      bool pointerReuseEnabled = false);
 
   void addInput(const VectorPtr& input);
 
@@ -282,6 +289,17 @@ class SortBuffer {
   /// Upstream probe payload containers (for probe-side column extraction)
   std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>
       upstreamProbePayloads_;
+  
+  // === Sort Pointer Reuse State ===
+  // When pointerReuseEnabled_ is true, Sort directly uses passed row pointers
+  // without rebuilding rows in its own RowContainer. The upstream RowContainer
+  // (from the hash table) is used for row comparison during sorting.
+  
+  bool pointerReuseEnabled_{false};
+  
+  /// The RowContainer to use for comparison in pointer reuse mode.
+  /// Points to the upstream hash table's keys RowContainer.
+  RowContainer* comparisonRowContainer_{nullptr};
 };
 
 } // namespace bytedance::bolt::exec

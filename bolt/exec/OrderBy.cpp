@@ -86,6 +86,12 @@ OrderBy::OrderBy(
       !driverCtx->materializationPlanNodeId.empty() &&
       driverCtx->materializationPlanNodeId == planNodeId();
   
+  // Check if Sort pointer reuse is enabled
+  // Requires: late-m enabled, global pointer reuse flag, and LocalPlanner detected matching keys
+  bool pointerReuseEnabled = lateMaterializationEnabled &&
+      driverCtx->queryConfig().hybridJoinPointerReuseEnabled() &&
+      driverCtx->sortPointerReuseEnabled;
+  
   sortBuffer_ = std::make_unique<SortBuffer>(
       outputType_,
       sortColumnIndices,
@@ -97,12 +103,9 @@ OrderBy::OrderBy(
       operatorCtx_.get(),
       hybridSortEnabled,
       lateMaterializationEnabled,
-      driverCtx);
+      driverCtx,
+      pointerReuseEnabled);
   
-  if (lateMaterializationEnabled) {
-    LOG(INFO) << name() << " late materialization enabled, plan node: " << planNodeId();
-  }
-
   this->setRuntimeMetric(
       OperatorMetricKey::kCanUsedToEstimateHashBuildPartitionNum, "true");
   this->setRuntimeMetric(

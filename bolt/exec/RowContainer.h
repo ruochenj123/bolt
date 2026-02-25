@@ -2140,10 +2140,6 @@ class HybridContainer {
       for (size_t i = 0; i < upstreamBuildRowPtrs_.size(); ++i) {
         ptrToIndex_.emplace(upstreamBuildRowPtrs_[i], i);
       }
-      auto endTime = std::chrono::steady_clock::now();
-      auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-      LOG(INFO) << "[PointerReuse] setPointerReuseMode: built ptrToIndex_ map with "
-                << upstreamBuildRowPtrs_.size() << " entries in " << durationMs << "ms";
     }
   }
 
@@ -2608,7 +2604,7 @@ class HybridContainer {
     const T* rawValues = flatChild->rawValues();
     const uint64_t* rawNulls = flatChild->rawNulls();
 
-    constexpr vector_size_t kPrefetchDist = 16;
+    constexpr vector_size_t kPrefetchDist = 128;
 
     int32_t i = 0;
 
@@ -2710,7 +2706,7 @@ class HybridContainer {
     BOLT_CHECK_NOT_NULL(flatChild);
     const T* rawValues = flatChild->rawValues();
 
-    constexpr vector_size_t kPrefetchDist = 16;
+    constexpr vector_size_t kPrefetchDist = 128;
 
     int32_t i = 0;
 
@@ -2800,7 +2796,7 @@ class HybridContainer {
     auto values = valuesBuffer->asMutableRange<T>();
     auto* rowIdPtr = outputRowIds.data();
 
-    constexpr vector_size_t kPrefetchDist = 16;
+    constexpr vector_size_t kPrefetchDist = 128;
 
     std::vector<const T*> rawValuesByContainer(maxContainerId_ + 1, nullptr);
     std::vector<const uint64_t*> rawNullsByContainer(
@@ -2972,7 +2968,7 @@ class HybridContainer {
 
     auto* rowIdPtr = outputRowIds.data();
 
-    constexpr vector_size_t kPrefetchDist = 16;
+    constexpr vector_size_t kPrefetchDist = 128;
 
     std::vector<const T*> rawValuesByContainer(maxContainerId_ + 1, nullptr);
     for (const auto& entry : allContainers_) {
@@ -3490,7 +3486,7 @@ void ProbePayloadContainer::extractColumnWithNullsSingleContainer(
   const T* rawValues = flatChild->rawValues();
   const uint64_t* rawNulls = flatChild->rawNulls();
 
-  constexpr vector_size_t kPrefetchDist = 16;
+  constexpr vector_size_t kPrefetchDist = 128;
   int32_t i = 0;
 
   // ---- Main loop: process 4 rows per iteration ----
@@ -3566,7 +3562,7 @@ void ProbePayloadContainer::extractColumnNoNullsSingleContainer(
     BOLT_CHECK_LT(localIdx0, flatChild->size(), "localIdx out of bounds");
   }
 
-  constexpr vector_size_t kPrefetchDist = 16;
+  constexpr vector_size_t kPrefetchDist = 128;
   int32_t i = 0;
 
   // ---- Main loop: process 4 rows per iteration ----
@@ -3634,7 +3630,7 @@ void ProbePayloadContainer::extractColumnWithNullsMultiContainer(
     rawNullsByContainer[cid] = flatChild->rawNulls();
   }
 
-  constexpr vector_size_t kPrefetchDist = 16;
+  constexpr vector_size_t kPrefetchDist = 128;
   int32_t curCid = -1;
   const T* curRaw = nullptr;
   const uint64_t* curNulls = nullptr;
@@ -3749,7 +3745,7 @@ void ProbePayloadContainer::extractColumnNoNullsMultiContainer(
     rawValuesByContainer[cid] = flatChild->rawValues();
   }
 
-  constexpr vector_size_t kPrefetchDist = 16;
+  constexpr vector_size_t kPrefetchDist = 128;
   int32_t curCid = -1;
   const T* curRaw = nullptr;
 
@@ -4072,16 +4068,6 @@ inline void HybridContainer::extractColumnsFromUpstream(
         }
       }
       auto endTime = std::chrono::steady_clock::now();
-      auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-      static thread_local int64_t totalLookupMs = 0;
-      static thread_local int64_t totalLookupRows = 0;
-      totalLookupMs += durationMs;
-      totalLookupRows += numRows;
-      // Log every 5M rows
-      if (totalLookupRows % 5000000 < static_cast<int64_t>(numRows)) {
-        LOG(ERROR) << "[PointerReuse] ptrToIndex lookup: " << numRows << " rows in " << durationMs << "ms"
-                   << ", cumulative: " << totalLookupRows << " rows in " << totalLookupMs << "ms";
-      }
     } else {
       // Standard mode: decode rows to get localIdx, then look up upstream
       std::vector<HybridRowId> localRowIds;
@@ -4209,8 +4195,13 @@ inline void HybridContainer::extractColumnsFromUpstream(
           levelBuildPtrs = &levels[useLevel].buildRowPtrs;
         }
 
-        // Extract keys using the correct level's row pointers
-        hybridContainer->getKeys()->extractColumn(
+        // For pointer reuse mode: use getEffectiveKeyContainer() to get the
+        // actual key owner. In pointer reuse, J2 stores pointers to J1's rows,
+        // so we must extract from J1's keys_ layout, not J2's.
+        auto* effectiveKeyContainer = hybridContainer->getEffectiveKeyContainer();
+
+        // Extract keys using the effective container's keys_ and current level's row pointers
+        effectiveKeyContainer->getKeys()->extractColumn(
             levelBuildPtrs->data(),
             numRows,
             source.columnIndex,
@@ -4457,7 +4448,12 @@ inline void HybridContainer::extractColumnsFromUpstreamWithIndices(
           }
         }
 
-        hybridContainer->getKeys()->extractColumn(
+        // For pointer reuse mode: use getEffectiveKeyContainer() to get the
+        // actual key owner. In pointer reuse, J2 stores pointers to J1's rows,
+        // so we must extract from J1's keys_ layout, not J2's.
+        auto* effectiveKeyContainer = hybridContainer->getEffectiveKeyContainer();
+
+        effectiveKeyContainer->getKeys()->extractColumn(
             levelBuildPtrs->data(),
             numRows,
             source.columnIndex,
