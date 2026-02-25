@@ -557,6 +557,16 @@ void RowContainer::store(
   }
 }
 
+void RowContainer::storeColumnVelox(
+    const DecodedVector& decoded,
+    size_t size,
+    const std::vector<char*>& rows,
+    size_t column) {
+  for (size_t r = 0; r < size; ++r) {
+    store(decoded, r, rows[r], column);
+  }
+}
+
 std::unique_ptr<ByteInputStream> RowContainer::prepareRead(
     const char* row,
     int32_t offset) {

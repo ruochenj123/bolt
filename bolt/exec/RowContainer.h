@@ -346,6 +346,14 @@ class RowContainer {
       char* FOLLY_NONNULL row,
       int32_t column);
 
+  /// Velox-style store: stores all values from 'decoded' into 'rows' at 'column'.
+  /// Uses the existing store() method which handles type dispatch internally.
+  void storeColumnVelox(
+      const DecodedVector& decoded,
+      size_t size,
+      const std::vector<char*>& rows,
+      size_t column);
+
   template <TypeKind Kind>
   void storeColumn(
       const DecodedVector& decoded,

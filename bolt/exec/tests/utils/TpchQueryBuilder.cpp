@@ -227,6 +227,8 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ34Plan();
     case 35:
       return getQ35Plan();
+    case 40:
+      return getQ40Plan();
     default:
       BOLT_NYI("TPC-H query {} is not supported yet", queryId);
   }
@@ -3918,6 +3920,47 @@ TpchPlan TpchQueryBuilder::getQ35Plan() const {
   context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
   context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
   context.dataFiles[tPlanNodeId] = getTableFilePaths(kTableT);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q40: Configurable sort benchmark on lineitem
+// Uses 4 sort keys (l_linenumber, l_suppkey, l_partkey, l_orderkey)
+// and 16 columns (full lineitem schema)
+// 
+// This query tests hybrid sort performance on a simple TableScan -> Sort pattern
+// without join overhead.
+TpchPlan TpchQueryBuilder::getQ40Plan() const {
+  // Define sort keys (all numeric for deterministic ordering)
+  // Ordered by increasing cardinality: low cardinality first
+  std::vector<std::string> sortKeys = {
+      "l_linenumber",  // INTEGER - 1-7 values
+      "l_suppkey",     // BIGINT - ~10K unique values
+      "l_partkey",     // BIGINT - ~200K unique values
+      "l_orderkey"     // BIGINT - ~60M unique values
+  };
+  
+  // Full lineitem schema (16 columns)
+  const auto& selectedColumns = kTables_.at(kLineitem);
+  
+  const auto selectedRowType = getRowType(kLineitem, selectedColumns);
+  const auto& fileColumnNames = getFileColumnNames(kLineitem);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId lineitemPlanNodeId;
+
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .filtersAsNode(filtersAsNode_)
+          .tableScan(kLineitem, selectedRowType, fileColumnNames)
+          .captureScanNodeId(lineitemPlanNodeId)
+          .orderBy(sortKeys, false)
+          .planNode();
+
+  TpchPlan context;
+  context.planName = "q40_4keys_16cols";
+  context.plan = std::move(plan);
+  context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
   context.dataFileFormat = format_;
   return context;
 }

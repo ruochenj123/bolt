@@ -264,11 +264,7 @@ void SortBuffer::addInput(const VectorPtr& input) {
     for (const auto& columnProjection : columnMap_) {
       DecodedVector decoded(
           *inputRow->childAt(columnProjection.outputChannel), allRows);
-      auto kind =
-          inputRow->childAt(columnProjection.outputChannel)->type()->kind();
-      BOLT_DYNAMIC_TYPE_DISPATCH(
-          data_->storeColumn,
-          kind,
+      data_->storeColumnVelox(
           decoded,
           input->size(),
           rows,
