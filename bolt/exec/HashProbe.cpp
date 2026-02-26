@@ -245,8 +245,7 @@ HashProbe::HashProbe(
             << ", isNWayLateMOutput_=" << isNWayLateMOutput_
             << ", isFinalProbeBeforeSort_=" << isFinalProbeBeforeSort_
             << ", isFinalMaterializationProbe_=" << isFinalMaterializationProbe_
-            << ", hasDownstreamHashBuild=" << hasDownstreamHashBuild
-            << ", pointerReuseEligibleNodeIds.size()=" << driverCtx->pointerReuseEligibleNodeIds.size();
+            << ", hasDownstreamHashBuild=" << hasDownstreamHashBuild;
 }
 
 void HashProbe::initialize() {
@@ -575,16 +574,18 @@ void HashProbe::asyncWaitForHashTable() {
   useFinalMaterializationPath_ = isFinalMaterializationProbe_ && tableHasLateMMetadata;
 
   // Check if pointer reuse mode should be enabled for intermediate late-m output.
-  // This requires: config enabled, planner detected same keys, intermediate late-m mode,
-  // valid container, and a join type that doesn't need right-side iteration.
+  // This requires: config enabled, planner detected same keys for DOWNSTREAM build,
+  // intermediate late-m mode, valid container, and a join type that doesn't need right-side iteration.
+  // Note: We check downstreamPointerReuseEligibleProbeIds (this probe's ID) not
+  // pointerReuseEligibleNodeIds (downstream build's ID).
   const bool joinTypeSupportsPointerReuse = !isRightJoin(joinType_) &&
       !isFullJoin(joinType_) && !isRightSemiFilterJoin(joinType_) &&
       !isRightSemiProjectJoin(joinType_);
   pointerReuseEnabled_ = useLateMOutputPath_ &&
       operatorCtx_->driverCtx()->queryConfig().hybridJoinPointerReuseEnabled() &&
-      (operatorCtx_->driverCtx()->pointerReuseEligibleNodeIds.count(planNodeId()) > 0) &&  // Planner detected same keys for THIS join
+      (operatorCtx_->driverCtx()->downstreamPointerReuseEligibleProbeIds.count(planNodeId()) > 0) &&  // THIS probe feeds reuse-eligible build
       table_->hybridData() && joinTypeSupportsPointerReuse;
-
+  
   maybeSetupSpillInput(
       hashBuildResult->restoredPartitionId,
       hashBuildResult->spillPartitionIds,
@@ -2097,11 +2098,46 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
   // Data flow:
   // - For key columns (precomputed): materialize in output for downstream HashBuild
   // - For non-key columns: store in containers only (deferred materialization)
+
+  auto* driverCtx = operatorCtx_->driverCtx();
+
+  // FAST PATH: Pointer reuse mode with no probe payload columns.
+  // Just pass raw row pointers directly - minimal overhead.
+  if (pointerReuseEnabled_ && probePayloadProjections_.empty()) {
+    // Copy columnSourceMap once (needed for final materialization chain)
+    if (!columnSourceMapUpdated_) {
+      if (table_->hybridData()) {
+        driverCtx->columnSourceMap = table_->hybridData()->getColumnSourceMap();
+      }
+      updateColumnSourceMapForOutput();
+    }
+
+    // Pass outputTableRows_ directly - no unwrapping needed.
+    // Downstream HashBuild will store these as upstream refs.
+    // VirtualRow chain is followed at final materialization, not here.
+    driverCtx->buildSideLateMBuildRowPtrs.assign(
+        outputTableRows_.begin(), outputTableRows_.begin() + size);
+    
+    // ProbeRowIds are only needed if there are probe-side payload columns.
+    // Since probePayloadProjections_ is empty, we can use dummy values.
+    driverCtx->buildSideLateMProbeRowIds.resize(size);
+    // No need to populate with real IDs - they won't be used
+    
+    prepareOutput(size);
+    return;
+  }
+  
+  // Log once per operator if we're NOT taking the fast path in reuse mode
+  static thread_local bool loggedOnce = false;
+  if (pointerReuseEnabled_ && !loggedOnce) {
+    LOG(WARNING) << "[HashProbe] planNodeId=" << planNodeId()
+                 << " NOT taking fast path: probePayloadProjections_.size()=" 
+                 << probePayloadProjections_.size();
+    loggedOnce = true;
+  }
   // 
   // Note: probeKeyProjections_, probePayloadProjections_, buildKeyProjections_,
   // buildKeyChannelMapping_ are precomputed once in initialize()
-
-  auto* driverCtx = operatorCtx_->driverCtx();
 
   // 0. Unwrap VirtualRow pointers once at the beginning.
   // In pointer reuse mode, outputTableRows_ contains VirtualRow* pointers.
@@ -2168,9 +2204,12 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
   updateColumnSourceMapForOutput();
 
   // 5. For pointer reuse mode: skip output materialization entirely.
-  // Just pass row pointers through driverCtx; return nullptr to indicate no vectors.
+  // Data is passed through driverCtx (buildSideLateMBuildRowPtrs/ProbeRowIds).
+  // But we must return a non-null RowVector so the pipeline continues.
+  // Downstream HashBuild ignores vector content in pointer reuse mode.
   if (pointerReuseEnabled_) {
-    output_ = nullptr;
+    prepareOutput(size);
+    // Leave all children as nullptr - HashBuild reads from driverCtx
     return;
   }
 

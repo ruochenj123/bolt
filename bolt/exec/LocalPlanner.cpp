@@ -442,7 +442,12 @@ void detectNWayJoinChains(
   std::unordered_set<core::PlanNodeId> sortMaterializationNodeIds;
 
   // Set of join nodes where pointer reuse is eligible (downstream keys match upstream keys)
+  // Used by HashBuild to check if THIS build should use pointer reuse.
   std::unordered_set<core::PlanNodeId> pointerReuseEligibleNodeIds;
+  
+  // Set of probe nodes whose DOWNSTREAM build is pointer-reuse eligible.
+  // Used by HashProbe to check if it should skip key extraction.
+  std::unordered_set<core::PlanNodeId> downstreamPointerReuseEligibleProbeIds;
   
   // Set of OrderBy nodes where Sort pointer reuse is eligible (sort keys match join keys)
   std::unordered_set<core::PlanNodeId> sortPointerReuseEligibleNodeIds;
@@ -595,7 +600,8 @@ void detectNWayJoinChains(
                 }
                 bool exactKeysMatch = (innerRightKeyNames == parentRightKeyNames);
                 if (exactKeysMatch && !parentJoin->rightKeys().empty()) {
-                  pointerReuseEligibleNodeIds.insert(parentJoin->id());
+                  pointerReuseEligibleNodeIds.insert(parentJoin->id());  // For HashBuild (J2)
+                  downstreamPointerReuseEligibleProbeIds.insert(innerJoin->id());  // For HashProbe (J1)
                 }
               }
               probeToDownstreamKeyChannels[innerJoin->id()] = keyChannels;
@@ -695,6 +701,10 @@ void detectNWayJoinChains(
           factories[i]->nWayPointerReuseEligibleNodeIds.insert(
               factories[i]->consumerNode->id());
         }
+        // Propagate downstream pointer reuse eligibility for probes in this factory
+        if (downstreamPointerReuseEligibleProbeIds.count(node->id()) > 0) {
+          factories[i]->nWayDownstreamPointerReuseEligibleProbeIds.insert(node->id());
+        }
         
         factoryMarked = true;
         break; // Factory marked, move to next factory
@@ -725,6 +735,10 @@ void detectNWayJoinChains(
         if (pointerReuseEligibleNodeIds.count(factories[i]->consumerNode->id()) > 0) {
           factories[i]->nWayPointerReuseEligibleNodeIds.insert(
               factories[i]->consumerNode->id());
+        }
+        // Also propagate downstream probe eligibility for probes in base factory
+        if (downstreamPointerReuseEligibleProbeIds.count(factories[i]->consumerNode->id()) > 0) {
+          factories[i]->nWayDownstreamPointerReuseEligibleProbeIds.insert(factories[i]->consumerNode->id());
         }
       }
     }
@@ -945,6 +959,7 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     ctx->downstreamBuildKeyChannels = nWayDownstreamBuildKeyChannels;
     ctx->downstreamSortKeyChannels = nWayDownstreamSortKeyChannels;
     ctx->pointerReuseEligibleNodeIds = nWayPointerReuseEligibleNodeIds;
+    ctx->downstreamPointerReuseEligibleProbeIds = nWayDownstreamPointerReuseEligibleProbeIds;
   }
 
   std::vector<std::unique_ptr<Operator>> operators;

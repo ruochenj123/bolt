@@ -356,7 +356,12 @@ struct DriverCtx {
 
   /// Set of plan node IDs eligible for pointer reuse optimization.
   /// Only operators with their planNodeId in this set should enable pointer reuse.
+  /// Used by HashBuild to check if THIS build should reuse pointers.
   std::set<core::PlanNodeId> pointerReuseEligibleNodeIds;
+
+  /// Set of probe node IDs whose DOWNSTREAM build is pointer-reuse eligible.
+  /// Used by HashProbe to check if it should skip key extraction.
+  std::set<core::PlanNodeId> downstreamPointerReuseEligibleProbeIds;
 
   /// Clear batch-level state between batches
   void clearBatchState() {
@@ -741,7 +746,12 @@ struct DriverFactory {
 
   /// Set of plan node IDs eligible for pointer reuse optimization in this factory.
   /// Operators check if their planNodeId is in this set before enabling pointer reuse.
+  /// Used by HashBuild.
   std::set<core::PlanNodeId> nWayPointerReuseEligibleNodeIds;
+
+  /// Set of probe node IDs whose downstream build is pointer-reuse eligible.
+  /// Used by HashProbe to skip key extraction.
+  std::set<core::PlanNodeId> nWayDownstreamPointerReuseEligibleProbeIds;
 
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,
