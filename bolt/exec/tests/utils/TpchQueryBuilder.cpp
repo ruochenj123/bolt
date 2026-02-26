@@ -40,6 +40,7 @@
 
 DECLARE_int32(s_selectivity_pct);
 DECLARE_int32(t_selectivity_pct);
+DECLARE_int32(u_selectivity_pct);
 
 namespace bytedance::bolt::exec::test {
 
@@ -232,6 +233,8 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ34Plan();
     case 35:
       return getQ35Plan();
+    case 36:
+      return getQ36Plan();
     case 40:
       return getQ40Plan();
     default:
@@ -3870,42 +3873,44 @@ TpchPlan TpchQueryBuilder::getQ34Plan() const {
   return context;
 }
 
-// Q35: Minimal columns for pointer reuse testing
-// Pattern: T (probe₂) × (S × R) (build₂) -> Sort
-// Only join keys + 1 payload for verification
-// Q35: N-way join with DIFFERENT keys for J2 (to test pointer reuse is DISABLED)
-// Pattern: T (probe₂) × (S × R) (build₂) -> Sort
-// J1 uses R's key columns (row_id, l_suppkey, l_returnflag, l_linestatus)
-// J2 uses R's PAYLOAD column (l_orderkey) as key - NOT in J1's keys!
-// This should DISABLE pointer reuse since J2 build keys are NOT in R's keys
+// Q35: 3-way join: R × S × T × U
+// Pattern: U (probe₃) × (T × (S × R))
+// Extends Q33 by adding a 4th table U
 TpchPlan TpchQueryBuilder::getQ35Plan() const {
-  // q35: Test case where J2 uses only 2 of J1's 4 keys  
-  // This tests that pointer reuse requires EXACT same keys
-  // J1: 4 keys (row_id, l_suppkey, l_returnflag, l_linestatus)
-  // J2: 2 keys (row_id, l_suppkey) - subset of J1's keys
-  // Expected: pointer reuse DISABLED (exact match required)
+  // Validate selectivity values
+  auto validateSelectivity = [](int pct, const char* name) {
+    BOLT_CHECK(
+        pct == 10 || pct == 30 || pct == 60 || pct == 90 || pct == 100,
+        "{} must be 10, 30, 60, 90, or 100, got {}",
+        name,
+        pct);
+  };
+  validateSelectivity(FLAGS_s_selectivity_pct, "s_selectivity_pct");
+  validateSelectivity(FLAGS_t_selectivity_pct, "t_selectivity_pct");
+  validateSelectivity(FLAGS_u_selectivity_pct, "u_selectivity_pct");
 
-  // R columns: 4 join keys + payload  
+  // R columns (build₁) - 4 keys + 8 payloads = 12 total
   std::vector<std::string> rColumns = {
-      "row_id",           // join key for J1 AND J2
-      "l_suppkey",        // join key for J1 AND J2
-      "l_returnflag",     // join key for J1 only
-      "l_linestatus",     // join key for J1 only
-      "l_orderkey"        // payload
+      "row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+      "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+      "l_extendedprice", "l_discount", "l_tax", "l_comment"
   };
 
-  // S columns: 4 keys for J1
+  // S columns (probe₁) - join keys + s_orderkey for selectivity filter
   std::vector<std::string> sColumns = {
-      "row_id",           // join key
-      "l_suppkey",        // join key
-      "l_returnflag",     // join key
-      "l_linestatus"      // join key
+      "row_id", "l_suppkey", "l_returnflag", "l_linestatus", "s_orderkey"
   };
 
-  // T columns: only 2 keys (subset of J1's 4 keys)
+  // T columns (probe₂) - 4 join keys + 4 payloads
   std::vector<std::string> tColumns = {
-      "t_row_id",         // join key for J2
-      "t_suppkey"         // join key for J2
+      "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
+      "t_payload1", "t_payload2", "t_payload3", "t_payload4"
+  };
+
+  // U columns (probe₃) - uses same parquet schema as T
+  std::vector<std::string> uColumns = {
+      "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
+      "t_payload1", "t_payload2", "t_payload3", "t_payload4"
   };
 
   auto rSelectedRowType = getRowType(kTableR, rColumns);
@@ -3914,11 +3919,161 @@ TpchPlan TpchQueryBuilder::getQ35Plan() const {
   const auto& sFileColumns = getFileColumnNames(kTableS);
   auto tSelectedRowType = getRowType(kTableT, tColumns);
   const auto& tFileColumns = getFileColumnNames(kTableT);
+  auto uSelectedRowType = getRowType(kTableU, uColumns);
+  const auto& uFileColumns = getFileColumnNames(kTableU);
 
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
   core::PlanNodeId rPlanNodeId;
   core::PlanNodeId sPlanNodeId;
   core::PlanNodeId tPlanNodeId;
+  core::PlanNodeId uPlanNodeId;
+
+  // Build side for first join: R (has payloads)
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, rSelectedRowType, rFileColumns)
+               .captureScanNodeId(rPlanNodeId)
+               .planNode();
+
+  // First join: S (probe₁) × R (build₁) on 4 keys
+  PlanBuilder sBuilder(planNodeIdGenerator, pool_.get());
+  sBuilder.filtersAsNode(filtersAsNode_)
+          .tableScan(kTableS, sSelectedRowType, sFileColumns)
+          .captureScanNodeId(sPlanNodeId);
+
+  if (FLAGS_s_selectivity_pct < 100) {
+    int threshold = FLAGS_s_selectivity_pct / 10;
+    sBuilder.filter(fmt::format("(s_orderkey % 10) < {}", threshold));
+  }
+
+  auto sJoinR = sBuilder
+      .project({"row_id AS s_row_id", "l_suppkey AS s_suppkey",
+                "l_returnflag AS s_returnflag", "l_linestatus AS s_linestatus"})
+      .hashJoin(
+          {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},
+          r, "",
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+           "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+           "l_extendedprice", "l_discount", "l_tax", "l_comment"})
+      .planNode();
+
+  // Second join: T (probe₂) × sJoinR (build₂) on 4 keys
+  PlanBuilder tBuilder(planNodeIdGenerator, pool_.get());
+  tBuilder.filtersAsNode(filtersAsNode_)
+          .tableScan(kTableT, tSelectedRowType, tFileColumns)
+          .captureScanNodeId(tPlanNodeId);
+
+  if (FLAGS_t_selectivity_pct < 100) {
+    int threshold = FLAGS_t_selectivity_pct / 10;
+    tBuilder.filter(fmt::format("(t_row_id % 10) < {}", threshold));
+  }
+
+  auto tJoinSR = tBuilder
+      .hashJoin(
+          {"t_row_id", "t_suppkey", "t_returnflag", "t_linestatus"},
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},
+          sJoinR, "",
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+           "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+           "l_extendedprice", "l_discount", "l_tax", "l_comment",
+           "t_payload1", "t_payload2", "t_payload3", "t_payload4"})
+      .planNode();
+
+  // Third join: U (probe₃) × tJoinSR (build₃) on 4 keys
+  // Scan U (uses T's parquet schema with t_* columns), rename to u_* for join
+  PlanBuilder uBuilder(planNodeIdGenerator, pool_.get());
+  uBuilder.filtersAsNode(filtersAsNode_)
+          .tableScan(kTableU, uSelectedRowType, uFileColumns)
+          .captureScanNodeId(uPlanNodeId);
+
+  if (FLAGS_u_selectivity_pct < 100) {
+    int threshold = FLAGS_u_selectivity_pct / 10;
+    uBuilder.filter(fmt::format("(t_row_id % 10) < {}", threshold));
+  }
+
+  auto plan = uBuilder
+      .project({"t_row_id AS u_row_id", "t_suppkey AS u_suppkey",
+                "t_returnflag AS u_returnflag", "t_linestatus AS u_linestatus",
+                "t_payload1 AS u_payload1", "t_payload2 AS u_payload2",
+                "t_payload3 AS u_payload3", "t_payload4 AS u_payload4"})
+      .hashJoin(
+          {"u_row_id", "u_suppkey", "u_returnflag", "u_linestatus"},
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},
+          tJoinSR, "",
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+           "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+           "l_extendedprice", "l_discount", "l_tax", "l_comment",
+           "t_payload1", "t_payload2", "t_payload3", "t_payload4",
+           "u_payload1", "u_payload2", "u_payload3", "u_payload4"})
+      .planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format(
+      "q35_sSel{}pct_tSel{}pct_uSel{}pct",
+      FLAGS_s_selectivity_pct, FLAGS_t_selectivity_pct, FLAGS_u_selectivity_pct);
+  context.plan = std::move(plan);
+  context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
+  context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
+  context.dataFiles[tPlanNodeId] = getTableFilePaths(kTableT);
+  context.dataFiles[uPlanNodeId] = getTableFilePaths(kTableU);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q36: Q35 + Sort (3-way join with Sort)
+// Pattern: U (probe₃) × (T × (S × R)) -> Sort
+TpchPlan TpchQueryBuilder::getQ36Plan() const {
+  // Validate selectivity values
+  auto validateSelectivity = [](int pct, const char* name) {
+    BOLT_CHECK(
+        pct == 10 || pct == 30 || pct == 60 || pct == 90 || pct == 100,
+        "{} must be 10, 30, 60, 90, or 100, got {}",
+        name,
+        pct);
+  };
+  validateSelectivity(FLAGS_s_selectivity_pct, "s_selectivity_pct");
+  validateSelectivity(FLAGS_t_selectivity_pct, "t_selectivity_pct");
+  validateSelectivity(FLAGS_u_selectivity_pct, "u_selectivity_pct");
+
+  // R columns (build₁) - 4 keys + 8 payloads
+  std::vector<std::string> rColumns = {
+      "row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+      "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+      "l_extendedprice", "l_discount", "l_tax", "l_shipdate"
+  };
+
+  // S columns (probe₁)
+  std::vector<std::string> sColumns = {
+      "row_id", "l_suppkey", "l_returnflag", "l_linestatus", "s_orderkey"
+  };
+
+  // T columns (probe₂)
+  std::vector<std::string> tColumns = {
+      "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
+      "t_payload1", "t_payload2", "t_payload3", "t_payload4"
+  };
+
+  // U columns (probe₃) - uses same parquet schema as T
+  std::vector<std::string> uColumns = {
+      "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
+      "t_payload1", "t_payload2", "t_payload3", "t_payload4"
+  };
+
+  auto rSelectedRowType = getRowType(kTableR, rColumns);
+  const auto& rFileColumns = getFileColumnNames(kTableR);
+  auto sSelectedRowType = getRowType(kTableS, sColumns);
+  const auto& sFileColumns = getFileColumnNames(kTableS);
+  auto tSelectedRowType = getRowType(kTableT, tColumns);
+  const auto& tFileColumns = getFileColumnNames(kTableT);
+  auto uSelectedRowType = getRowType(kTableU, uColumns);
+  const auto& uFileColumns = getFileColumnNames(kTableU);
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId rPlanNodeId;
+  core::PlanNodeId sPlanNodeId;
+  core::PlanNodeId tPlanNodeId;
+  core::PlanNodeId uPlanNodeId;
 
   // Build side for first join: R
   auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -3927,55 +4082,89 @@ TpchPlan TpchQueryBuilder::getQ35Plan() const {
                .captureScanNodeId(rPlanNodeId)
                .planNode();
 
-  // First join: S (probe₁) × R (build₁) on 4 keys
-  auto sJoinR =
-      PlanBuilder(planNodeIdGenerator, pool_.get())
-          .filtersAsNode(filtersAsNode_)
+  // First join: S × R
+  PlanBuilder sBuilder(planNodeIdGenerator, pool_.get());
+  sBuilder.filtersAsNode(filtersAsNode_)
           .tableScan(kTableS, sSelectedRowType, sFileColumns)
-          .captureScanNodeId(sPlanNodeId)
-          .project({"row_id AS s_row_id",
-                    "l_suppkey AS s_suppkey",
-                    "l_returnflag AS s_returnflag",
-                    "l_linestatus AS s_linestatus"})
-          .hashJoin(
-              {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},  // 4 probe keys  
-              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},    // 4 build keys (R's keys)
-              r,
-              "",
-              {"row_id",           // from R
-               "l_suppkey",        // from R  
-               "l_returnflag",     // from R
-               "l_linestatus",     // from R
-               "l_orderkey"})      // from R (payload)
-          .planNode();
+          .captureScanNodeId(sPlanNodeId);
 
-  // Second join: T (probe₂) × sJoinR (build₂)
-  // J2 keys: (row_id, l_suppkey) - only 2 of J1's 4 keys!
-  // This should DISABLE pointer reuse (requires exact same keys)
-  auto plan =
-      PlanBuilder(planNodeIdGenerator, pool_.get())
-          .filtersAsNode(filtersAsNode_)
+  if (FLAGS_s_selectivity_pct < 100) {
+    int threshold = FLAGS_s_selectivity_pct / 10;
+    sBuilder.filter(fmt::format("(s_orderkey % 10) < {}", threshold));
+  }
+
+  auto sJoinR = sBuilder
+      .project({"row_id AS s_row_id", "l_suppkey AS s_suppkey",
+                "l_returnflag AS s_returnflag", "l_linestatus AS s_linestatus"})
+      .hashJoin(
+          {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},
+          r, "",
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+           "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+           "l_extendedprice", "l_discount", "l_tax", "l_shipdate"})
+      .planNode();
+
+  // Second join: T × (S × R)
+  PlanBuilder tBuilder(planNodeIdGenerator, pool_.get());
+  tBuilder.filtersAsNode(filtersAsNode_)
           .tableScan(kTableT, tSelectedRowType, tFileColumns)
-          .captureScanNodeId(tPlanNodeId)
-          .hashJoin(
-              {"t_row_id", "t_suppkey"},  // T's keys: 2 keys only
-              {"row_id", "l_suppkey"},    // Build keys: 2 keys (subset of J1's 4)
-              sJoinR,
-              "",
-              {"row_id",           // from R
-               "l_suppkey",        // from R
-               "l_returnflag",     // from R
-               "l_linestatus",     // from R
-               "l_orderkey"})      // from R
-          .orderBy({"row_id", "l_suppkey", "l_returnflag", "l_linestatus"}, false)
-          .planNode();
+          .captureScanNodeId(tPlanNodeId);
+
+  if (FLAGS_t_selectivity_pct < 100) {
+    int threshold = FLAGS_t_selectivity_pct / 10;
+    tBuilder.filter(fmt::format("(t_row_id % 10) < {}", threshold));
+  }
+
+  auto tJoinSR = tBuilder
+      .hashJoin(
+          {"t_row_id", "t_suppkey", "t_returnflag", "t_linestatus"},
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},
+          sJoinR, "",
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+           "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+           "l_extendedprice", "l_discount", "l_tax", "l_shipdate",
+           "t_payload1", "t_payload2", "t_payload3", "t_payload4"})
+      .planNode();
+
+  // Third join: U × (T × (S × R)) -> Sort
+  // Scan U (uses T's parquet schema with t_* columns), rename to u_* for join
+  PlanBuilder uBuilder(planNodeIdGenerator, pool_.get());
+  uBuilder.filtersAsNode(filtersAsNode_)
+          .tableScan(kTableU, uSelectedRowType, uFileColumns)
+          .captureScanNodeId(uPlanNodeId);
+
+  if (FLAGS_u_selectivity_pct < 100) {
+    int threshold = FLAGS_u_selectivity_pct / 10;
+    uBuilder.filter(fmt::format("(t_row_id % 10) < {}", threshold));
+  }
+
+  auto plan = uBuilder
+      .project({"t_row_id AS u_row_id", "t_suppkey AS u_suppkey",
+                "t_returnflag AS u_returnflag", "t_linestatus AS u_linestatus",
+                "t_payload1 AS u_payload1", "t_payload2 AS u_payload2",
+                "t_payload3 AS u_payload3", "t_payload4 AS u_payload4"})
+      .hashJoin(
+          {"u_row_id", "u_suppkey", "u_returnflag", "u_linestatus"},
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},
+          tJoinSR, "",
+          {"row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+           "l_orderkey", "l_partkey", "l_linenumber", "l_quantity",
+           "l_extendedprice", "l_discount", "l_tax", "l_shipdate",
+           "t_payload1", "t_payload2", "t_payload3", "t_payload4",
+           "u_payload1", "u_payload2", "u_payload3", "u_payload4"})
+      .orderBy({"row_id", "l_suppkey", "l_returnflag", "l_linestatus"}, false)
+      .planNode();
 
   TpchPlan context;
-  context.planName = "q35";
+  context.planName = fmt::format(
+      "q36_sSel{}pct_tSel{}pct_uSel{}pct",
+      FLAGS_s_selectivity_pct, FLAGS_t_selectivity_pct, FLAGS_u_selectivity_pct);
   context.plan = std::move(plan);
   context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
   context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
   context.dataFiles[tPlanNodeId] = getTableFilePaths(kTableT);
+  context.dataFiles[uPlanNodeId] = getTableFilePaths(kTableU);
   context.dataFileFormat = format_;
   return context;
 }
@@ -4032,7 +4221,8 @@ const std::vector<std::string> TpchQueryBuilder::kTableNames_ = {
     kPartsupp,
     kTableR,
     kTableS,
-    kTableT};
+    kTableT,
+    kTableU};
 
 const std::unordered_map<std::string, std::vector<std::string>>
     TpchQueryBuilder::kTables_ = {
@@ -4076,6 +4266,12 @@ const std::unordered_map<std::string, std::vector<std::string>>
             "T",
             std::vector<std::string>{
                 "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
-                "t_payload1", "t_payload2", "t_payload3", "t_payload4", "t_payload5"})};  // 4 join keys + 5 payloads
+                "t_payload1", "t_payload2", "t_payload3", "t_payload4", "t_payload5"}),  // 4 join keys + 5 payloads
+        // U uses same schema as T (will reuse T's data files)
+        std::make_pair(
+            "U",
+            std::vector<std::string>{
+                "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
+                "t_payload1", "t_payload2", "t_payload3", "t_payload4", "t_payload5"})};  // Same columns as T, renamed in query
 
 } // namespace bytedance::bolt::exec::test

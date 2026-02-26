@@ -141,9 +141,10 @@ class TpchQueryBuilder {
   // Custom join benchmark queries using R, S, T tables
   TpchPlan getQ31Plan() const;  // S JOIN R -> Sort (2-way, 16 output cols)
   TpchPlan getQ32Plan() const;  // T JOIN (S JOIN R) -> Sort (3-way N-way, 16 output cols)
-  TpchPlan getQ33Plan() const;  // T JOIN (S JOIN R) (3-way N-way without Sort, 16 output cols)
-  TpchPlan getQ34Plan() const;  // Q33 + Sort (for correctness verification)
-  TpchPlan getQ35Plan() const;  // Minimal columns for pointer reuse testing (join keys + 1 payload)
+  TpchPlan getQ33Plan() const;  // T JOIN (S JOIN R) (2-way N-way without Sort)
+  TpchPlan getQ34Plan() const;  // Q33 + Sort (2-way with Sort)
+  TpchPlan getQ35Plan() const;  // U JOIN (T JOIN (S JOIN R)) (3-way N-way without Sort)
+  TpchPlan getQ36Plan() const;  // Q35 + Sort (3-way with Sort)
   TpchPlan getQ40Plan() const;  // Configurable sort benchmark on lineitem (4 sort keys, 16 cols)
 
   const std::vector<std::string>& getTableFilePaths(
@@ -183,6 +184,7 @@ class TpchQueryBuilder {
   static constexpr const char* kTableR = "R";
   static constexpr const char* kTableS = "S";
   static constexpr const char* kTableT = "T";
+  static constexpr const char* kTableU = "U";
   std::shared_ptr<memory::MemoryPool> pool_ =
       memory::memoryManager()->addLeafPool();
   const bool filtersAsNode_;

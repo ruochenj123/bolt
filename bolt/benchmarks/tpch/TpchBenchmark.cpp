@@ -78,6 +78,10 @@ DEFINE_int32(
     t_selectivity_pct,
     100,
     "Selectivity percentage for T table in Q34 (10, 30, 60, 90, or 100)");
+DEFINE_int32(
+    u_selectivity_pct,
+    100,
+    "Selectivity percentage for U table in Q35/Q36 (10, 30, 60, 90, or 100)");
 
 std::shared_ptr<TpchQueryBuilder> queryBuilder;
 

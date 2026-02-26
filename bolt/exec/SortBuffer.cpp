@@ -30,6 +30,7 @@
 
 #include "SortBuffer.h"
 #include <algorithm>
+#include <numeric>
 #include "HashTable.h"
 #include "Spiller.h"
 #include "bolt/exec/MemoryReclaimer.h"
@@ -336,38 +337,40 @@ void SortBuffer::noMoreInput() {
       
       MicrosecondTimer timer(&sortInSortTimeUs_);
       
-      // Sort using upstream RowContainer for comparison
+      // Use indexed sort (argsort) to track permutation for probeRowIds
+      // Create index array: indices[i] = i initially
+      std::vector<size_t> indices(sortedRows_.size());
+      std::iota(indices.begin(), indices.end(), 0);
+      
+      // Sort indices by comparing the corresponding row pointers
       auto* cmpContainer = comparisonRowContainer_;
       sorter_.sort(
-          sortedRows_.begin(),
-          sortedRows_.end(),
-          [cmpContainer, this](const char* leftRow, const char* rightRow) {
+          indices.begin(),
+          indices.end(),
+          [cmpContainer, this](size_t i, size_t j) {
             for (vector_size_t index = 0; index < sortCompareFlags_.size();
                  ++index) {
               if (auto result = cmpContainer->compare(
-                      leftRow, rightRow, index, sortCompareFlags_[index])) {
+                      sortedRows_[i], sortedRows_[j], index, sortCompareFlags_[index])) {
                 return result < 0;
               }
             }
             return false;
           });
       
-      // For pointer reuse, sortedRows_ ARE the sorted build row pointers
-      // We also need to reorder probeRowIds to match
-      if (!lateMProbeRowIds_.empty()) {
-        // In pointer reuse mode, we stored probeRowIds in the same order as buildRowPtrs
-        // Now we need to create a mapping of old index -> new index
-        // This requires tracking original indices, which we didn't do...
-        // For simplicity, set sortedProbeRowIds_ = lateMProbeRowIds_ 
-        // (order doesn't matter for probe-side since we extract by pointer)
-        // Actually, we need to track the permutation during sort.
-        
-        // TODO: For now, we'll use the sortedRows_ as sortedBuildRowPtrs_
-        // and NOT reorder probeRowIds (they're used with buildRowPtrs indices)
-        sortedBuildRowPtrs_ = sortedRows_;
-        sortedProbeRowIds_ = std::move(lateMProbeRowIds_);
-        lateMProbeRowIds_.clear();
+      // Apply permutation to both buildRowPtrs and probeRowIds
+      sortedBuildRowPtrs_.resize(indices.size());
+      sortedProbeRowIds_.resize(indices.size());
+      for (size_t i = 0; i < indices.size(); ++i) {
+        sortedBuildRowPtrs_[i] = sortedRows_[indices[i]];
+        sortedProbeRowIds_[i] = lateMProbeRowIds_[indices[i]];
       }
+      
+      // Clear originals to free memory
+      sortedRows_.clear();
+      sortedRows_.shrink_to_fit();
+      lateMProbeRowIds_.clear();
+      lateMProbeRowIds_.shrink_to_fit();
     } else {
       // Standard sorting path
       BOLT_CHECK_EQ(numInputRows_, data_->numRows());

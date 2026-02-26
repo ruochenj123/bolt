@@ -581,10 +581,22 @@ void HashProbe::asyncWaitForHashTable() {
   const bool joinTypeSupportsPointerReuse = !isRightJoin(joinType_) &&
       !isFullJoin(joinType_) && !isRightSemiFilterJoin(joinType_) &&
       !isRightSemiProjectJoin(joinType_);
-  pointerReuseEnabled_ = useLateMOutputPath_ &&
+  
+  // Pointer reuse for intermediate late-m output (feeds downstream HashBuild)
+  const bool intermediatePointerReuse = useLateMOutputPath_ &&
       operatorCtx_->driverCtx()->queryConfig().hybridJoinPointerReuseEnabled() &&
-      (operatorCtx_->driverCtx()->downstreamPointerReuseEligibleProbeIds.count(planNodeId()) > 0) &&  // THIS probe feeds reuse-eligible build
+      (operatorCtx_->driverCtx()->downstreamPointerReuseEligibleProbeIds.count(planNodeId()) > 0) &&
       table_->hybridData() && joinTypeSupportsPointerReuse;
+  
+  // Pointer reuse for final probe before Sort (Sort does materialization)
+  // When Sort is the materialization point and sortPointerReuseEnabled is true,
+  // this probe can pass raw row pointers directly to Sort for sorting.
+  const bool sortPointerReuse = isFinalProbeBeforeSort_ &&
+      operatorCtx_->driverCtx()->queryConfig().hybridJoinPointerReuseEnabled() &&
+      operatorCtx_->driverCtx()->sortPointerReuseEnabled &&
+      table_->hybridData() && joinTypeSupportsPointerReuse;
+  
+  pointerReuseEnabled_ = intermediatePointerReuse || sortPointerReuse;
   
   maybeSetupSpillInput(
       hashBuildResult->restoredPartitionId,
@@ -2112,11 +2124,22 @@ void HashProbe::fillOutputLateMaterialization(vector_size_t size) {
       updateColumnSourceMapForOutput();
     }
 
-    // Pass outputTableRows_ directly - no unwrapping needed.
-    // Downstream HashBuild will store these as upstream refs.
-    // VirtualRow chain is followed at final materialization, not here.
-    driverCtx->buildSideLateMBuildRowPtrs.assign(
-        outputTableRows_.begin(), outputTableRows_.begin() + size);
+    // For downstream HashBuild: pass VirtualRow pointers directly.
+    // HashBuild's buildFromExternalPointers handles VirtualRow chains.
+    // For Sort (isFinalProbeBeforeSort_): unwrap VirtualRows first.
+    // Sort needs raw pointers into J1's container for direct comparison.
+    if (isFinalProbeBeforeSort_ && table_->isUsingVirtualRows()) {
+      driverCtx->buildSideLateMBuildRowPtrs.resize(size);
+      for (vector_size_t i = 0; i < size; ++i) {
+        const VirtualRow* vrow = table_->getVirtualRow(outputTableRows_[i]);
+        driverCtx->buildSideLateMBuildRowPtrs[i] = vrow->sourcePtr;
+      }
+    } else {
+      // Pass outputTableRows_ directly - no unwrapping needed.
+      // Downstream HashBuild will store these as upstream refs.
+      driverCtx->buildSideLateMBuildRowPtrs.assign(
+          outputTableRows_.begin(), outputTableRows_.begin() + size);
+    }
     
     // ProbeRowIds are only needed if there are probe-side payload columns.
     // Since probePayloadProjections_ is empty, we can use dummy values.

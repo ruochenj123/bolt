@@ -295,6 +295,10 @@ void HashBuild::setupTable() {
   lookup_->reset(1);
   analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
 
+  // TEST: Force kHash mode to confirm J2 probe slowdown hypothesis
+  // Remove this line after testing!
+  analyzeKeys_ = false;
+
   if (hybridJoin_) {
     table_->hybridData()->setId(static_cast<uint8_t>(driverId_));
     // Initialize allContainers_ with itself so spilling can work before table
