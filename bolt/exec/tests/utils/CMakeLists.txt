@@ -43,6 +43,7 @@ add_library(
   RowBasedSerde.cpp
   SumNonPODAggregate.cpp
   TpchQueryBuilder.cpp
+  TpcdsQueryBuilder.cpp
   VectorTestUtil.cpp
 )
 

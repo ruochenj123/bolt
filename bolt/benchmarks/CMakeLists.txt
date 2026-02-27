@@ -50,6 +50,7 @@ target_link_libraries(bolt_benchmark_builder GTest::gtest)
 
 if(${BOLT_ENABLE_BENCHMARKS})
   add_subdirectory(tpch)
+  add_subdirectory(tpcds)
 endif()
 
 add_library(bolt_query_benchmark QueryBenchmarkBase.cpp)

@@ -51,6 +51,7 @@
 #include "bolt/exec/Split.h"
 #include "bolt/exec/tests/utils/HiveConnectorTestBase.h"
 #include "bolt/exec/tests/utils/TpchQueryBuilder.h"
+#include "bolt/exec/tests/utils/TpcdsQueryBuilder.h"
 #include "bolt/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
 #include "bolt/parse/TypeResolver.h"
@@ -100,10 +101,18 @@ class QueryBenchmarkBase {
   std::pair<std::unique_ptr<exec::test::TaskCursor>, std::vector<RowVectorPtr>>
   run(const exec::test::TpchPlan& tpchPlan);
 
+  std::pair<std::unique_ptr<exec::test::TaskCursor>, std::vector<RowVectorPtr>>
+  run(const exec::test::TpcdsPlan& tpcdsPlan);
+
   virtual std::vector<std::shared_ptr<connector::ConnectorSplit>> listSplits(
       const std::string& path,
       int32_t numSplitsPerFile,
       const exec::test::TpchPlan& plan);
+
+  virtual std::vector<std::shared_ptr<connector::ConnectorSplit>> listSplits(
+      const std::string& path,
+      int32_t numSplitsPerFile,
+      const exec::test::TpcdsPlan& plan);
 
   static void ensureTaskCompletion(exec::Task* task);
 

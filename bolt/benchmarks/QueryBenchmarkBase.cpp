@@ -258,6 +258,20 @@ QueryBenchmarkBase::listSplits(
   return result;
 }
 
+std::vector<std::shared_ptr<connector::ConnectorSplit>>
+QueryBenchmarkBase::listSplits(
+    const std::string& path,
+    int32_t numSplitsPerFile,
+    const exec::test::TpcdsPlan& plan) {
+  std::vector<std::shared_ptr<connector::ConnectorSplit>> result;
+  auto temp = HiveConnectorTestBase::makeHiveConnectorSplits(
+      path, numSplitsPerFile, plan.dataFileFormat);
+  for (auto& i : temp) {
+    result.push_back(i);
+  }
+  return result;
+}
+
 void QueryBenchmarkBase::shutdown() {
   if (cache_) {
     cache_->shutdown();
@@ -321,6 +335,68 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
     }
   } catch (const std::exception& e) {
     LOG(ERROR) << "Query " << tpchPlan.planName
+               << " terminated with: " << e.what();
+    return {nullptr, std::vector<RowVectorPtr>()};
+  }
+}
+
+std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>>
+QueryBenchmarkBase::run(const TpcdsPlan& tpcdsPlan) {
+  int32_t repeat = 0;
+  try {
+    for (;;) {
+      CursorParameters params;
+      params.maxDrivers = FLAGS_num_drivers;
+      params.planNode = tpcdsPlan.plan;
+      params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
+          std::to_string(FLAGS_split_preload_per_driver);
+      if (FLAGS_hybrid_join_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinEnabled] = "true";
+      }
+      if (FLAGS_hybrid_sort_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridSortEnabled] = "true";
+      }
+      if (FLAGS_late_materialization_enabled) {
+        params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
+            "true";
+      }
+      if (FLAGS_hybrid_join_pointer_reuse_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] =
+            "true";
+      }
+      if (FLAGS_max_output_batch_rows != 10000) {
+        params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =
+            std::to_string(FLAGS_max_output_batch_rows);
+      }
+      if (FLAGS_preferred_output_batch_rows != 1024) {
+        params.queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] =
+            std::to_string(FLAGS_preferred_output_batch_rows);
+      }
+      const int numSplitsPerFile = FLAGS_num_splits_per_file;
+
+      bool noMoreSplits = false;
+      auto addSplits = [&](exec::Task* task) {
+        if (!noMoreSplits) {
+          for (const auto& entry : tpcdsPlan.dataFiles) {
+            for (const auto& path : entry.second) {
+              auto splits = listSplits(path, numSplitsPerFile, tpcdsPlan);
+              for (auto split : splits) {
+                task->addSplit(entry.first, exec::Split(std::move(split)));
+              }
+            }
+            task->noMoreSplits(entry.first);
+          }
+        }
+        noMoreSplits = true;
+      };
+      auto result = readCursor(params, addSplits);
+      ensureTaskCompletion(result.first->task().get());
+      if (++repeat >= FLAGS_num_repeats) {
+        return result;
+      }
+    }
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Query " << tpcdsPlan.planName
                << " terminated with: " << e.what();
     return {nullptr, std::vector<RowVectorPtr>()};
   }

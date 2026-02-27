@@ -2310,6 +2310,7 @@ class HybridContainer {
 
   // Coalesce all payload batches into a single batch to improve locality.
   void coalesceBatches() {
+    auto startTime = std::chrono::steady_clock::now();
     // Skip if no payload columns defined.
     if (payloadTypes_.empty()) {
       return;
@@ -2340,6 +2341,7 @@ class HybridContainer {
     }
 
     const auto totalRows = totalRows_;
+    const auto numBatches = owningInputs_.size();
 
     std::vector<VectorPtr> newChildren;
     newChildren.reserve(numPayloadCols);
@@ -2371,6 +2373,10 @@ class HybridContainer {
         std::move(newChildren)));
 
     totalBatches_ = 1;
+    auto endTime = std::chrono::steady_clock::now();
+    auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+    fprintf(stderr, "[PROFILE] HybridContainer::coalesceBatches: %zu batches, %ld rows, %zu cols -> %ld us\n",
+            numBatches, totalRows, numPayloadCols, durationUs);
   }
 
   /// Extracts columns from upstream sources using ColumnSourceMap.
@@ -3253,6 +3259,7 @@ class ProbePayloadContainer {
 
   /// Coalesce all batches into a single flat batch for efficient extraction.
   void coalesceBatches() {
+    auto startTime = std::chrono::steady_clock::now();
     if (coalesced_ || batches_.empty()) {
       coalesced_ = true;
       return;
@@ -3290,6 +3297,7 @@ class ProbePayloadContainer {
     // Multiple batches: coalesce into one
     auto& firstBatch = batches_[0];
     const auto numCols = firstBatch->childrenSize();
+    const auto numBatches = batches_.size();
     std::vector<VectorPtr> newChildren;
     newChildren.reserve(numCols);
 
@@ -3314,6 +3322,10 @@ class ProbePayloadContainer {
         std::move(newChildren)));
     totalBatches_ = 1;
     coalesced_ = true;
+    auto endTime = std::chrono::steady_clock::now();
+    auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+    fprintf(stderr, "[PROFILE] ProbePayloadContainer::coalesceBatches: %zu batches, %ld rows, %d cols -> %ld us\n",
+            numBatches, totalRows_, numCols, durationUs);
   }
 
   /// Clear all stored batches.
