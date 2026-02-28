@@ -64,10 +64,28 @@ class TpcdsQueryBuilder {
   // TPC-DS query plans
   TpcdsPlan getQ1Plan() const;
   TpcdsPlan getQ3Plan() const;
+  TpcdsPlan getQ7Plan() const;
   TpcdsPlan getQ10Plan() const;
+  TpcdsPlan getQ13Plan() const;
+  TpcdsPlan getQ15Plan() const;
+  TpcdsPlan getQ18Plan() const;
+  TpcdsPlan getQ19Plan() const;
+  TpcdsPlan getQ25Plan() const;
+  TpcdsPlan getQ26Plan() const;
+  TpcdsPlan getQ29Plan() const;
   TpcdsPlan getQ30Plan() const;
+  TpcdsPlan getQ42Plan() const;
+  TpcdsPlan getQ43Plan() const;
+  TpcdsPlan getQ46Plan() const;
+  TpcdsPlan getQ52Plan() const;
+  TpcdsPlan getQ53Plan() const;
+  TpcdsPlan getQ55Plan() const;
   TpcdsPlan getQ63Plan() const;
+  TpcdsPlan getQ68Plan() const;
+  TpcdsPlan getQ73Plan() const;
+  TpcdsPlan getQ79Plan() const;
   TpcdsPlan getQ89Plan() const;
+  TpcdsPlan getQ96Plan() const;
 
   const std::vector<std::string>& getTableFilePaths(
       const std::string& tableName) const {
