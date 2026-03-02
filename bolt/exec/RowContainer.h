@@ -2546,11 +2546,19 @@ class HybridContainer {
               rows, rowNumbers, numRows, columnIndex, resultOffset,
               flatResult, outputRowIds);
         }
-        return;
+      } else {
+        // Multi-container scattered mode
+        if (isNullable_[columnIndex]) {
+          extractPayloadScatteredWithNullsMulti<T, useRowNumbers>(
+              rows, rowNumbers, numRows, columnIndex, resultOffset,
+              flatResult, outputRowIds);
+        } else {
+          extractPayloadScatteredNoNullsMulti<T, useRowNumbers>(
+              rows, rowNumbers, numRows, columnIndex, resultOffset,
+              flatResult, outputRowIds);
+        }
       }
-      // Multi-container scattered - fall through to handle with coalesced path
-      // (each container has scattered batches - complex case, TODO if needed)
-      BOLT_CHECK(false, "Multi-container scattered mode not yet implemented");
+      return;
     }
 
     // Fast path for single container (spilling, sort) - avoids map lookups
@@ -2941,6 +2949,140 @@ class HybridContainer {
       }
     }
   }
+
+  // ========== Multi-container scattered mode extraction ==========
+  // Each container has its own decodedPayloads_, indexed by [batchIdx][columnIndex].
+  // Uses containerId_ to find the right container, then batchId()/rowInBatch() to locate data.
+
+  template <typename T, bool useRowNumbers>
+  void extractPayloadScatteredNoNullsMulti(
+      const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      int32_t numRows,
+      int32_t columnIndex,
+      int32_t resultOffset,
+      FlatVector<T>* FOLLY_NONNULL result,
+      std::vector<HybridRowId>& outputRowIds) {
+    auto maxRows = numRows + resultOffset;
+    BOLT_DCHECK_LE(maxRows, result->size());
+
+    BufferPtr valuesBuffer = result->mutableValues(maxRows);
+    auto values = valuesBuffer->asMutableRange<T>();
+    auto* rowIdPtr = outputRowIds.data();
+
+    // Cache current container's decodedPayloads pointer
+    uint8_t currentContainerId = UINT8_MAX;
+    std::vector<std::vector<std::unique_ptr<DecodedVector>>>* currentDecodedPayloads = nullptr;
+
+    for (int32_t i = 0; i < numRows; ++i) {
+      const char* row;
+      if constexpr (useRowNumbers) {
+        auto rowNumber = rowNumbers[i];
+        row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
+      } else {
+        row = rows[i];
+      }
+
+      const auto resultIndex = resultOffset + i;
+      if (row == nullptr) {
+        result->setNull(resultIndex, true);
+        continue;
+      }
+
+      result->setNull(resultIndex, false);
+      const auto& rid = rowIdPtr[i];
+
+      // Switch container if needed
+      if (rid.containerId_ != currentContainerId) {
+        currentContainerId = rid.containerId_;
+        auto it = allContainers_.find(currentContainerId);
+        BOLT_CHECK(it != allContainers_.end(), "Container {} not found", currentContainerId);
+        currentDecodedPayloads = &(it->second->decodedPayloads_);
+      }
+
+      auto batchIdx = rid.batchId();
+      auto rowInBatch = rid.rowInBatch();
+
+      BOLT_DCHECK_LT(batchIdx, currentDecodedPayloads->size());
+      BOLT_DCHECK_LT(columnIndex, (*currentDecodedPayloads)[batchIdx].size());
+
+      T value = (*currentDecodedPayloads)[batchIdx][columnIndex]->valueAt<T>(rowInBatch);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(resultIndex, value);
+      } else {
+        values[resultIndex] = value;
+      }
+    }
+  }
+
+  template <typename T, bool useRowNumbers>
+  void extractPayloadScatteredWithNullsMulti(
+      const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      int32_t numRows,
+      int32_t columnIndex,
+      int32_t resultOffset,
+      FlatVector<T>* FOLLY_NONNULL result,
+      std::vector<HybridRowId>& outputRowIds) {
+    auto maxRows = numRows + resultOffset;
+    BOLT_DCHECK_LE(maxRows, result->size());
+
+    BufferPtr valuesBuffer = result->mutableValues(maxRows);
+    auto values = valuesBuffer->asMutableRange<T>();
+    auto* rowIdPtr = outputRowIds.data();
+
+    // Cache current container's decodedPayloads pointer
+    uint8_t currentContainerId = UINT8_MAX;
+    std::vector<std::vector<std::unique_ptr<DecodedVector>>>* currentDecodedPayloads = nullptr;
+
+    for (int32_t i = 0; i < numRows; ++i) {
+      const char* row;
+      if constexpr (useRowNumbers) {
+        auto rowNumber = rowNumbers[i];
+        row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
+      } else {
+        row = rows[i];
+      }
+
+      const auto resultIndex = resultOffset + i;
+      if (row == nullptr) {
+        result->setNull(resultIndex, true);
+        continue;
+      }
+
+      const auto& rid = rowIdPtr[i];
+
+      // Switch container if needed
+      if (rid.containerId_ != currentContainerId) {
+        currentContainerId = rid.containerId_;
+        auto it = allContainers_.find(currentContainerId);
+        BOLT_CHECK(it != allContainers_.end(), "Container {} not found", currentContainerId);
+        currentDecodedPayloads = &(it->second->decodedPayloads_);
+      }
+
+      auto batchIdx = rid.batchId();
+      auto rowInBatch = rid.rowInBatch();
+
+      BOLT_DCHECK_LT(batchIdx, currentDecodedPayloads->size());
+      BOLT_DCHECK_LT(columnIndex, (*currentDecodedPayloads)[batchIdx].size());
+
+      // Check for null in the payload
+      if ((*currentDecodedPayloads)[batchIdx][columnIndex]->isNullAt(rowInBatch)) {
+        result->setNull(resultIndex, true);
+        continue;
+      }
+
+      result->setNull(resultIndex, false);
+      T value = (*currentDecodedPayloads)[batchIdx][columnIndex]->valueAt<T>(rowInBatch);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(resultIndex, value);
+      } else {
+        values[resultIndex] = value;
+      }
+    }
+  }
+
+  // ========== End scattered mode extraction implementations ==========
   // ========== End single-container fast path implementations ==========
 
   template <typename T, bool useRowNumbers>

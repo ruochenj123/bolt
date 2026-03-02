@@ -1044,7 +1044,7 @@ class QueryConfig {
   /// When enabled, payload batches are kept separate instead of being merged,
   /// avoiding coalesceBatches() overhead. Default false (use coalesced mode).
   bool hybridJoinScatteredModeEnabled() const {
-    return get<bool>(kHybridJoinScatteredModeEnabled, false);
+    return get<bool>(kHybridJoinScatteredModeEnabled, true);
   }
 
   /// Returns whether late materialization optimization is enabled.

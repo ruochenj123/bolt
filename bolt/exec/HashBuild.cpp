@@ -165,7 +165,7 @@ HashBuild::HashBuild(
   scatteredModeEnabled_ = hybridJoin_ && !isNWayLateMEnabled_ &&
       operatorCtx_->driverCtx()->queryConfig().hybridJoinScatteredModeEnabled();
 
-  LOG(INFO) << "HashBuild " << planNodeId() << " constructor:"
+  LOG(ERROR) << "HashBuild " << planNodeId() << " constructor:"
             << " isNWayLateMEnabled_=" << isNWayLateMEnabled_
             << ", hybridJoin_=" << hybridJoin_
             << ", scatteredModeEnabled_=" << scatteredModeEnabled_
