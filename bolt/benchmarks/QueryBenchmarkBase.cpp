@@ -107,6 +107,11 @@ DEFINE_bool(
     false,
     "Enable pointer reuse optimization for N-way late materialization");
 
+DEFINE_bool(
+    hybrid_join_scattered_mode_enabled,
+    false,
+    "Enable scattered (non-coalesced) mode for hybrid join payload extraction");
+
 DEFINE_int32(
     max_output_batch_rows,
     10000,
@@ -302,6 +307,10 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
         params.queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] =
             "true";
       }
+      if (FLAGS_hybrid_join_scattered_mode_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
+            "true";
+      }
       if (FLAGS_max_output_batch_rows != 10000) {
         params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =
             std::to_string(FLAGS_max_output_batch_rows);
@@ -362,6 +371,10 @@ QueryBenchmarkBase::run(const TpcdsPlan& tpcdsPlan) {
       }
       if (FLAGS_hybrid_join_pointer_reuse_enabled) {
         params.queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] =
+            "true";
+      }
+      if (FLAGS_hybrid_join_scattered_mode_enabled) {
+        params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
             "true";
       }
       if (FLAGS_max_output_batch_rows != 10000) {

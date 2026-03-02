@@ -594,6 +594,14 @@ class QueryConfig {
   static constexpr const char* kHybridJoinPointerReuseEnabled =
       "hybrid_join_pointer_reuse_enabled";
 
+  /// If true, use scattered (non-coalesced) mode for hybrid join payload extraction.
+  /// In scattered mode, payload batches are kept separate instead of being
+  /// merged into one large batch. Row IDs encode (batchId, rowInBatch) instead
+  /// of global row index. This avoids the coalesceBatches() overhead but may
+  /// have worse cache locality during extraction.
+  static constexpr const char* kHybridJoinScatteredModeEnabled =
+      "hybrid_join_scattered_mode_enabled";
+
   /// If true, enable late materialization optimization for HashJoin->Sort
   /// pattern when they share the same keys. This avoids redundant layout
   /// conversion between operators.
@@ -1030,6 +1038,13 @@ class QueryConfig {
   /// instead of copying keys, reducing memory usage for multi-way joins.
   bool hybridJoinPointerReuseEnabled() const {
     return get<bool>(kHybridJoinPointerReuseEnabled, false);
+  }
+
+  /// Returns whether scattered (non-coalesced) mode is enabled for hybrid join.
+  /// When enabled, payload batches are kept separate instead of being merged,
+  /// avoiding coalesceBatches() overhead. Default false (use coalesced mode).
+  bool hybridJoinScatteredModeEnabled() const {
+    return get<bool>(kHybridJoinScatteredModeEnabled, false);
   }
 
   /// Returns whether late materialization optimization is enabled.

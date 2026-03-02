@@ -160,9 +160,15 @@ HashBuild::HashBuild(
       !joinNode_->isLeftSemiFilterJoin() &&
       !joinNode_->isLeftSemiProjectJoin() && !joinNode_->isAntiJoin();
   
+  // Scattered mode: keep payload batches separate instead of coalescing
+  // Only applies to hybrid join (not N-way which doesn't have payloads)
+  scatteredModeEnabled_ = hybridJoin_ && !isNWayLateMEnabled_ &&
+      operatorCtx_->driverCtx()->queryConfig().hybridJoinScatteredModeEnabled();
+
   LOG(INFO) << "HashBuild " << planNodeId() << " constructor:"
             << " isNWayLateMEnabled_=" << isNWayLateMEnabled_
             << ", hybridJoin_=" << hybridJoin_
+            << ", scatteredModeEnabled_=" << scatteredModeEnabled_
             << ", numKeys=" << numKeys
             << ", numDependents=" << numDependents
             << ", pointerReuseEligibleNodeIds.size()=" << driverCtx->pointerReuseEligibleNodeIds.size();
@@ -310,6 +316,8 @@ void HashBuild::setupTable() {
     // testing.
     table_->hybridData()->setReorderEnabled(
         queryConfig.hybridJoinReorderEnabled());
+    // Set scattered mode flag - when enabled, payloads are not coalesced
+    table_->hybridData()->setScatteredModeEnabled(scatteredModeEnabled_);
 
     // Note: For N-way late-m, upstream container references and columnSourceMap
     // are set in noMoreInputInternal() after data has been processed.
@@ -656,6 +664,8 @@ void HashBuild::addInput(RowVectorPtr input) {
 
   if (hybridJoin_) {
     auto baseRow = table_->hybridData()->getNumRows();
+    auto batchId = table_->hybridData()->getNumBatches();
+    const bool useScattered = scatteredModeEnabled_;
     
     activeRows_.applyToSelected([&](auto rowIndex) {
       char* newRow = rows->newRow();
@@ -668,9 +678,17 @@ void HashBuild::addInput(RowVectorPtr input) {
       for (auto i = 0; i < hashers.size(); ++i) {
         rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
       }
-      // Store RowId: driverId (8 bits) | globalRowId (56 bits)
-      uint64_t encodedId = (static_cast<uint64_t>(driverId_) << 56) |
-          (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+      // Store RowId:
+      // - Coalesced mode: driverId (8 bits) | globalRowId (56 bits)
+      // - Scattered mode: driverId (8 bits) | batchId (24 bits) | rowInBatch (32 bits)
+      uint64_t encodedId;
+      if (useScattered) {
+        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+            HybridRowId::encodeScattered(batchId, rowIndex);
+      } else {
+        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+            (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
+      }
       rows->storeSingleRowId(encodedId, newRow);
     });
     auto payloadInput = wrapColumns(
@@ -1201,7 +1219,8 @@ void HashBuild::noMoreInputInternal() {
   // Coalesce batches in this driver's HybridContainer before merging with
   // peers. This handles both the normal path (from noMoreInput) and spill
   // restore path (from processSpillInput). Each driver does this independently.
-  if (hybridJoin_ && table_->hybridData()) {
+  // Skip coalescing if scattered mode is enabled - keep batches separate.
+  if (hybridJoin_ && table_->hybridData() && !scatteredModeEnabled_) {
     table_->hybridData()->coalesceBatches();
   }
 

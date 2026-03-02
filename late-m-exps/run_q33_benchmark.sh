@@ -7,7 +7,7 @@ set -e
 
 BENCHMARK="/home/jiang.2091/velox_join/bolt/_build/Release/bolt/benchmarks/tpch/bolt_tpch_benchmark"
 DATA_PATH="/home/jiang.2091/velox_join/data/join_benchmark_v2"
-S_SEL=60
+S_SEL=30
 T_SEL=60
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_FILE="/home/jiang.2091/velox_join/bolt/late-m-exps/q33_results_${TIMESTAMP}.txt"

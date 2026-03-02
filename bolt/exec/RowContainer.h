@@ -1816,9 +1816,38 @@ struct RowFormatInfo {
 
 /// Hybrid container
 
+/// Row identifier for hybrid join mode.
+/// In coalesced mode: rowId_ is a global row index (0 to totalRows-1).
+/// In scattered mode: rowId_ encodes (batchId << 32 | rowInBatch).
 struct HybridRowId {
   uint8_t containerId_;
   uint64_t rowId_;
+
+  // Constants for scattered mode encoding
+  static constexpr int kBatchIdBits = 24;
+  static constexpr int kRowInBatchBits = 32;
+  static constexpr uint64_t kRowInBatchMask = (1ULL << kRowInBatchBits) - 1;
+  static constexpr uint64_t kBatchIdMask = ((1ULL << kBatchIdBits) - 1) << kRowInBatchBits;
+
+  // Encode batchId and rowInBatch for scattered mode
+  static uint64_t encodeScattered(uint32_t batchId, uint32_t rowInBatch) {
+    return (static_cast<uint64_t>(batchId) << kRowInBatchBits) | rowInBatch;
+  }
+
+  // Decode batchId from rowId_ (scattered mode)
+  uint32_t batchId() const {
+    return static_cast<uint32_t>((rowId_ & kBatchIdMask) >> kRowInBatchBits);
+  }
+
+  // Decode rowInBatch from rowId_ (scattered mode)
+  uint32_t rowInBatch() const {
+    return static_cast<uint32_t>(rowId_ & kRowInBatchMask);
+  }
+
+  // For coalesced mode, rowId_ is the global row index
+  uint64_t globalRowId() const {
+    return rowId_;
+  }
 };
 
 // Forward declarations for late materialization
@@ -2074,6 +2103,16 @@ class HybridContainer {
     return reorderEnabled_;
   }
 
+  // Controls whether scattered (non-coalesced) mode is used for payloads.
+  // In scattered mode, batches are kept separate and row IDs encode (batchId, rowInBatch).
+  void setScatteredModeEnabled(bool enabled) {
+    scatteredModeEnabled_ = enabled;
+  }
+
+  bool isScatteredModeEnabled() const {
+    return scatteredModeEnabled_;
+  }
+
   // Returns whether sorting should be used for extraction.
   // Sorting is used when: reorder is enabled AND there are multiple containers.
   bool shouldUseSorting() const {
@@ -2140,7 +2179,6 @@ class HybridContainer {
     pointerReuseMode_ = enabled;
     ptrToIndex_.clear();
     if (enabled && !skipPtrToIndex) {
-      auto startTime = std::chrono::steady_clock::now();
       // Build multimap from ptr -> index for probe-side expansion
       for (size_t i = 0; i < upstreamBuildRowPtrs_.size(); ++i) {
         ptrToIndex_.emplace(upstreamBuildRowPtrs_[i], i);
@@ -2310,7 +2348,6 @@ class HybridContainer {
 
   // Coalesce all payload batches into a single batch to improve locality.
   void coalesceBatches() {
-    auto startTime = std::chrono::steady_clock::now();
     // Skip if no payload columns defined.
     if (payloadTypes_.empty()) {
       return;
@@ -2373,10 +2410,7 @@ class HybridContainer {
         std::move(newChildren)));
 
     totalBatches_ = 1;
-    auto endTime = std::chrono::steady_clock::now();
-    auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
-    fprintf(stderr, "[PROFILE] HybridContainer::coalesceBatches: %zu batches, %ld rows, %zu cols -> %ld us\n",
-            numBatches, totalRows, numPayloadCols, durationUs);
+    fprintf(stderr, "[PROFILE] HybridContainer::coalesceBatches");
   }
 
   /// Extracts columns from upstream sources using ColumnSourceMap.
@@ -2499,6 +2533,25 @@ class HybridContainer {
     BOLT_CHECK(Kind != TypeKind::ROW && Kind != TypeKind::MAP);
     using T = typename KindToFlatVector<Kind>::HashRowType;
     auto flatResult = result->as<FlatVector<T>>();
+
+    // Scattered mode: payloads kept in separate batches
+    if (scatteredModeEnabled_) {
+      if (isSingleContainer()) {
+        if (isNullable_[columnIndex]) {
+          extractPayloadScatteredWithNulls<T, useRowNumbers>(
+              rows, rowNumbers, numRows, columnIndex, resultOffset,
+              flatResult, outputRowIds);
+        } else {
+          extractPayloadScatteredNoNulls<T, useRowNumbers>(
+              rows, rowNumbers, numRows, columnIndex, resultOffset,
+              flatResult, outputRowIds);
+        }
+        return;
+      }
+      // Multi-container scattered - fall through to handle with coalesced path
+      // (each container has scattered batches - complex case, TODO if needed)
+      BOLT_CHECK(false, "Multi-container scattered mode not yet implemented");
+    }
 
     // Fast path for single container (spilling, sort) - avoids map lookups
     if (isSingleContainer()) {
@@ -2786,6 +2839,108 @@ class HybridContainer {
     }
   }
 
+  // ========== Scattered mode extraction (non-coalesced batches) ==========
+  // Optimization: 4-way unrolled prefetch for better cache utilization.
+  // Cache data pointers per batch and prefetch future row data locations.
+
+  template <typename T, bool useRowNumbers>
+  void extractPayloadScatteredNoNulls(
+      const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      int32_t numRows,
+      int32_t columnIndex,
+      int32_t resultOffset,
+      FlatVector<T>* FOLLY_NONNULL result,
+      std::vector<HybridRowId>& outputRowIds) {
+    auto maxRows = numRows + resultOffset;
+    BOLT_DCHECK_LE(maxRows, result->size());
+
+    BufferPtr valuesBuffer = result->mutableValues(maxRows);
+    auto values = valuesBuffer->asMutableRange<T>();
+    auto* rowIdPtr = outputRowIds.data();
+
+    // Simple loop using DecodedVector - no prefetch complexity
+    for (int32_t i = 0; i < numRows; ++i) {
+      const char* row;
+      if constexpr (useRowNumbers) {
+        auto rowNumber = rowNumbers[i];
+        row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
+      } else {
+        row = rows[i];
+      }
+
+      const auto resultIndex = resultOffset + i;
+      if (row == nullptr) {
+        result->setNull(resultIndex, true);
+        continue;
+      }
+
+      result->setNull(resultIndex, false);
+      const auto& rid = rowIdPtr[i];
+      auto batchIdx = rid.batchId();
+      auto rowInBatch = rid.rowInBatch();
+
+      T value = decodedPayloads_[batchIdx][columnIndex]->valueAt<T>(rowInBatch);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(resultIndex, value);
+      } else {
+        values[resultIndex] = value;
+      }
+    }
+  }
+
+
+  template <typename T, bool useRowNumbers>
+  void extractPayloadScatteredWithNulls(
+      const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      int32_t numRows,
+      int32_t columnIndex,
+      int32_t resultOffset,
+      FlatVector<T>* FOLLY_NONNULL result,
+      std::vector<HybridRowId>& outputRowIds) {
+    auto maxRows = numRows + resultOffset;
+    BOLT_DCHECK_LE(maxRows, result->size());
+
+    BufferPtr valuesBuffer = result->mutableValues(maxRows);
+    auto values = valuesBuffer->asMutableRange<T>();
+    auto* rowIdPtr = outputRowIds.data();
+
+    // Simple loop using DecodedVector - no prefetch complexity
+    for (int32_t i = 0; i < numRows; ++i) {
+      const char* row;
+      if constexpr (useRowNumbers) {
+        auto rowNumber = rowNumbers[i];
+        row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
+      } else {
+        row = rows[i];
+      }
+
+      const auto resultIndex = resultOffset + i;
+      if (row == nullptr) {
+        result->setNull(resultIndex, true);
+        continue;
+      }
+
+      const auto& rid = rowIdPtr[i];
+      auto batchIdx = rid.batchId();
+      auto rowInBatch = rid.rowInBatch();
+
+      // Check for null in the payload
+      if (decodedPayloads_[batchIdx][columnIndex]->isNullAt(rowInBatch)) {
+        result->setNull(resultIndex, true);
+        continue;
+      }
+
+      result->setNull(resultIndex, false);
+      T value = decodedPayloads_[batchIdx][columnIndex]->valueAt<T>(rowInBatch);
+      if constexpr (std::is_same_v<T, StringView>) {
+        result->set(resultIndex, value);
+      } else {
+        values[resultIndex] = value;
+      }
+    }
+  }
   // ========== End single-container fast path implementations ==========
 
   template <typename T, bool useRowNumbers>
@@ -3183,6 +3338,17 @@ class HybridContainer {
   // Default true for better cache locality. Can be disabled for testing.
   bool reorderEnabled_{true};
 
+  // Controls whether scattered (non-coalesced) mode is used.
+  // In scattered mode, payload batches are kept separate and row IDs
+  // encode (batchId, rowInBatch) instead of global row index.
+  bool scatteredModeEnabled_{false};
+
+  // Decoded payload vectors for scattered mode extraction.
+  // Outer vector: per batch (same index as owningInputs_)
+  // Inner vector: per payload column
+  // Using DecodedVector allows efficient access to any encoding (flat, dictionary, lazy).
+  std::vector<std::vector<std::unique_ptr<DecodedVector>>> decodedPayloads_;
+
   // === N-Way Late Materialization Support ===
   // Upstream row pointers for N-way join chain.
   // "Upstream" refers to the previous join in the pipeline (child node in the plan tree).
@@ -3259,7 +3425,6 @@ class ProbePayloadContainer {
 
   /// Coalesce all batches into a single flat batch for efficient extraction.
   void coalesceBatches() {
-    auto startTime = std::chrono::steady_clock::now();
     if (coalesced_ || batches_.empty()) {
       coalesced_ = true;
       return;
@@ -3322,10 +3487,7 @@ class ProbePayloadContainer {
         std::move(newChildren)));
     totalBatches_ = 1;
     coalesced_ = true;
-    auto endTime = std::chrono::steady_clock::now();
-    auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
-    fprintf(stderr, "[PROFILE] ProbePayloadContainer::coalesceBatches: %zu batches, %ld rows, %d cols -> %ld us\n",
-            numBatches, totalRows_, numCols, durationUs);
+    fprintf(stderr, "[PROFILE] ProbePayloadContainer::coalesceBatches");
   }
 
   /// Clear all stored batches.
@@ -4068,7 +4230,6 @@ inline void HybridContainer::extractColumnsFromUpstream(
       const auto& currentLevelPtrs = levels.back().buildRowPtrs;
       const auto& ptrToIndex = levelHybrid->getPtrToIndexMap();
 
-      auto startTime = std::chrono::steady_clock::now();
       for (int32_t i = 0; i < numRows; ++i) {
         char* ptr = currentLevelPtrs[i];
         // Build side: same pointer (R ptr stays R ptr)
@@ -4084,7 +4245,6 @@ inline void HybridContainer::extractColumnsFromUpstream(
           nextLevel.probeRowIds[i] = 0;
         }
       }
-      auto endTime = std::chrono::steady_clock::now();
     } else {
       // Standard mode: decode rows to get localIdx, then look up upstream
       std::vector<HybridRowId> localRowIds;

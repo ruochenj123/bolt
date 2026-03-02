@@ -816,9 +816,9 @@ TpcdsPlan TpcdsQueryBuilder::getQ7Plan() const {
                           .planNode();
 
   auto promoNode = PlanBuilder(planNodeIdGenerator, pool_.get())
-                       .tableScan(kPromotion, promoType, promoFileColumnNames,
-                                  {"p_channel_email = 'N' OR p_channel_event = 'N'"})
+                       .tableScan(kPromotion, promoType, promoFileColumnNames, {})
                        .capturePlanNodeId(promoScanId)
+                       .filter("p_channel_email = 'N' OR p_channel_event = 'N'")
                        .planNode();
 
   auto plan =
@@ -1727,7 +1727,7 @@ TpcdsPlan TpcdsQueryBuilder::getQ68Plan() const {
 
   auto dateDimNode = PlanBuilder(planNodeIdGenerator, pool_.get())
                          .tableScan(kDateDim, dateDimType, ddFileColumnNames,
-                                    {"d_year IN (1999, 2000, 2001)", "d_dom >= 1", "d_dom <= 2"})
+                                    {"d_year IN (1999, 2000, 2001)", "d_dom BETWEEN 1 AND 2"})
                          .capturePlanNodeId(dateDimScanId)
                          .planNode();
 
@@ -1737,9 +1737,9 @@ TpcdsPlan TpcdsQueryBuilder::getQ68Plan() const {
                        .planNode();
 
   auto hdNode = PlanBuilder(planNodeIdGenerator, pool_.get())
-                    .tableScan(kHouseholdDemographics, hdType, hdFileColumnNames,
-                               {"hd_dep_count = 4 OR hd_vehicle_count = 3"})
+                    .tableScan(kHouseholdDemographics, hdType, hdFileColumnNames, {})
                     .capturePlanNodeId(hdScanId)
+                    .filter("hd_dep_count = 4 OR hd_vehicle_count = 3")
                     .planNode();
 
   auto customerNode = PlanBuilder(planNodeIdGenerator, pool_.get())
@@ -1818,7 +1818,7 @@ TpcdsPlan TpcdsQueryBuilder::getQ73Plan() const {
 
   auto dateDimNode = PlanBuilder(planNodeIdGenerator, pool_.get())
                          .tableScan(kDateDim, dateDimType, ddFileColumnNames,
-                                    {"d_year IN (1999, 2000, 2001)", "d_dom >= 1", "d_dom <= 2"})
+                                    {"d_year IN (1999, 2000, 2001)", "d_dom BETWEEN 1 AND 2"})
                          .capturePlanNodeId(dateDimScanId)
                          .planNode();
 
@@ -1902,14 +1902,14 @@ TpcdsPlan TpcdsQueryBuilder::getQ79Plan() const {
                          .planNode();
 
   auto storeNode = PlanBuilder(planNodeIdGenerator, pool_.get())
-                       .tableScan(kStore, storeType, storeFileColumnNames, {"s_number_employees >= 200", "s_number_employees <= 295"})
+                       .tableScan(kStore, storeType, storeFileColumnNames, {"s_number_employees BETWEEN 200 AND 295"})
                        .capturePlanNodeId(storeScanId)
                        .planNode();
 
   auto hdNode = PlanBuilder(planNodeIdGenerator, pool_.get())
-                    .tableScan(kHouseholdDemographics, hdType, hdFileColumnNames,
-                               {"hd_dep_count = 6 OR hd_vehicle_count > 2"})
+                    .tableScan(kHouseholdDemographics, hdType, hdFileColumnNames, {})
                     .capturePlanNodeId(hdScanId)
+                    .filter("hd_dep_count = 6 OR hd_vehicle_count > 2")
                     .planNode();
 
   auto customerNode = PlanBuilder(planNodeIdGenerator, pool_.get())
