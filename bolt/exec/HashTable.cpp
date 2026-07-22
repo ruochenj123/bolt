@@ -2503,7 +2503,7 @@ void HashTable<ignoreNullKeys>::buildFromExternalPointers(
       insertForJoin(virtualRowPtrBatch.data(), hashes.data(), batchSize, nullptr);
     }
     auto t4 = std::chrono::steady_clock::now();
-    LOG(ERROR) << "[buildFromExternalPointers] numRows=" << numRows
+    VLOG(1) << "[buildFromExternalPointers] numRows=" << numRows
                << " VirtualRow alloc=" << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << "ms"
                << " VirtualRow init=" << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << "ms"
                << " HashTable build=" << std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << "ms (single-threaded)";

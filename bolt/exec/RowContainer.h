@@ -1851,6 +1851,18 @@ struct HybridRowId {
 };
 
 // Forward declarations for late materialization
+
+// Phase-2 defensive helper: late-m payload storage can retain dictionary/lazy
+// encoded children (peer-driver containers that were never coalesced, probe
+// outputs stored as-is). Extraction paths require FLAT. Flatten in place on
+// demand; no-op when already flat. TODO(reorg): flatten at STORE time instead.
+inline void ensureFlatChild(RowVector* batch, int32_t columnIndex) {
+  auto& child = batch->childAt(columnIndex);
+  if (child->encoding() != VectorEncoding::Simple::FLAT) {
+    BaseVector::flattenVector(child);
+  }
+}
+
 class HybridContainer;
 class ProbePayloadContainer;
 
@@ -2410,7 +2422,7 @@ class HybridContainer {
         std::move(newChildren)));
 
     totalBatches_ = 1;
-    fprintf(stderr, "[PROFILE] HybridContainer::coalesceBatches");
+
   }
 
   /// Extracts columns from upstream sources using ColumnSourceMap.
@@ -2669,6 +2681,7 @@ class HybridContainer {
     auto* rowIdPtr = outputRowIds.data();
 
     // Single container - direct access without map lookup
+    ensureFlatChild(getSingleContainerData(), columnIndex);
     auto* flatChild = getSingleContainerData()
                           ->childAt(columnIndex)
                           ->template as<FlatVector<T>>();
@@ -2772,6 +2785,7 @@ class HybridContainer {
     auto* rowIdPtr = outputRowIds.data();
 
     // Single container - direct access without map lookup
+    ensureFlatChild(getSingleContainerData(), columnIndex);
     auto* flatChild = getSingleContainerData()
                           ->childAt(columnIndex)
                           ->template as<FlatVector<T>>();
@@ -3114,6 +3128,7 @@ class HybridContainer {
       if (entry.second->owningInputs_.empty()) {
         continue;
       }
+      ensureFlatChild(entry.second->owningInputs_[0].get(), columnIndex);
       auto* flatChild = entry.second->owningInputs_[0]
                             ->childAt(columnIndex)
                             ->template as<FlatVector<T>>();
@@ -3284,6 +3299,7 @@ class HybridContainer {
       if (entry.second->owningInputs_.empty()) {
         continue;
       }
+      ensureFlatChild(entry.second->owningInputs_[0].get(), columnIndex);
       auto* flatChild = entry.second->owningInputs_[0]
                             ->childAt(columnIndex)
                             ->template as<FlatVector<T>>();
@@ -3629,7 +3645,7 @@ class ProbePayloadContainer {
         std::move(newChildren)));
     totalBatches_ = 1;
     coalesced_ = true;
-    fprintf(stderr, "[PROFILE] ProbePayloadContainer::coalesceBatches");
+    
   }
 
   /// Clear all stored batches.
@@ -3800,6 +3816,8 @@ void ProbePayloadContainer::extractColumnWithNullsSingleContainer(
   BufferPtr valuesBuffer = result->mutableValues(numRows);
   auto values = valuesBuffer->asMutableRange<T>();
 
+  ensureFlatChild(getSingleContainerData(), columnIndex);
+
   auto* flatChild = getSingleContainerData()
                         ->childAt(columnIndex)
                         ->template as<FlatVector<T>>();
@@ -3872,6 +3890,7 @@ void ProbePayloadContainer::extractColumnNoNullsSingleContainer(
   auto* data = getSingleContainerData();
   
   BOLT_CHECK_LT(columnIndex, data->childrenSize());
+  ensureFlatChild(data, columnIndex);
   auto* flatChild = data->childAt(columnIndex)->template as<FlatVector<T>>();
   BOLT_CHECK_NOT_NULL(flatChild);
   
@@ -3943,6 +3962,7 @@ void ProbePayloadContainer::extractColumnWithNullsMultiContainer(
     if (container->batches_.empty()) {
       continue;
     }
+    ensureFlatChild(container->batches_[0].get(), columnIndex);
     auto* flatChild = container->batches_[0]
                           ->childAt(columnIndex)
                           ->template as<FlatVector<T>>();
@@ -4059,6 +4079,7 @@ void ProbePayloadContainer::extractColumnNoNullsMultiContainer(
     if (container->batches_.empty()) {
       continue;
     }
+    ensureFlatChild(container->batches_[0].get(), columnIndex);
     auto* flatChild = container->batches_[0]
                           ->childAt(columnIndex)
                           ->template as<FlatVector<T>>();

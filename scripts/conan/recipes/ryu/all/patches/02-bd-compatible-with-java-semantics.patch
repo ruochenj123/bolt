@@ -10,7 +10,7 @@ index 7dc1309..49f1023 100644
 +  memcpy(result + sign, "0.0", 3);
    return sign + 3;
  }
-
+ 
 diff --git a/ryu/d2s.c b/ryu/d2s.c
 index 41de875..1073946 100644
 --- a/ryu/d2s.c
@@ -28,7 +28,7 @@ index 41de875..1073946 100644
    if (v >= 100000000000000L) { return 15; }
 @@ -203,6 +205,10 @@ static inline floating_decimal_64 d2d(const uint64_t ieeeMantissa, const uint32_
  #endif
-
+ 
    // Step 4: Find the shortest decimal representation in the interval of valid representations.
 +  int32_t vplength = decimalLength17(vp);
 +  int32_t exp1 = e10 + vplength - 1;
@@ -103,7 +103,7 @@ index 41de875..1073946 100644
 @@ -327,93 +348,156 @@ static inline int to_chars(const floating_decimal_64 v, const bool sign, char* c
    printf("EXP=%u\n", v.exponent + olength);
  #endif
-
+ 
 -  // Print the decimal digits.
 -  // The following code is equivalent to:
 -  // for (uint32_t i = 0; i < olength - 1; ++i) {
@@ -193,7 +193,7 @@ index 41de875..1073946 100644
 +            result[index + i] = '0' + c;
 +        }
 +        index += olength;
-
+ 
 -  // Print decimal point if needed.
 -  if (olength > 1) {
 -    result[index + 1] = '.';
@@ -228,7 +228,7 @@ index 41de875..1073946 100644
 +
 +    return index;
    }
-
+ 
 -  // Print the exponent.
 -  result[index++] = 'E';
 -  int32_t exp = v.exponent + (int32_t) olength - 1;
@@ -305,7 +305,7 @@ index 41de875..1073946 100644
 +        ++index;
 +    }
    }
-
+ 
 -  if (exp >= 100) {
 -    const int32_t c = exp % 10;
 -    memcpy(result + index, DIGIT_TABLE + 2 * (exp / 10), 2);
@@ -337,12 +337,12 @@ index 41de875..1073946 100644
 +        result[index++] = (char) ('0' + exp);
 +    }
    }
-
+ 
    return index;
 @@ -472,25 +556,7 @@ int d2s_buffered_n(double f, char* result) {
      return copy_special_str(result, ieeeSign, ieeeExponent, ieeeMantissa);
    }
-
+ 
 -  floating_decimal_64 v;
 -  const bool isSmallInt = d2d_small_int(ieeeMantissa, ieeeExponent, &v);
 -  if (isSmallInt) {
@@ -363,7 +363,7 @@ index 41de875..1073946 100644
 -    v = d2d(ieeeMantissa, ieeeExponent);
 -  }
 +  floating_decimal_64 v = d2d(ieeeMantissa, ieeeExponent);
-
+ 
    return to_chars(v, ieeeSign, result);
  }
 diff --git a/ryu/d2s_intrinsics.h b/ryu/d2s_intrinsics.h
@@ -383,11 +383,11 @@ index 426ed8f..377b668 100644
 +  return (hi << (64 - dist)) | ((uint32_t)(lo >> 32) >> (dist - 32));
 +#endif
  }
-
+ 
  #endif // defined(HAS_64_BIT_INTRINSICS)
 @@ -189,14 +195,15 @@ static inline uint32_t mod1e9(const uint64_t x) {
  #endif // defined(RYU_32_BIT_PLATFORM)
-
+ 
  static inline uint32_t pow5Factor(uint64_t value) {
 -  const uint64_t m_inv_5 = 14757395258967641293u; // 5 * m_inv_5 = 1 (mod 2^64)
 -  const uint64_t n_div_5 = 3689348814741910323u;  // #{ n | n = 0 (mod 2^64) } = 2^64 / 5
@@ -420,7 +420,7 @@ index 22940d6..456b02e 100644
 @@ -24,7 +24,7 @@
  #define DOUBLE_POW5_INV_BITCOUNT 125
  #define DOUBLE_POW5_BITCOUNT 125
-
+ 
 -static const uint64_t DOUBLE_POW5_INV_SPLIT2[15][2] = {
 +static const uint64_t DOUBLE_POW5_INV_SPLIT2[13][2] = {
    {                    1u, 2305843009213693952u },
@@ -443,7 +443,7 @@ index 255ecbe..95c34d4 100644
 +++ b/ryu/f2s.c
 @@ -152,11 +152,22 @@ static inline floating_decimal_32 f2d(const uint32_t ieeeMantissa, const uint32_
  #endif
-
+ 
    // Step 4: Find the shortest decimal representation in the interval of valid representations.
 +  // We do some extra work here in order to follow Float/Double.toString semantics. In particular,
 +  // that requires printing in scientific format if and only if the exponent is between -3 and 7,
@@ -515,7 +515,7 @@ index 255ecbe..95c34d4 100644
 @@ -243,6 +260,8 @@ static inline int to_chars(const floating_decimal_32 v, const bool sign, char* c
    printf("EXP=%u\n", v.exponent + olength);
  #endif
-
+ 
 +  int32_t exp1 = v.exponent + (int32_t) olength - 1;
 +  bool scientificNotation = !((exp1 >= -3) && (exp1 < 7));
    // Print the decimal digits.
@@ -582,7 +582,7 @@ index 255ecbe..95c34d4 100644
 +    } else {
 +      result[index] = (char) ('0' + output);
 +    }
-
+ 
 -  // Print decimal point if needed.
 -  if (olength > 1) {
 -    result[index + 1] = '.';
@@ -597,7 +597,7 @@ index 255ecbe..95c34d4 100644
 +    } else {
 +      ++index;
 +    }
-
+ 
 -  // Print the exponent.
 -  result[index++] = 'E';
 -  int32_t exp = v.exponent + (int32_t) olength - 1;
@@ -612,7 +612,7 @@ index 255ecbe..95c34d4 100644
 +      result[index++] = '-';
 +      exp = -exp;
 +    }
-
+ 
 -  if (exp >= 10) {
 -    memcpy(result + index, DIGIT_TABLE + 2 * exp, 2);
 -    index += 2;
@@ -664,7 +664,7 @@ index 255ecbe..95c34d4 100644
 +        index += olength + 1;
 +      }
    }
-
+ 
    return index;
 diff --git a/ryu/ryu.h b/ryu/ryu.h
 index 558822a..009da59 100644
@@ -697,3 +697,4 @@ index 558822a..009da59 100644
 + */
  #ifndef RYU_H
  #define RYU_H
+ 

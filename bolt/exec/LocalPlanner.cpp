@@ -408,6 +408,29 @@ uint32_t maxDrivers(
 void detectNWayJoinChains(
     const core::PlanNodePtr& root,
     std::vector<std::unique_ptr<DriverFactory>>& factories) {
+  // ===========================================================================
+  // PHASE-2 VERDICT (2026-07-22): N-way late-m DISABLED pending rewrite.
+  //
+  // Eight distinct failure modes were catalogued running TPC-H SF100 under the
+  // fusion config, and gating the detector by plan shape does NOT converge:
+  // each gate changes which chains fire, migrating failures to previously
+  // working queries (e.g. depth cap fixed Q8's null-type crash and moved it to
+  // Q3). Catalogue:
+  //   1. fillFilterInput -> extractColumns not VirtualRow-aware (SIGSEGV)
+  //   2. extract paths assume FLAT children; storage keeps dict/lazy encodings
+  //   3. updateSourceMapForNWay cannot trace channels through Project nodes
+  //   4. null type propagated into vector creation (Q8/Q3)
+  //   5. probe-KEY columns unmappable when consumed downstream as payload
+  //   6. deepest chain member's columnSourceMap never initialized (Q2/Q20)
+  //   7. second StringView extraction path with garbage refs (Q8 round 2)
+  //   8. failure migration under gating: shared driverCtx state couples chains
+  // The plan-shape gates below are KEPT as documentation of the supported
+  // envelope; this early return supersedes them. The mechanism returns as
+  // JoinFusionPlanner/FusionState (store-time flattening, single VirtualRow
+  // choke point, projection-aware channel maps, per-chain state isolation).
+  // ===========================================================================
+  return;
+
   // Map from plan node ID to factory index
   std::unordered_map<core::PlanNodeId, size_t> nodeIdToFactory;
   for (size_t i = 0; i < factories.size(); ++i) {
@@ -516,21 +539,97 @@ void detectNWayJoinChains(
 
       if (buildSource) {
         // Check if buildSource itself is a HashJoin or contains one
+        // INTERIM GATE (phase-2): the N-way late-m bookkeeping
+        // (updateSourceMapForNWay channel tracing, type propagation) only
+        // handles chains where the build source IS a HashJoin directly.
+        // Interposed Project/Filter nodes remap channels in ways the
+        // columnSourceMap cannot trace (TPC-H Q2: "inputChannel 7 not found";
+        // Q8: null type in vector creation). Restrict detection to DIRECT
+        // join-over-join until the fusion planner rewrite; everything else
+        // falls back to hybrid execution.
         std::function<bool(const core::PlanNodePtr&)> hasBuildSideJoin;
         hasBuildSideJoin = [&](const core::PlanNodePtr& n) -> bool {
-          if (!n)
-            return false;
-          if (std::dynamic_pointer_cast<const core::HashJoinNode>(n)) {
-            return true;
-          }
-          for (const auto& src : n->sources()) {
-            if (hasBuildSideJoin(src))
-              return true;
-          }
-          return false;
+          return n != nullptr &&
+              std::dynamic_pointer_cast<const core::HashJoinNode>(n) != nullptr;
         };
         
         bool hasBuild = hasBuildSideJoin(buildSource);
+
+        // GUARD (phase-2 correctness fix): join FILTERS are not supported inside
+        // a fused region. HashProbe::fillFilterInput extracts build columns via
+        // the generic extractColumns(), which is not VirtualRow-aware and cannot
+        // resolve multi-level provenance -- with late-m state it reads garbage
+        // rowIds and SIGSEGVs (TPC-H Q2/7/8/9/10/15/17/20/21 at SF100).
+        // Until the fused path supports filter evaluation, reject the WHOLE
+        // chain if this join or ANY join in its build subtree has a filter;
+        // such plans fall back to plain hybrid execution (sound, and measured
+        // no worse than hybrid on all affected queries).
+        std::function<bool(const core::PlanNodePtr&)> subtreeHasFilteredJoin =
+            [&](const core::PlanNodePtr& n) -> bool {
+          if (!n) {
+            return false;
+          }
+          if (auto j = std::dynamic_pointer_cast<const core::HashJoinNode>(n)) {
+            if (j->filter() != nullptr) {
+              return true;
+            }
+          }
+          for (const auto& src : n->sources()) {
+            if (subtreeHasFilteredJoin(src)) {
+              return true;
+            }
+          }
+          return false;
+        };
+        if (hasBuild &&
+            (hashJoin->filter() != nullptr ||
+             subtreeHasFilteredJoin(buildSource))) {
+          hasBuild = false;
+        }
+
+        // INTERIM GATE #3 (phase-2): probe-side KEY columns are not stored in
+        // ProbePayloadContainer, so a chain join's probe keys that survive into
+        // its output are unmappable by the downstream build's
+        // updateSourceMapForNWay ("inputChannel N not found" — TPC-H Q2/Q20)
+        // UNLESS they are consumed as that downstream build's join keys (keys
+        // map to HYBRID_KEY without the payload lookup). Validate every
+        // (child, parent) pair along the direct build-side chain.
+        if (hasBuild) {
+          std::function<bool(
+              const core::HashJoinNode*, const core::HashJoinNode*)>
+              chainPairOk = [&](const core::HashJoinNode* child,
+                                const core::HashJoinNode* parent) -> bool {
+            std::unordered_set<std::string> parentRightKeys;
+            for (const auto& k : parent->rightKeys()) {
+              parentRightKeys.insert(k->name());
+            }
+            auto childOutput = child->outputType();
+            for (const auto& k : child->leftKeys()) {
+              if (childOutput->getChildIdxIfExists(k->name()).has_value() &&
+                  parentRightKeys.count(k->name()) == 0) {
+                return false;  // probe key leaks into payload channels
+              }
+            }
+            // INTERIM GATE #4: cap fused chains at ONE pair (depth 2).
+            // Deeper chains hit further unvalidated bookkeeping (deepest-member
+            // columnSourceMap initialization — TPC-H Q2/Q20 channels 0/2; and a
+            // second StringView extraction path — Q8). The q33-family
+            // experiments only ever validated single-pair fusion; longer chains
+            // wait for the fusion-planner rewrite.
+            if (child->sources().size() > 1 &&
+                std::dynamic_pointer_cast<const core::HashJoinNode>(
+                    child->sources()[1]) != nullptr) {
+              return false;
+            }
+            return true;
+          };
+          auto directChild =
+              std::dynamic_pointer_cast<const core::HashJoinNode>(buildSource);
+          if (directChild &&
+              !chainPairOk(directChild.get(), hashJoin.get())) {
+            hasBuild = false;
+          }
+        }
 
         if (hasBuild) {
           // Found N-way pattern! This join and all joins in its build subtree
@@ -620,14 +719,14 @@ void detectNWayJoinChains(
                 probeToDownstreamSortKeyChannels[innerJoin->id()] = std::move(sortKeyChannels);
               }
               
-              // Continue marking this join's build subtree with this join as parent
-              for (const auto& src : n->sources()) {
-                markBuildSubtree(src, innerJoin.get());
+              // INTERIM GATE: only continue the chain through a DIRECT
+              // build-side join; do not traverse through non-join nodes
+              // (their channel remapping breaks the N-way source map).
+              if (innerJoin->sources().size() > 1) {
+                markBuildSubtree(innerJoin->sources()[1], innerJoin.get());
               }
             } else {
-              for (const auto& src : n->sources()) {
-                markBuildSubtree(src, parentJoin);
-              }
+              // Non-join node inside a would-be chain: chain stops here.
             }
           };
           markBuildSubtree(buildSource, hashJoin.get());
