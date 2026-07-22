@@ -29,6 +29,8 @@
  */
 
 #include "bolt/exec/LocalPlanner.h"
+#include "bolt/exec/JoinFusionPlanner.h"
+
 #include "RoundRobinPartitionFunction.h"
 #include "bolt/common/process/ExceptionTraceContext.h"
 #include "bolt/core/PlanFragment.h"
@@ -901,6 +903,39 @@ void LocalPlanner::plan(
     detail::detectNWayJoinChains(planFragment.planNode, *driverFactories);
   }
 
+  // Fusion v2: per-pipeline probe-run detection (docs/fusion-v2-design.md).
+  LOG(ERROR) << "[fusion-v2] planner gate: enabled=" << queryConfig.fusionV2Enabled()
+             << " pipelines=" << driverFactories->size();
+  if (queryConfig.fusionV2Enabled()) {
+    auto plan = std::make_shared<FusionPlan>();
+    size_t runs = 0;
+    for (auto& factory : *driverFactories) {
+      {
+        std::string kinds;
+        for (const auto& n : factory->planNodes) {
+          kinds += n->name();
+          kinds += ",";
+        }
+        LOG(ERROR) << "[fusion-v2] pipeline nodes: " << kinds;
+      }
+      auto hops = JoinFusionPlanner::planPipeline(factory->planNodes);
+      LOG(ERROR) << "[fusion-v2] hops found: " << hops.size();
+      if (!hops.empty()) {
+        ++runs;
+        for (auto& hop : hops) {
+          plan->addHop(std::move(hop));
+        }
+      }
+    }
+    plan->setNumRuns(runs);
+    if (!plan->empty()) {
+      std::shared_ptr<const FusionPlan> shared = std::move(plan);
+      for (auto& factory : *driverFactories) {
+        factory->fusionPlan = shared;
+      }
+    }
+  }
+
   (*driverFactories)[0]->outputDriver = true;
 
   if (planFragment.isGroupedExecution()) {
@@ -1046,6 +1081,7 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     std::shared_ptr<ExchangeClient> exchangeClient,
     std::function<int(int pipelineId)> numDrivers,
     std::shared_ptr<LocalExchangeQueue> primedQueue) {
+  ctx->fusionPlan = fusionPlan;
   auto driver = std::shared_ptr<Driver>(new Driver());
   ctx->driver = driver.get();
 

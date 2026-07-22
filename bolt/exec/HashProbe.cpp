@@ -206,6 +206,11 @@ HashProbe::HashProbe(
       driverId_(static_cast<uint8_t>(driverCtx->driverId)) {
   BOLT_CHECK_NOT_NULL(joinBridge_);
 
+  // Fusion v2: resolve this probe's hop instruction (immutable plan).
+  if (driverCtx->fusionPlan != nullptr) {
+    fusionHop_ = driverCtx->fusionPlan->hopFor(planNodeId());
+  }
+
   // N-way late materialization: isNWayLateMInput_ is reserved for future use
   // when probe-side input may come from upstream join results.
   // Currently, probe side always comes from TableScan or other sources.
@@ -562,6 +567,19 @@ void HashProbe::asyncWaitForHashTable() {
 
   table_ = std::move(hashBuildResult->table);
   BOLT_CHECK_NOT_NULL(table_);
+
+  // Fusion v2: activate deferral only on the standard path with a non-hybrid
+  // table (extraction-by-row-pointer uses stock RowContainer::extractColumn).
+  // The materialization hop keeps the standard path and post-processes refs.
+  if (fusionHop_ != nullptr) {
+    const bool tableIsPlain = table_->hybridData() == nullptr;
+    fusionDeferActive_ = !fusionHop_->isMaterializationPoint && tableIsPlain &&
+        !fusionHop_->deferredChannels.empty();
+    if (!tableIsPlain) {
+      // Hybrid+fusion composition is v2.1; run this hop unfused.
+      fusionDeferActive_ = false;
+    }
+  }
 
   // Compute late-m output paths once now that table_ is available.
   // Check if this table actually has late-m metadata (columnSourceMap).
@@ -1059,6 +1077,12 @@ void HashProbe::fillLeftSemiProjectMatchColumn(vector_size_t size) {
 }
 
 void HashProbe::fillOutput(vector_size_t size) {
+  // Fusion v2 (mutually exclusive with v1 late-m by configuration).
+  if (fusionDeferActive_) {
+    fillOutputFusionDeferred(size);
+    return;
+  }
+
   // N-way late materialization paths - flags precomputed in asyncWaitForHashTable()
   if (useLateMOutputPath_) {
     // Intermediate probe: pass rowIds downstream instead of materializing
@@ -1145,6 +1169,159 @@ void HashProbe::fillOutput(vector_size_t size) {
           outputType_->children(),
           output_->children(),
           /*allowSorting=*/!hasProbeColumns);
+    }
+  }
+
+  // Fusion v2: resolve upstream deferred refs at the run's final hop.
+  if (fusionHop_ != nullptr && fusionHop_->isMaterializationPoint &&
+      input_ != nullptr &&
+      input_->childrenSize() > probeType_->size()) {
+    materializeFusionRefs(size);
+  }
+}
+
+
+void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
+  // The previous batch replaced output_ with the extended (ref-carrying)
+  // vector; prepareOutput would reuse it and mismatch outputType_. Reset.
+  if (output_ != nullptr && output_->childrenSize() != outputType_->size()) {
+    output_ = nullptr;
+  }
+  {
+    static std::atomic<bool> logged{false};
+    bool expected = false;
+    if (logged.compare_exchange_strong(expected, true)) {
+      LOG(INFO) << "[fusion-v2] deferred output ACTIVE at node " << planNodeId();
+    }
+  }
+  prepareOutput(size);
+  for (auto projection : projectedInputColumns_) {
+    ensureLoadedIfNotAtEnd(projection.inputChannel);
+  }
+  wrapIndirectChildren(
+      projectedInputColumns_,
+      input_->children(),
+      size,
+      outputRowMapping_,
+      output_->children());
+
+  // Split build-side projections: deferred channels become null-constants (the
+  // channel must exist so downstream indexing is stable); the rest extract now.
+  std::unordered_set<column_index_t> deferredSet(
+      fusionHop_->deferredChannels.begin(), fusionHop_->deferredChannels.end());
+  std::vector<IdentityProjection> immediate;
+  for (auto projection : tableOutputProjections_) {
+    if (deferredSet.count(projection.outputChannel) > 0) {
+      output_->childAt(projection.outputChannel) = BaseVector::createNullConstant(
+          outputType_->childAt(projection.outputChannel), size, pool());
+    } else {
+      immediate.push_back(projection);
+    }
+  }
+  if (!immediate.empty()) {
+    extractColumns(
+        table_.get(),
+        folly::Range<char**>(outputTableRows_.data(), size),
+        immediate,
+        pool(),
+        outputType_->children(),
+        output_->children(),
+        /*allowSorting=*/false);
+  }
+
+  // Assemble extended output: planned channels + upstream ref pass-through
+  // (re-wrapped with this hop's probe dictionary) + this hop's own ref column.
+  std::vector<VectorPtr> children = output_->children();
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+  names.reserve(outputType_->size() + 4);
+  types.reserve(outputType_->size() + 4);
+  for (column_index_t c = 0; c < outputType_->size(); ++c) {
+    names.push_back(outputType_->nameOf(c));
+    types.push_back(outputType_->childAt(c));
+  }
+  const auto& inputRowType = input_->type()->asRow();
+  for (auto i = probeType_->size(); i < input_->childrenSize(); ++i) {
+    children.push_back(wrapChild(size, outputRowMapping_, input_->childAt(i)));
+    names.push_back(inputRowType.nameOf(i));
+    types.push_back(inputRowType.childAt(i));
+  }
+  auto refs = BaseVector::create<FlatVector<int64_t>>(BIGINT(), size, pool());
+  auto* rawRefs = refs->mutableRawValues();
+  for (vector_size_t i = 0; i < size; ++i) {
+    rawRefs[i] = reinterpret_cast<int64_t>(outputTableRows_[i]);
+  }
+  children.push_back(refs);
+  names.push_back(fmt::format("$fref${}", planNodeId()));
+  types.push_back(BIGINT());
+
+  output_ = std::make_shared<RowVector>(
+      pool(),
+      ROW(std::move(names), std::move(types)),
+      BufferPtr(nullptr),
+      size,
+      std::move(children));
+}
+
+void HashProbe::materializeFusionRefs(vector_size_t size) {
+  {
+    static std::atomic<bool> logged{false};
+    bool expected = false;
+    if (logged.compare_exchange_strong(expected, true)) {
+      LOG(INFO) << "[fusion-v2] materialization ACTIVE at node " << planNodeId();
+    }
+  }
+  const auto planned = probeType_->size();
+  const auto& inputRowType = input_->type()->asRow();
+  for (auto i = planned; i < input_->childrenSize(); ++i) {
+    const auto& name = inputRowType.nameOf(i);
+    if (name.rfind("$fref$", 0) != 0) {
+      continue;
+    }
+    const auto hopId = name.substr(6);
+    auto* peerOp = operatorCtx_->driverCtx()->driver->findOperator(hopId);
+    auto* peer = dynamic_cast<HashProbe*>(peerOp);
+    BOLT_CHECK_NOT_NULL(peer, "fusion v2: producing probe not found: {}", hopId);
+    const auto* peerHop = peer->fusionHop();
+    BOLT_CHECK_NOT_NULL(peerHop);
+    auto* peerRows = peer->fusionTableFor()->rows();
+    BOLT_CHECK_NOT_NULL(peerRows);
+
+    // Align the ref column to output rows via this hop's probe dictionary,
+    // then decode to raw row pointers.
+    auto aligned = wrapChild(size, outputRowMapping_, input_->childAt(i));
+    SelectivityVector allRows(size);
+    DecodedVector decoded(*aligned, allRows);
+    std::vector<char*> rowPtrs(size);
+    for (vector_size_t r = 0; r < size; ++r) {
+      rowPtrs[r] = decoded.isNullAt(r)
+          ? nullptr
+          : reinterpret_cast<char*>(decoded.valueAt<int64_t>(r));
+    }
+
+    // Extract every deferred channel of the producing hop into the final
+    // output channel of the same NAME.
+    std::unordered_set<column_index_t> peerDeferred(
+        peerHop->deferredChannels.begin(), peerHop->deferredChannels.end());
+    const auto& peerOutputType = peer->outputType_->asRow();
+    for (auto projection : peer->fusionTableProjections()) {
+      if (peerDeferred.count(projection.outputChannel) == 0) {
+        continue;
+      }
+      const auto& colName = peerOutputType.nameOf(projection.outputChannel);
+      auto ourChannel = outputType_->getChildIdxIfExists(colName);
+      if (!ourChannel.has_value()) {
+        continue;  // column projected away before the run end
+      }
+      auto& target = output_->childAt(ourChannel.value());
+      if (!target || !BaseVector::isVectorWritable(target) ||
+          !target->isFlatEncoding()) {
+        target = BaseVector::create(
+            outputType_->childAt(ourChannel.value()), size, pool());
+      }
+      target->resize(size);
+      peerRows->extractColumn(
+          rowPtrs.data(), size, projection.inputChannel, target);
     }
   }
 }

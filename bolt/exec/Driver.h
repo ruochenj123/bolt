@@ -47,6 +47,7 @@
 #include "bolt/exec/TraceConfig.h"
 
 namespace bytedance::bolt::exec {
+class FusionPlan;
 
 // Forward declarations for late materialization
 class BaseHashTable;
@@ -292,6 +293,9 @@ struct DriverCtx {
   std::string currentSplitStr;
 
   std::shared_ptr<Task> task;
+
+  /// Fusion v2 plan (immutable; copied from DriverFactory at driver creation).
+  std::shared_ptr<const FusionPlan> fusionPlan;
   Driver* driver;
   bytedance::bolt::process::ThreadDebugInfo threadDebugInfo;
   /// Tracks the traced operator ids. It is also used to avoid tracing the
@@ -717,6 +721,11 @@ struct DriverFactory {
   /// Whether this pipeline participates in an N-way join chain where
   /// build-side late materialization is enabled.
   bool nWayJoinLateMEnabled{false};
+
+  /// Fusion v2 (immutable after planning; see docs/fusion-v2-design.md).
+  /// Shared by all drivers of this pipeline; operators read their hop via
+  /// fusionPlan->hopFor(planNodeId). Never mutated at runtime.
+  std::shared_ptr<const FusionPlan> fusionPlan;
 
   /// For N-way join chains, the plan node ID where final materialization
   /// should happen. This can be:

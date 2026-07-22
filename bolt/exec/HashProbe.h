@@ -32,6 +32,7 @@
 
 #include <set>
 #include "bolt/exec/HashBuild.h"
+#include "bolt/exec/JoinFusionPlanner.h"
 #include "bolt/exec/HashPartitionFunction.h"
 #include "bolt/exec/HashTable.h"
 #include "bolt/exec/Operator.h"
@@ -123,6 +124,29 @@ class HashProbe : public Operator {
 
   // Check if output_ can be re-used and if not make a new one.
   void prepareOutput(vector_size_t size);
+
+  /// Fusion v2: non-final hop output — probe columns wrapped as usual, deferred
+  /// build channels emitted as null-constants, one trailing int64 ref column of
+  /// build row pointers, upstream ref columns passed through re-wrapped.
+  void fillOutputFusionDeferred(vector_size_t size);
+
+  /// Fusion v2: at the run's materialization point, resolve every upstream ref
+  /// column in input_ (trailing children beyond probeType_) into real columns
+  /// via the producing probe's RowContainer (same driver).
+  void materializeFusionRefs(vector_size_t size);
+
+  // Fusion v2: peer access from the run's materialization probe (same driver,
+  // same thread). Exposes the build container and output projections needed to
+  // bulk-extract deferred columns by row pointer.
+  BaseHashTable* fusionTableFor() const {
+    return table_.get();
+  }
+  const std::vector<IdentityProjection>& fusionTableProjections() const {
+    return tableOutputProjections_;
+  }
+  const FusionHopPlan* fusionHop() const {
+    return fusionHop_;
+  }
 
   // Populate output columns.
   void fillOutput(vector_size_t size);
@@ -327,6 +351,15 @@ class HashProbe : public Operator {
   // Table shared between other HashProbes in other Drivers of the
   // same pipeline.
   std::shared_ptr<BaseHashTable> table_;
+
+  /// ===== Fusion v2 (docs/fusion-v2-design.md) =====
+  /// Immutable hop instruction for this probe, or nullptr when not fused.
+  const FusionHopPlan* fusionHop_{nullptr};
+  /// Deferral actually active (hop plan present, not materialization point,
+  /// standard output path, non-hybrid table). Decided in asyncWaitForHashTable.
+  bool fusionDeferActive_{false};
+  /// outputType_ + trailing ref columns (this hop's + passed-through upstream).
+  RowTypePtr fusionExtendedType_;
 
   // Indicates whether there was no input. Used for right semi join project.
   bool noInput_{true};

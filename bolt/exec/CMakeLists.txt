@@ -64,6 +64,7 @@ add_library(
   Limit.cpp
   LocalPartition.cpp
   LocalPlanner.cpp
+  JoinFusionPlanner.cpp
   LocalShuffle.cpp
   MarkDistinct.cpp
   MemoryReclaimer.cpp

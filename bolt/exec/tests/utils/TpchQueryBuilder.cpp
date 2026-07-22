@@ -545,9 +545,12 @@ TpchPlan TpchQueryBuilder::getQ3Plan() const {
                        .captureScanNodeId(customerPlanNodeId)
                        .planNode();
 
-  auto custkeyJoinNode =
+  // Left-deep fact-probe chain (fusion v2 target shape; matches upstream velox
+  // and optimizer output for star queries): lineitem probes orders, then the
+  // run probes customer keyed on o_custkey (a hop-1 build column -> planner
+  // marks it immediate, everything else defers).
+  auto orders =
       PlanBuilder(planNodeIdGenerator, pool_.get())
-          .filtersAsNode(filtersAsNode_)
           .filtersAsNode(filtersAsNode_)
           .tableScan(
               kOrders,
@@ -555,12 +558,6 @@ TpchPlan TpchQueryBuilder::getQ3Plan() const {
               ordersFileColumns,
               {orderDateFilter})
           .captureScanNodeId(ordersPlanNodeId)
-          .hashJoin(
-              {"o_custkey"},
-              {"c_custkey"},
-              customers,
-              "",
-              {"o_orderdate", "o_shippriority", "o_orderkey"})
           .planNode();
 
   auto plan =
@@ -578,7 +575,17 @@ TpchPlan TpchQueryBuilder::getQ3Plan() const {
           .hashJoin(
               {"l_orderkey"},
               {"o_orderkey"},
-              custkeyJoinNode,
+              orders,
+              "",
+              {"l_orderkey",
+               "o_orderdate",
+               "o_shippriority",
+               "o_custkey",
+               "part_revenue"})
+          .hashJoin(
+              {"o_custkey"},
+              {"c_custkey"},
+              customers,
               "",
               {"l_orderkey", "o_orderdate", "o_shippriority", "part_revenue"})
           .partialAggregation(

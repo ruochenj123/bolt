@@ -605,6 +605,9 @@ class QueryConfig {
   /// If true, enable late materialization optimization for HashJoin->Sort
   /// pattern when they share the same keys. This avoids redundant layout
   /// conversion between operators.
+  /// Fusion v2 (deferred-ref columns; docs/fusion-v2-design.md).
+  static constexpr const char* kFusionV2Enabled = "fusion_v2_enabled";
+
   static constexpr const char* kLateMaterializationEnabled =
       "late_materialization_enabled";
 
@@ -1050,6 +1053,10 @@ class QueryConfig {
   /// Returns whether late materialization optimization is enabled.
   /// When enabled, HashJoin->Sort with same keys can share HybridContainer
   /// to avoid redundant layout conversion.
+  bool fusionV2Enabled() const {
+    return get<bool>(kFusionV2Enabled, false);
+  }
+
   bool lateMaterializationEnabled() const {
     return get<bool>(kLateMaterializationEnabled, false);
   }

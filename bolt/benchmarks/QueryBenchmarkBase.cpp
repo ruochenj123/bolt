@@ -102,6 +102,8 @@ DEFINE_bool(
     false,
     "Enable late materialization optimization for HashJoin->Sort pattern");
 
+DEFINE_bool(fusion_v2_enabled, false, "Enable fusion v2 (deferred-ref columns)");
+
 DEFINE_bool(
     hybrid_join_pointer_reuse_enabled,
     false,
@@ -303,6 +305,9 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
         params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
             "true";
       }
+      if (FLAGS_fusion_v2_enabled) {
+        params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
+      }
       if (FLAGS_hybrid_join_pointer_reuse_enabled) {
         params.queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] =
             "true";
@@ -368,6 +373,9 @@ QueryBenchmarkBase::run(const TpcdsPlan& tpcdsPlan) {
       if (FLAGS_late_materialization_enabled) {
         params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
             "true";
+      }
+      if (FLAGS_fusion_v2_enabled) {
+        params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
       }
       if (FLAGS_hybrid_join_pointer_reuse_enabled) {
         params.queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] =
