@@ -45,3 +45,5 @@ target_link_libraries(
   ${FOLLY_BENCHMARK}
   fmt::fmt
 )
+
+set_target_properties(bolt_hive_partition_function_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

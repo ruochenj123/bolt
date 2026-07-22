@@ -151,3 +151,65 @@ target_link_libraries(bolt_functions_prestosql_benchmarks_map_subscript ${BENCHM
 
 add_executable(bolt_functions_prestosql_benchmarks_generic GenericBenchmark.cpp)
 target_link_libraries(bolt_functions_prestosql_benchmarks_generic ${BENCHMARK_DEPENDENCIES})
+
+set_target_properties(bolt_benchmark_map_writer_with_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_benchmark_map_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_benchmarks_row_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_benchmarks_string_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_zip PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_row PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_comparisons PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_concat PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_zip_with PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_map_zip_with PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_cardinality PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_benchmarks_simdjson_function_with_expr PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_map_subscript PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_generic PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_array_contains PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_array_min_max PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_array_position PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_array_sum PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_width_bucket PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_string_ascii_utf_functions PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_not PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_date_time PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_bitwise PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_in PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_prestosql_benchmarks_map_input PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_benchmarks_url PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_functions_benchmarks_compare PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_benchmark_array_writer_with_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_benchmark_array_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_benchmark_nested_array_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_benchmark_nested_array_writer_with_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

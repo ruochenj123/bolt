@@ -29,3 +29,5 @@ target_link_libraries(
   ${FOLLY_BENCHMARK}
   gflags::gflags
 )
+
+set_target_properties(unsafe_row_serialize_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

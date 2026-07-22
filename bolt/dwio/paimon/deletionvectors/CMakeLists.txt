@@ -24,3 +24,7 @@ target_link_libraries(
 if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
+
+# WHOLE_ARCHIVE consistency: bolt_process appears both plain and feature'd in this
+# target's closure (mix from PR #136); declare the feature authoritative here.
+set_target_properties(bolt_dwio_paimon_deletion_vector_reader PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process")

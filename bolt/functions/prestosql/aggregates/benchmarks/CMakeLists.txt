@@ -111,3 +111,13 @@ target_link_libraries(
   ${FOLLY_BENCHMARK}
   gflags::gflags
 )
+
+set_target_properties(bolt_aggregates_simple_aggregates_bm PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_aggregates_string_keys_bm PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_aggregates_reduce_agg_bm PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_various_aggregates_bm PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_join_bm PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

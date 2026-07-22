@@ -86,3 +86,7 @@ if(${BOLT_ENABLE_CUDF})
   target_include_directories(bolt_exec_test_lib SYSTEM PRIVATE ${cudf_INCLUDE_DIRS})
   target_link_libraries(bolt_exec_test_lib bolt_cudf_exec bolt_cudf_test_util)
 endif()
+
+# WHOLE_ARCHIVE consistency: bolt_process appears both plain and feature'd in this
+# target's closure (mix from PR #136); declare the feature authoritative here.
+set_target_properties(bolt_exec_test_lib PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process")

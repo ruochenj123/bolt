@@ -57,3 +57,7 @@ target_link_libraries(
   ${FOLLY_BENCHMARK}
   gflags::gflags
 )
+
+set_target_properties(bolt_vector_selectivity_vector_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(copy_vectors_opt_bench PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

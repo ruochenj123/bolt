@@ -77,3 +77,5 @@ target_link_libraries(
   Folly::follybenchmark
   fmt::fmt
 )
+
+set_target_properties(bolt_query_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

@@ -113,3 +113,7 @@ endif()
 if(${BOLT_ENABLE_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
+
+# WHOLE_ARCHIVE consistency: bolt_process appears both plain and feature'd in this
+# target's closure (mix from PR #136); declare the feature authoritative here.
+set_target_properties(bolt_hive_connector PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process")

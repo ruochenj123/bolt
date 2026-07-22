@@ -28,3 +28,7 @@
 add_library(bolt_functions_aggregates_test_lib AggregationTestBase.cpp)
 
 target_link_libraries(bolt_functions_aggregates_test_lib bolt_exec_test_lib bolt_vector_test_lib)
+
+# WHOLE_ARCHIVE consistency: bolt_process appears both plain and feature'd in this
+# target's closure (mix from PR #136); declare the feature authoritative here.
+set_target_properties(bolt_functions_aggregates_test_lib PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process")

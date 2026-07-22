@@ -63,3 +63,5 @@ add_executable(bolt_sparksql_benchmarks_map MapBenchmark.cpp)
 target_link_libraries(
   bolt_sparksql_benchmarks_map bolt_functions_spark bolt_benchmark_builder bolt_vector_test_lib
 )
+
+set_target_properties(bolt_sparksql_benchmarks_in PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

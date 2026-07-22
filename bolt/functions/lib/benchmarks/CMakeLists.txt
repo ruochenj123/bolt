@@ -37,3 +37,5 @@ target_link_libraries(
   Folly::folly
   ${FOLLY_BENCHMARK}
 )
+
+set_target_properties(bolt_re2_functions_benchmarks PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

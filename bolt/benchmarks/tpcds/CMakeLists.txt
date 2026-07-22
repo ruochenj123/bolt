@@ -32,3 +32,7 @@ target_link_libraries(
 add_executable(bolt_tpcds_benchmark TpcdsBenchmarkMain.cpp)
 
 target_link_libraries(bolt_tpcds_benchmark bolt_tpcds_benchmark_lib)
+
+set_target_properties(bolt_tpcds_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_tpcds_benchmark_lib PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

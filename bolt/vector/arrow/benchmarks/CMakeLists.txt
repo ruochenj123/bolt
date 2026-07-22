@@ -57,3 +57,11 @@ target_link_libraries(
   arrow::libarrow_testing
   ${FOLLY_BENCHMARK}
 )
+
+set_target_properties(export_bolt_arrow_bridge_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(arrow_bolt_bridge_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(arrow_bolt_array_bridge_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(import_arrow_bolt_bridge_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

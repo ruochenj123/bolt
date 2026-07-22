@@ -56,3 +56,7 @@ target_link_libraries(
 add_executable(bolt_tpch_benchmark TpchBenchmarkMain.cpp)
 
 target_link_libraries(bolt_tpch_benchmark bolt_tpch_benchmark_lib)
+
+set_target_properties(bolt_tpch_benchmark_lib PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+
+set_target_properties(bolt_tpch_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
