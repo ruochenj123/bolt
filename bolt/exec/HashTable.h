@@ -69,20 +69,6 @@ struct TableInsertPartitionInfo {
   }
 };
 
-/// Virtual row for pointer reuse mode in N-way late materialization.
-/// Instead of reusing R_ptr directly (which requires dedup due to nextRow chain),
-/// we create lightweight virtual rows that point to the source data.
-/// This eliminates both dedup overhead and ptrToIndex lookup overhead.
-struct VirtualRow {
-  char* sourcePtr;      // Pointer to original R row (for key comparison)
-  size_t originalIndex; // Index in upstreamBuildRowPtrs_/upstreamProbeRowIds_
-  char* nextRow;        // For hash table chaining (replaces R_ptr's nextRow)
-
-  VirtualRow() : sourcePtr(nullptr), originalIndex(0), nextRow(nullptr) {}
-  VirtualRow(char* src, size_t idx)
-      : sourcePtr(src), originalIndex(idx), nextRow(nullptr) {}
-};
-
 /// Contains input and output parameters for groupProbe and joinProbe APIs.
 struct HashLookup {
   explicit HashLookup(const std::vector<std::unique_ptr<VectorHasher>>& h)
@@ -315,30 +301,6 @@ class BaseHashTable {
       folly::Executor* executor = nullptr,
       bool dropDuplicates = false,
       int8_t spillInputStartPartitionBit = kNoSpillInputStartPartitionBit) = 0;
-
-  /// Builds the hash table from external row pointers (pointer reuse mode).
-  /// Used for N-way joins where keys already exist in upstream containers.
-  /// @param rowPtrs External row pointers to use directly (ownership transferred)
-  /// @param keySource RowContainer that rowPtrs point into (used for hash/compare)
-  /// @param executor Optional executor for parallel hash table building
-  virtual void buildFromExternalPointers(
-      std::vector<char*> rowPtrs,
-      RowContainer* keySource,
-      folly::Executor* executor = nullptr) = 0;
-
-  /// Check if hash table is using VirtualRow mode.
-  /// In VirtualRow mode, hash hits return VirtualRow* instead of raw row pointers.
-  virtual bool isUsingVirtualRows() const = 0;
-
-  /// Get VirtualRow from a hit pointer (only valid when isUsingVirtualRows() is true).
-  virtual const VirtualRow* getVirtualRow(char* hitPtr) const = 0;
-
-  /// Get the source pointer (original row) from a hit pointer.
-  /// Works for both VirtualRow mode and direct external pointer mode.
-  virtual char* getSourcePtr(char* hitPtr) const = 0;
-
-  /// Get original index from a hit pointer (only valid when isUsingVirtualRows() is true).
-  virtual size_t getOriginalIndex(char* hitPtr) const = 0;
 
   /// The hash table used for join build in left semi and anti join does not
   /// retain duplicate join keys by default. This is achieved by constructing
@@ -761,53 +723,6 @@ class HashTable : public BaseHashTable {
       bool dropDuplicates = false,
       int8_t spillInputStartPartitionBit =
           kNoSpillInputStartPartitionBit) override;
-
-  /// Build hash table from external row pointers.
-  /// External rows must have compatible schema (same key columns at same offsets).
-  /// This is used for pointer reuse in N-way late materialization.
-  /// @param rowPtrs Pointers to rows in an external RowContainer
-  /// @param keySource The RowContainer where rowPtrs point into (for hash/compare)
-  /// @param executor Optional executor for parallel hash table building
-  void buildFromExternalPointers(
-      std::vector<char*> rowPtrs,
-      RowContainer* keySource,
-      folly::Executor* executor = nullptr) override;
-
-  /// Check if hash table is in external row mode.
-  bool isExternalRowMode() const {
-    return externalRowMode_;
-  }
-
-  /// Get external row pointers (only valid when isExternalRowMode() is true).
-  const std::vector<char*>& getExternalRowPtrs() const {
-    return externalRowPtrs_;
-  }
-
-  /// Check if hash table is using virtual rows mode.
-  bool isUsingVirtualRows() const override {
-    return useVirtualRows_;
-  }
-
-  /// Get VirtualRow from a hit pointer (only valid when useVirtualRows_ is true).
-  /// The hit pointer points to a VirtualRow, not the original R row.
-  const VirtualRow* getVirtualRow(char* hitPtr) const override {
-    return reinterpret_cast<const VirtualRow*>(hitPtr);
-  }
-
-  /// Get the source pointer (original R row) from a hit pointer.
-  /// Works for both virtual row mode and direct external pointer mode.
-  char* getSourcePtr(char* hitPtr) const override {
-    if (useVirtualRows_) {
-      return reinterpret_cast<VirtualRow*>(hitPtr)->sourcePtr;
-    }
-    return hitPtr;
-  }
-
-  /// Get original index from a hit pointer (only valid when useVirtualRows_ is true).
-  size_t getOriginalIndex(char* hitPtr) const override {
-    BOLT_CHECK(useVirtualRows_, "getOriginalIndex only valid in virtual rows mode");
-    return reinterpret_cast<VirtualRow*>(hitPtr)->originalIndex;
-  }
 
   uint64_t hashTableSizeIncrease(int32_t numNewDistinct) const override {
     if (numDistinct_ + numNewDistinct > rehashSize()) {
@@ -1244,16 +1159,6 @@ class HashTable : public BaseHashTable {
 
   // If true, avoids using VectorHasher value ranges with kArray hash mode.
   bool disableRangeArrayHash_{false};
-
-  // External row mode: hash table built from external row pointers
-  // instead of rows in rows_ RowContainer.
-  bool externalRowMode_{false};
-  std::vector<char*> externalRowPtrs_;
-  RowContainer* externalKeySource_{nullptr};
-
-  // Virtual rows for pointer reuse mode (eliminates dedup and ptrToIndex overhead)
-  std::vector<VirtualRow> virtualRows_;
-  bool useVirtualRows_{false};
 
   friend class ProbeState;
   friend test::HashTableTestHelper<ignoreNullKeys>;

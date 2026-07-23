@@ -149,26 +149,11 @@ target_link_libraries(
   gflags::gflags
 )
 
-add_executable(bolt_hybrid_late_m_benchmark HybridLateMBenchmark.cpp)
-target_link_libraries(
-  bolt_hybrid_late_m_benchmark
-  bolt_exec
-  bolt_exec_test_lib
-  bolt_tpch_connector
-  bolt_aggregates
-  bolt_functions_prestosql
-  Folly::folly
-  gflags::gflags
-  glog::glog
-)
-
 set_target_properties(bolt_gather_copy_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
 
 set_target_properties(rowEqVectors_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
 
 set_target_properties(hash_vectors_bench PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_hybrid_late_m_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
 
 set_target_properties(bolt_filter_project_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
 

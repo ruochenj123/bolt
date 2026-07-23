@@ -97,17 +97,7 @@ DEFINE_bool(
     false,
     "Enable hybrid sort optimization");
 
-DEFINE_bool(
-    late_materialization_enabled,
-    false,
-    "Enable late materialization optimization for HashJoin->Sort pattern");
-
 DEFINE_bool(fusion_v2_enabled, false, "Enable fusion v2 (deferred-ref columns)");
-
-DEFINE_bool(
-    hybrid_join_pointer_reuse_enabled,
-    false,
-    "Enable pointer reuse optimization for N-way late materialization");
 
 DEFINE_bool(
     hybrid_join_scattered_mode_enabled,
@@ -301,16 +291,8 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       if (FLAGS_hybrid_sort_enabled) {
         params.queryConfigs[core::QueryConfig::kHybridSortEnabled] = "true";
       }
-      if (FLAGS_late_materialization_enabled) {
-        params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
-            "true";
-      }
       if (FLAGS_fusion_v2_enabled) {
         params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
-      }
-      if (FLAGS_hybrid_join_pointer_reuse_enabled) {
-        params.queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] =
-            "true";
       }
       if (FLAGS_hybrid_join_scattered_mode_enabled) {
         params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
@@ -370,16 +352,8 @@ QueryBenchmarkBase::run(const TpcdsPlan& tpcdsPlan) {
       if (FLAGS_hybrid_sort_enabled) {
         params.queryConfigs[core::QueryConfig::kHybridSortEnabled] = "true";
       }
-      if (FLAGS_late_materialization_enabled) {
-        params.queryConfigs[core::QueryConfig::kLateMaterializationEnabled] =
-            "true";
-      }
       if (FLAGS_fusion_v2_enabled) {
         params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
-      }
-      if (FLAGS_hybrid_join_pointer_reuse_enabled) {
-        params.queryConfigs[core::QueryConfig::kHybridJoinPointerReuseEnabled] =
-            "true";
       }
       if (FLAGS_hybrid_join_scattered_mode_enabled) {
         params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =

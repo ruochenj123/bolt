@@ -49,19 +49,6 @@ namespace bytedance::bolt::exec {
 /// A utility class to accumulate data inside and output the sorted result.
 /// Spilling would be triggered if spilling is enabled and memory usage exceeds
 /// limit.
-///
-/// Late Materialization Mode:
-/// When lateMaterializationEnabled is true, SortBuffer acts as the materialization
-/// point for N-way late-m joins. In this mode:
-/// - addInput() stores sort key columns plus captures row references from DriverCtx
-/// - noMoreInput() sorts and reorders row references to match sorted order
-/// - getOutput() materializes full rows from upstream containers using columnSourceMap
-///
-/// Sort Pointer Reuse Mode:
-/// When pointerReuseEnabled is true AND sort keys match upstream join keys:
-/// - addInput() directly stores passed row pointers without rebuilding
-/// - noMoreInput() sorts using upstream RowContainer for comparison
-/// - This avoids the overhead of copying sort keys into Sort's own RowContainer
 class SortBuffer {
  public:
   SortBuffer(
@@ -73,10 +60,7 @@ class SortBuffer {
       const common::SpillConfig* spillConfig = nullptr,
       uint64_t spillMemoryThreshold = 0,
       OperatorCtx* operatorCtx = nullptr,
-      bool hybridSortEnabled = false,
-      bool lateMaterializationEnabled = false,
-      DriverCtx* driverCtx = nullptr,
-      bool pointerReuseEnabled = false);
+      bool hybridSortEnabled = false);
 
   void addInput(const VectorPtr& input);
 
@@ -182,8 +166,6 @@ class SortBuffer {
   void prepareOutput(uint32_t maxOutputRows);
   void getOutputWithoutSpill();
   void getOutputWithSpill();
-  // Late materialization output: materialize full rows from upstream containers
-  void getOutputLateMaterialization();
   // Spill during input stage.
   void spillInput();
   // Spill during output stage.
@@ -259,47 +241,6 @@ class SortBuffer {
   std::vector<IdentityProjection> payloadColumnMap_;
   std::vector<column_index_t> payloadChannels_;
   RowTypePtr payloadTypes_;
-  
-  // === Late Materialization State ===
-  // When lateMaterializationEnabled_ is true, SortBuffer is the materialization
-  // point for N-way late-m joins. It stores row references alongside sort keys
-  // and materializes from upstream containers after sorting.
-  
-  bool lateMaterializationEnabled_{false};
-  
-  /// DriverCtx for accessing row references during addInput
-  DriverCtx* driverCtx_{nullptr};
-  
-  /// Column source map for late materialization (tells where each output column comes from)
-  ColumnSourceMap columnSourceMap_;
-  
-  /// Row references stored for all input rows (parallel to rows in data_)
-  /// buildRowPtrs[i] points to build-side row for input row i
-  /// probeRowIds[i] encodes probe-side row reference for input row i
-  std::vector<char*> lateMBuildRowPtrs_;
-  std::vector<uint64_t> lateMProbeRowIds_;
-  
-  /// Sorted row references (reordered to match sortedRows_)
-  std::vector<char*> sortedBuildRowPtrs_;
-  std::vector<uint64_t> sortedProbeRowIds_;
-  
-  /// Primary upstream hash table - kept alive for row pointer validity
-  std::shared_ptr<BaseHashTable> primaryUpstreamHashTable_;
-  
-  /// Upstream probe payload containers (for probe-side column extraction)
-  std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>
-      upstreamProbePayloads_;
-  
-  // === Sort Pointer Reuse State ===
-  // When pointerReuseEnabled_ is true, Sort directly uses passed row pointers
-  // without rebuilding rows in its own RowContainer. The upstream RowContainer
-  // (from the hash table) is used for row comparison during sorting.
-  
-  bool pointerReuseEnabled_{false};
-  
-  /// The RowContainer to use for comparison in pointer reuse mode.
-  /// Points to the upstream hash table's keys RowContainer.
-  RowContainer* comparisonRowContainer_{nullptr};
 };
 
 } // namespace bytedance::bolt::exec

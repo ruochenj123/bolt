@@ -389,22 +389,14 @@ bool HashTable<ignoreNullKeys>::compareKeys(
     const char* group,
     HashLookup& lookup,
     vector_size_t row) {
-  // In VirtualRow mode, group is a VirtualRow*, we need to compare against sourcePtr
-  const char* actualGroup = useVirtualRows_ 
-      ? reinterpret_cast<const VirtualRow*>(group)->sourcePtr 
-      : group;
-  
   int32_t numKeys = lookup.hashers.size();
   // The loop runs at least once. Allow for first comparison to fail
   // before loop end check.
   int32_t i = 0;
-  // In VirtualRow/external mode, use externalKeySource_ for comparison
-  RowContainer* compareContainer = externalKeySource_ ? externalKeySource_ : rows_.get();
-  
   do {
     auto& hasher = lookup.hashers[i];
-    if (!compareContainer->equals<!ignoreNullKeys>(
-            actualGroup, compareContainer->columnAt(i), hasher->decodedVector(), row)) {
+    if (!rows_->equals<!ignoreNullKeys>(
+            group, rows_->columnAt(i), hasher->decodedVector(), row)) {
       return false;
     }
   } while (++i < numKeys);
@@ -415,38 +407,26 @@ template <bool ignoreNullKeys>
 bool HashTable<ignoreNullKeys>::compareKeys(
     const char* group,
     const char* inserted) {
-  // In VirtualRow mode, both group and inserted are VirtualRow*, compare sourcePtrs
-  const char* actualGroup = useVirtualRows_
-      ? reinterpret_cast<const VirtualRow*>(group)->sourcePtr
-      : group;
-  const char* actualInserted = useVirtualRows_
-      ? reinterpret_cast<const VirtualRow*>(inserted)->sourcePtr
-      : inserted;
-  
-  // In VirtualRow/external mode, use externalKeySource_ for comparison
-  RowContainer* compareContainer = externalKeySource_ ? externalKeySource_ : rows_.get();
-  
   auto scalarCmp = [&]() -> bool {
     auto numKeys = hashers_.size();
     int32_t i = 0;
     do {
-      if (compareContainer->compare(actualGroup, actualInserted, i, CompareFlags{true, true})) {
+      if (rows_->compare(group, inserted, i, CompareFlags{true, true})) {
         return false;
       }
     } while (++i < numKeys);
     return true;
   };
 #if DEBUG
-  if (rowEqRowFunc_ && !useVirtualRows_) {
-    // JIT comparison not supported in VirtualRow mode
-    auto jitEqual = rowEqRowFunc_(actualGroup, actualInserted);
+  if (rowEqRowFunc_) {
+    auto jitEqual = rowEqRowFunc_(group, inserted);
     auto expected = scalarCmp();
     if ((expected && !jitEqual) || (!expected && jitEqual)) {
       std::stringstream ss;
       ss << " build cmp expected: " << (int)expected
          << " jitEqual: " << (int)jitEqual
-         << " row:  " << compareContainer->toString(actualGroup)
-         << " insert: " << compareContainer->toString(actualInserted) << std::endl;
+         << " row:  " << rows_->toString(group)
+         << " insert: " << rows_->toString(inserted) << std::endl;
       std::cerr << ss.str() << std::endl;
       BOLT_CHECK(false);
     }
@@ -455,9 +435,8 @@ bool HashTable<ignoreNullKeys>::compareKeys(
   return scalarCmp();
 #else
 
-  if (rowEqRowFunc_ && !useVirtualRows_) {
-    // JIT comparison not supported in VirtualRow mode
-    return rowEqRowFunc_(actualGroup, actualInserted);
+  if (rowEqRowFunc_) {
+    return rowEqRowFunc_(group, inserted);
   }
   return scalarCmp();
 #endif
@@ -492,10 +471,6 @@ FOLLY_ALWAYS_INLINE void HashTable<ignoreNullKeys>::fullProbe(
       *this,
       0,
       [&](char* group, int32_t row) {
-        // In VirtualRow mode, always use compareKeys (JIT doesn't understand VirtualRow)
-        if (useVirtualRows_) {
-          return compareKeys(group, lookup, row);
-        }
 #if DEBUG
         if (rowEqVectorsFunc_) {
           auto expected = compareKeys(group, lookup, row);
@@ -953,16 +928,13 @@ bool HashTable<ignoreNullKeys>::hashRows(
     return true;
   }
 
-  // In VirtualRow/external mode, use externalKeySource_ for column layout
-  RowContainer* hashContainer = externalKeySource_ ? externalKeySource_ : rows_.get();
-
   for (int32_t i = 0; i < hashers_.size(); ++i) {
     auto& hasher = hashers_[i];
     if (hashMode_ == HashMode::kHash) {
-      hashContainer->hash(i, rows, i > 0, hashes.data());
+      rows_->hash(i, rows, i > 0, hashes.data());
     } else {
       // Array or normalized key.
-      auto column = hashContainer->columnAt(i);
+      auto column = rows_->columnAt(i);
       if (!hasher->computeValueIdsForRows(
               rows.data(),
               rows.size(),
@@ -1882,28 +1854,6 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     for (auto& table : otherTables_)
       hybridDataChannel[table->hybridData()->getId()] = table->hybridData();
     hybridData_->setAllContainers(hybridDataChannel);
-
-    // For N-way late-m: merge upstream ProbePayloadContainers
-    // Collect all ProbePayloadContainers from all merged tables and call
-    // setAllContainers on each one to enable cross-driver extraction
-    const auto& myProbePayloads = hybridData_->getUpstreamProbePayloads();
-    if (!myProbePayloads.empty()) {
-      // Build merged map of all probe payload containers
-      std::unordered_map<uint8_t, ProbePayloadContainer*> allProbePayloads;
-      for (const auto& [driverId, container] : myProbePayloads) {
-        allProbePayloads[driverId] = container.get();
-      }
-      for (auto& table : otherTables_) {
-        for (const auto& [driverId, container] :
-             table->hybridData()->getUpstreamProbePayloads()) {
-          allProbePayloads[driverId] = container.get();
-        }
-      }
-      // Set allContainers on each ProbePayloadContainer for cross-driver extraction
-      for (auto& [_, container] : allProbePayloads) {
-        container->setAllContainers(allProbePayloads);
-      }
-    }
   }
 
   bool useValueIds = mayUseValueIds(*this);
@@ -2432,233 +2382,5 @@ void BaseHashTable::prepareForJoinProbe(
   populateLookupRows(rows, lookup.rows);
 }
 
-template <bool ignoreNullKeys>
-void HashTable<ignoreNullKeys>::buildFromExternalPointers(
-    std::vector<char*> rowPtrs,
-    RowContainer* keySource,
-    folly::Executor* executor) {
-  BOLT_CHECK(
-      isJoinBuild_,
-      "buildFromExternalPointers only supported for join build");
-  BOLT_CHECK(
-      keySource != nullptr,
-      "keySource cannot be null for external pointer mode");
-  
-  const size_t numRows = rowPtrs.size();
-  
-  // Set external row mode
-  externalRowMode_ = true;
-  externalRowPtrs_ = std::move(rowPtrs);
-  externalKeySource_ = keySource;
-  
-  if (numRows == 0) {
-    return;
-  }
-  
-  // Use VirtualRow mode: create a lightweight wrapper for each input row.
-  useVirtualRows_ = true;
-  
-  auto t0 = std::chrono::steady_clock::now();
-  virtualRows_.resize(numRows);
-  auto t1 = std::chrono::steady_clock::now();
-  for (size_t i = 0; i < numRows; ++i) {
-    virtualRows_[i].sourcePtr = externalRowPtrs_[i];
-    virtualRows_[i].originalIndex = i;
-    virtualRows_[i].nextRow = nullptr;
-  }
-  auto t2 = std::chrono::steady_clock::now();
-
-  // Set nextOffset_ to VirtualRow::nextRow offset
-  nextOffset_ = offsetof(VirtualRow, nextRow);
-  numDistinct_ = numRows;
-  // Keep hashMode_ as kHash for build/probe hash consistency.
-  // Note: We cannot reuse normalized keys from keySource because probe
-  // uses column-based hash, which differs from normalized key values.
-  hashMode_ = HashMode::kHash;
-  checkSize(0, true);
-  
-  // If no executor, use single-threaded build
-  if (!executor) {
-    constexpr int32_t kBatchSize = 1024;
-    raw_vector<uint64_t> hashes;
-    hashes.resize(kBatchSize);
-    std::vector<char*> sourcePtrBatch(kBatchSize);
-    std::vector<char*> virtualRowPtrBatch(kBatchSize);
-
-    auto t3 = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < numRows; i += kBatchSize) {
-      size_t batchEnd = std::min(i + kBatchSize, numRows);
-      size_t batchSize = batchEnd - i;
-      
-      for (size_t j = 0; j < batchSize; ++j) {
-        sourcePtrBatch[j] = virtualRows_[i + j].sourcePtr;
-        virtualRowPtrBatch[j] = reinterpret_cast<char*>(&virtualRows_[i + j]);
-      }
-      
-      auto rowRange = folly::Range<char**>(sourcePtrBatch.data(), batchSize);
-      if (!hashRows(rowRange, false, hashes)) {
-        BOLT_CHECK(false, "hashRows failed in virtual row mode");
-      }
-      
-      insertForJoin(virtualRowPtrBatch.data(), hashes.data(), batchSize, nullptr);
-    }
-    auto t4 = std::chrono::steady_clock::now();
-    VLOG(1) << "[buildFromExternalPointers] numRows=" << numRows
-               << " VirtualRow alloc=" << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << "ms"
-               << " VirtualRow init=" << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << "ms"
-               << " HashTable build=" << std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << "ms (single-threaded)";
-    return;
-  }
-
-  // Parallel build: partition VirtualRows by hash and build in parallel
-  buildExecutor_ = executor;
-  const int numPartitions = std::min<int>(buildExecutor_ != nullptr ? 8 : 1, (numRows + 9999) / 10000);
-  
-  // Set up partition bounds
-  buildPartitionBounds_.resize(numPartitions + 1);
-  std::fill(
-      buildPartitionBounds_.begin(),
-      buildPartitionBounds_.begin() + buildPartitionBounds_.capacity(),
-      std::numeric_limits<PartitionBoundIndexType>::max());
-  for (int i = 0; i < numPartitions; ++i) {
-    buildPartitionBounds_[i] =
-        bits::roundUp(((sizeMask_ + 1) / numPartitions) * i, kBucketSize);
-  }
-  buildPartitionBounds_.back() = sizeMask_ + 1;
-
-  // Parallel hash+partition: split rows into chunks and process in parallel
-  auto t3 = std::chrono::steady_clock::now();
-  std::vector<uint8_t> rowPartitions(numRows);
-  std::vector<uint64_t> rowHashes(numRows);
-  
-  // Use same number of parallel tasks as partitions
-  const int numHashTasks = numPartitions;
-  const size_t chunkSize = (numRows + numHashTasks - 1) / numHashTasks;
-  
-  std::vector<std::shared_ptr<AsyncSource<bool>>> hashSteps;
-  for (int t = 0; t < numHashTasks; ++t) {
-    size_t startIdx = t * chunkSize;
-    size_t endIdx = std::min(startIdx + chunkSize, numRows);
-    if (startIdx >= numRows) break;
-    
-    hashSteps.push_back(std::make_shared<AsyncSource<bool>>(
-        [this, startIdx, endIdx, numPartitions, &rowHashes, &rowPartitions]() {
-          constexpr int32_t kBatchSize = 1024;
-          raw_vector<uint64_t> batchHashes;
-          batchHashes.resize(kBatchSize);
-          std::vector<char*> sourcePtrBatch(kBatchSize);
-          
-          for (size_t i = startIdx; i < endIdx; i += kBatchSize) {
-            size_t batchEnd = std::min(i + kBatchSize, endIdx);
-            size_t batchSize = batchEnd - i;
-            
-            for (size_t j = 0; j < batchSize; ++j) {
-              sourcePtrBatch[j] = virtualRows_[i + j].sourcePtr;
-            }
-            
-            auto rowRange = folly::Range<char**>(sourcePtrBatch.data(), batchSize);
-            hashRows(rowRange, false, batchHashes);
-            
-            for (size_t j = 0; j < batchSize; ++j) {
-              rowHashes[i + j] = batchHashes[j];
-              auto index = bucketOffset(batchHashes[j]);
-              for (int p = 0; p < numPartitions; ++p) {
-                if (index < buildPartitionBounds_[p + 1]) {
-                  rowPartitions[i + j] = p;
-                  break;
-                }
-              }
-            }
-          }
-          return std::make_unique<bool>(true);
-        }));
-    executor->add([step = hashSteps.back()]() { step->prepare(); });
-  }
-  
-  // Wait for all hash tasks to complete
-  for (auto& step : hashSteps) {
-    step->move();
-  }
-  auto t4 = std::chrono::steady_clock::now();
-
-  // Build partition indices
-  std::vector<std::vector<size_t>> partitionIndices(numPartitions);
-  for (size_t i = 0; i < numRows; ++i) {
-    partitionIndices[rowPartitions[i]].push_back(i);
-  }
-  auto t5 = std::chrono::steady_clock::now();
-
-  // Parallel build each partition
-  std::vector<std::shared_ptr<AsyncSource<bool>>> buildSteps;
-  std::vector<std::vector<char*>> overflowPerPartition(numPartitions);
-  
-  for (int p = 0; p < numPartitions; ++p) {
-    buildSteps.push_back(std::make_shared<AsyncSource<bool>>(
-        [this, p, &partitionIndices, &rowHashes, &overflowPerPartition]() {
-          auto& indices = partitionIndices[p];
-          TableInsertPartitionInfo partitionInfo{
-              buildPartitionBounds_[p],
-              buildPartitionBounds_[p + 1],
-              overflowPerPartition[p]};
-          
-          constexpr int32_t kInsertBatch = 1024;
-          std::vector<char*> virtualRowPtrs(kInsertBatch);
-          raw_vector<uint64_t> hashes;
-          hashes.resize(kInsertBatch);
-          
-          for (size_t i = 0; i < indices.size(); i += kInsertBatch) {
-            size_t batchEnd = std::min(i + kInsertBatch, indices.size());
-            size_t batchSize = batchEnd - i;
-            
-            for (size_t j = 0; j < batchSize; ++j) {
-              virtualRowPtrs[j] = reinterpret_cast<char*>(&virtualRows_[indices[i + j]]);
-              hashes[j] = rowHashes[indices[i + j]];
-            }
-            
-            insertForJoin(virtualRowPtrs.data(), hashes.data(), batchSize, &partitionInfo);
-          }
-          return std::make_unique<bool>(true);
-        }));
-    buildExecutor_->add([step = buildSteps.back()]() { step->prepare(); });
-  }
-  
-  // Wait for all partitions to complete
-  std::exception_ptr error;
-  for (auto& step : buildSteps) {
-    try {
-      step->move();
-    } catch (const std::exception& e) {
-      error = std::current_exception();
-    }
-  }
-  if (error) {
-    std::rethrow_exception(error);
-  }
-  auto t6 = std::chrono::steady_clock::now();
-
-  // Insert overflow rows
-  for (int p = 0; p < numPartitions; ++p) {
-    auto& overflows = overflowPerPartition[p];
-    if (!overflows.empty()) {
-      raw_vector<uint64_t> hashes;
-      hashes.resize(overflows.size());
-      for (size_t i = 0; i < overflows.size(); ++i) {
-        auto* vrow = reinterpret_cast<VirtualRow*>(overflows[i]);
-        hashes[i] = rowHashes[vrow->originalIndex];
-      }
-      insertForJoin(overflows.data(), hashes.data(), overflows.size(), nullptr);
-    }
-  }
-  auto t7 = std::chrono::steady_clock::now();
-
-  LOG(ERROR) << "[buildFromExternalPointers] numRows=" << numRows
-             << " VirtualRow alloc=" << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << "ms"
-             << " VirtualRow init=" << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << "ms"
-             << " hash+partition=" << std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << "ms"
-             << " index=" << std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count() << "ms"
-             << " parallel build=" << std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count() << "ms"
-             << " overflow=" << std::chrono::duration_cast<std::chrono::milliseconds>(t7 - t6).count() << "ms"
-             << " (numPartitions=" << numPartitions << ")";
-}
 
 } // namespace bytedance::bolt::exec

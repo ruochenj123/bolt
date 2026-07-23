@@ -588,12 +588,6 @@ class QueryConfig {
 
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
-  /// If true, enable pointer reuse optimization for N-way late materialization.
-  /// In pointer reuse mode, downstream joins reuse row pointers from upstream
-  /// joins instead of copying keys, reducing memory usage for multi-way joins.
-  static constexpr const char* kHybridJoinPointerReuseEnabled =
-      "hybrid_join_pointer_reuse_enabled";
-
   /// If true, use scattered (non-coalesced) mode for hybrid join payload extraction.
   /// In scattered mode, payload batches are kept separate instead of being
   /// merged into one large batch. Row IDs encode (batchId, rowInBatch) instead
@@ -602,14 +596,8 @@ class QueryConfig {
   static constexpr const char* kHybridJoinScatteredModeEnabled =
       "hybrid_join_scattered_mode_enabled";
 
-  /// If true, enable late materialization optimization for HashJoin->Sort
-  /// pattern when they share the same keys. This avoids redundant layout
-  /// conversion between operators.
   /// Fusion v2 (deferred-ref columns; docs/fusion-v2-design.md).
   static constexpr const char* kFusionV2Enabled = "fusion_v2_enabled";
-
-  static constexpr const char* kLateMaterializationEnabled =
-      "late_materialization_enabled";
 
   /**
    * LLVM JIT enabled
@@ -1036,13 +1024,6 @@ class QueryConfig {
     return get<bool>(kHybridSortEnabled, false);
   }
 
-  /// Returns whether pointer reuse optimization is enabled for N-way late-m.
-  /// When enabled, downstream joins reuse row pointers from upstream joins
-  /// instead of copying keys, reducing memory usage for multi-way joins.
-  bool hybridJoinPointerReuseEnabled() const {
-    return get<bool>(kHybridJoinPointerReuseEnabled, false);
-  }
-
   /// Returns whether scattered (non-coalesced) mode is enabled for hybrid join.
   /// When enabled, payload batches are kept separate instead of being merged,
   /// avoiding coalesceBatches() overhead. Default false (use coalesced mode).
@@ -1050,15 +1031,9 @@ class QueryConfig {
     return get<bool>(kHybridJoinScatteredModeEnabled, true);
   }
 
-  /// Returns whether late materialization optimization is enabled.
-  /// When enabled, HashJoin->Sort with same keys can share HybridContainer
-  /// to avoid redundant layout conversion.
+  /// Returns whether fusion v2 (deferred-ref columns) is enabled.
   bool fusionV2Enabled() const {
     return get<bool>(kFusionV2Enabled, false);
-  }
-
-  bool lateMaterializationEnabled() const {
-    return get<bool>(kLateMaterializationEnabled, false);
   }
 
   /// Returns 'is aggregation spilling enabled' flag. Must also check the

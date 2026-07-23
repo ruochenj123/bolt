@@ -49,12 +49,6 @@
 namespace bytedance::bolt::exec {
 class FusionPlan;
 
-// Forward declarations for late materialization
-class BaseHashTable;
-class HybridContainer;
-class ProbePayloadContainer;
-struct ColumnSource;
-
 class Driver;
 class ExchangeClient;
 class LocalExchangeQueue;
@@ -304,86 +298,6 @@ struct DriverCtx {
   std::unordered_map<int32_t, std::string> tracedOperatorMap;
 
   const bool isAbtestControlGroup;
-
-  // === Late Materialization State ===
-
-  /// Whether build-side late-m is enabled for this pipeline
-  bool buildSideLateMEnabled = false;
-
-  /// Column source metadata: output channel → source location
-  /// Passed from HashProbe to HashBuild, updated as columns are extracted
-  std::unordered_map<int32_t, ColumnSource> columnSourceMap;
-
-  /// Upstream row pointers for current batch (build side)
-  /// These are char* pointers directly into upstream HybridContainer rows
-  std::vector<char*> buildSideLateMBuildRowPtrs;
-
-  /// Upstream probe row IDs for current batch
-  /// Encoded as (driverId << 56) | localRowIndex
-  std::vector<uint64_t> buildSideLateMProbeRowIds;
-
-  /// The primary upstream hash table - keeps the table alive so row pointers remain valid.
-  /// This is the build-side hash table from the current probe operation.
-  std::shared_ptr<BaseHashTable> primaryUpstreamHashTable;
-
-  /// The primary upstream build container - the one that buildSideLateMBuildRowPtrs point into.
-  /// This is the build-side container from the current probe operation.
-  std::shared_ptr<HybridContainer> primaryUpstreamBuildContainer;
-
-  /// Shared ownership of upstream probe payloads (for cross-driver access)
-  std::unordered_map<uint8_t, std::shared_ptr<ProbePayloadContainer>>
-      buildSideLateMUpstreamProbePayloads;
-
-  /// Plan node ID where materialization should happen (final probe or OrderBy)
-  std::string materializationPlanNodeId;
-  
-  /// If true, the materialization point is an OrderBy (Sort) node.
-  /// When set, the final HashProbe uses OUTPUT mode (passing row refs to Sort),
-  /// and OrderBy performs final materialization after sorting.
-  bool sortMaterializationEnabled = false;
-  
-  /// If true, Sort can use pointer reuse optimization: directly sort the passed
-  /// row pointers without rebuilding rows in its own RowContainer.
-  /// This is enabled when Sort's keys match the upstream join's keys.
-  bool sortPointerReuseEnabled = false;
-
-  /// For N-way late-m: output channels that are keys for downstream HashBuild.
-  /// Keyed by HashProbe's plan node ID. Only these channels need to be materialized
-  /// in intermediate probe outputs. Empty set means materialize all (final probe).
-  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
-      downstreamBuildKeyChannels;
-  
-  /// For N-way late-m followed by Sort: output channels that are sort keys for
-  /// downstream OrderBy. Keyed by HashProbe's plan node ID.
-  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
-      downstreamSortKeyChannels;
-
-  /// Set of plan node IDs eligible for pointer reuse optimization.
-  /// Only operators with their planNodeId in this set should enable pointer reuse.
-  /// Used by HashBuild to check if THIS build should reuse pointers.
-  std::set<core::PlanNodeId> pointerReuseEligibleNodeIds;
-
-  /// Set of probe node IDs whose DOWNSTREAM build is pointer-reuse eligible.
-  /// Used by HashProbe to check if it should skip key extraction.
-  std::set<core::PlanNodeId> downstreamPointerReuseEligibleProbeIds;
-
-  /// Clear batch-level state between batches
-  void clearBatchState() {
-    buildSideLateMBuildRowPtrs.clear();
-    buildSideLateMProbeRowIds.clear();
-  }
-
-  /// Clear all late-m state (called at pipeline end)
-  void clearLateMaterializationState() {
-    buildSideLateMEnabled = false;
-    columnSourceMap.clear();
-    buildSideLateMBuildRowPtrs.clear();
-    buildSideLateMProbeRowIds.clear();
-    primaryUpstreamHashTable.reset();
-    primaryUpstreamBuildContainer.reset();
-    buildSideLateMUpstreamProbePayloads.clear();
-    materializationPlanNodeId.clear();
-  }
 
   DriverCtx(
       std::shared_ptr<Task> _task,
@@ -716,51 +630,10 @@ struct DriverFactory {
   /// Same as 'mixedExecutionModeHashJoinNodeIds' but for Nested Loop Joins.
   folly::F14FastSet<core::PlanNodeId> mixedExecutionModeNestedLoopJoinNodeIds;
 
-  // === N-way Join Late Materialization ===
-
-  /// Whether this pipeline participates in an N-way join chain where
-  /// build-side late materialization is enabled.
-  bool nWayJoinLateMEnabled{false};
-
   /// Fusion v2 (immutable after planning; see docs/fusion-v2-design.md).
   /// Shared by all drivers of this pipeline; operators read their hop via
   /// fusionPlan->hopFor(planNodeId). Never mutated at runtime.
   std::shared_ptr<const FusionPlan> fusionPlan;
-
-  /// For N-way join chains, the plan node ID where final materialization
-  /// should happen. This can be:
-  /// - A HashProbe ID: final HashProbe does materialization
-  /// - An OrderBy ID: Sort does materialization after sorting
-  core::PlanNodeId nWayMaterializationPlanNodeId;
-  
-  /// If true, the materialization point is an OrderBy (Sort) node.
-  /// When set, the final HashProbe in the chain uses OUTPUT mode (passing
-  /// row references to Sort), and OrderBy performs final materialization.
-  bool nWaySortMaterializationEnabled{false};
-  
-  /// If true, OrderBy can use Sort pointer reuse: directly sort the passed
-  /// row pointers without rebuilding rows. Enabled when Sort's keys match join's keys.
-  bool nWaySortPointerReuseEnabled{false};
-
-  /// For N-way late-m: output channels of HashProbe that are keys for downstream
-  /// HashBuild. Keyed by the HashProbe's plan node ID.
-  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
-      nWayDownstreamBuildKeyChannels;
-  
-  /// For N-way late-m followed by Sort: output channels of HashProbe that are
-  /// sort keys for downstream OrderBy. Keyed by the HashProbe's plan node ID.
-  /// The final HashProbe materializes sort key columns for OrderBy to sort.
-  std::unordered_map<core::PlanNodeId, std::set<column_index_t>>
-      nWayDownstreamSortKeyChannels;
-
-  /// Set of plan node IDs eligible for pointer reuse optimization in this factory.
-  /// Operators check if their planNodeId is in this set before enabling pointer reuse.
-  /// Used by HashBuild.
-  std::set<core::PlanNodeId> nWayPointerReuseEligibleNodeIds;
-
-  /// Set of probe node IDs whose downstream build is pointer-reuse eligible.
-  /// Used by HashProbe to skip key extraction.
-  std::set<core::PlanNodeId> nWayDownstreamPointerReuseEligibleProbeIds;
 
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,

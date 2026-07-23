@@ -80,18 +80,7 @@ OrderBy::OrderBy(
         fromSortOrderToCompareFlags(orderByNode->sortingOrders()[i]));
   }
   auto hybridSortEnabled = driverCtx->queryConfig().hybridSortEnabled();
-  
-  // Check if this OrderBy is the materialization point for N-way late-m
-  bool lateMaterializationEnabled = driverCtx->sortMaterializationEnabled &&
-      !driverCtx->materializationPlanNodeId.empty() &&
-      driverCtx->materializationPlanNodeId == planNodeId();
-  
-  // Check if Sort pointer reuse is enabled
-  // Requires: late-m enabled, global pointer reuse flag, and LocalPlanner detected matching keys
-  bool pointerReuseEnabled = lateMaterializationEnabled &&
-      driverCtx->queryConfig().hybridJoinPointerReuseEnabled() &&
-      driverCtx->sortPointerReuseEnabled;
-  
+
   sortBuffer_ = std::make_unique<SortBuffer>(
       outputType_,
       sortColumnIndices,
@@ -101,11 +90,8 @@ OrderBy::OrderBy(
       spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
       operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold(),
       operatorCtx_.get(),
-      hybridSortEnabled,
-      lateMaterializationEnabled,
-      driverCtx,
-      pointerReuseEnabled);
-  
+      hybridSortEnabled);
+
   this->setRuntimeMetric(
       OperatorMetricKey::kCanUsedToEstimateHashBuildPartitionNum, "true");
   this->setRuntimeMetric(
