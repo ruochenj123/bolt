@@ -74,6 +74,27 @@ DEFINE_int32(
     s_selectivity_pct,
     100,
     "Selectivity percentage for S table in Q34 (10, 30, 60, 90, or 100)");
+
+DEFINE_int32(
+    synth_payload_cols,
+    12,
+    "Synthetic benches (Q31 join / Q40 sort): number of payload/projection "
+    "columns to carry (1..12; VARCHARs are the last two).");
+DEFINE_int32(
+    synth_sort_keys,
+    4,
+    "Q40 sort bench: number of sort keys (1..4, low-cardinality first).");
+
+DEFINE_bool(
+    synth_join_sort,
+    false,
+    "Q31 join bench: append the 4-key sort after the join.");
+
+DEFINE_int32(
+    synth_join_keys,
+    4,
+    "Q31 join bench: number of join keys (1..4; row_id first, so match "
+    "cardinality is identical for any count).");
 DEFINE_int32(
     t_selectivity_pct,
     100,

@@ -101,8 +101,15 @@ DEFINE_bool(fusion_v2_enabled, false, "Enable fusion v2 (deferred-ref columns)")
 
 DEFINE_bool(
     hybrid_join_scattered_mode_enabled,
-    false,
-    "Enable scattered (non-coalesced) mode for hybrid join payload extraction");
+    true,
+    "Enable scattered (non-coalesced) mode for hybrid join payload extraction "
+    "(matches QueryConfig default; set =false to force coalesced mode)");
+
+DEFINE_bool(
+    hybrid_join_reorder_enabled,
+    true,
+    "Enable driver-aware reorder of rows by containerId during hybrid join "
+    "payload extraction (set =false to disable)");
 
 DEFINE_int32(
     max_output_batch_rows,
@@ -294,10 +301,10 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       if (FLAGS_fusion_v2_enabled) {
         params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
       }
-      if (FLAGS_hybrid_join_scattered_mode_enabled) {
-        params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
-            "true";
-      }
+      params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
+          FLAGS_hybrid_join_scattered_mode_enabled ? "true" : "false";
+      params.queryConfigs[core::QueryConfig::kHybridJoinReorderEnabled] =
+          FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
       if (FLAGS_max_output_batch_rows != 10000) {
         params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =
             std::to_string(FLAGS_max_output_batch_rows);
@@ -355,10 +362,10 @@ QueryBenchmarkBase::run(const TpcdsPlan& tpcdsPlan) {
       if (FLAGS_fusion_v2_enabled) {
         params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
       }
-      if (FLAGS_hybrid_join_scattered_mode_enabled) {
-        params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
-            "true";
-      }
+      params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
+          FLAGS_hybrid_join_scattered_mode_enabled ? "true" : "false";
+      params.queryConfigs[core::QueryConfig::kHybridJoinReorderEnabled] =
+          FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
       if (FLAGS_max_output_batch_rows != 10000) {
         params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =
             std::to_string(FLAGS_max_output_batch_rows);

@@ -35,10 +35,15 @@
 #include "bolt/dwio/common/ReaderFactory.h"
 #include "bolt/tpch/gen/TpchGen.h"
 
+#include <algorithm>
 #include <fstream>
 #include <gflags/gflags.h>
 
 DECLARE_int32(s_selectivity_pct);
+DECLARE_int32(synth_payload_cols);
+DECLARE_int32(synth_sort_keys);
+DECLARE_bool(synth_join_sort);
+DECLARE_int32(synth_join_keys);
 DECLARE_int32(t_selectivity_pct);
 DECLARE_int32(u_selectivity_pct);
 
@@ -3324,26 +3329,20 @@ TpchPlan TpchQueryBuilder::getQ30Plan() const {
 // Pattern: S (probe) JOIN R (build) -> Sort by (row_id, l_suppkey, l_returnflag, l_linestatus)
 // Output: 16 columns from R (4 keys + 12 payloads, excluding l_comment)
 TpchPlan TpchQueryBuilder::getQ31Plan() const {
-  // Build-side columns (R) - 4 join keys + 12 payload columns (16 total)
-  std::vector<std::string> rColumns = {
-      "row_id",           // join key + sort key
-      "l_suppkey",        // join key + sort key
-      "l_returnflag",     // join key
-      "l_linestatus",     // join key
-      "l_orderkey",       // payload
-      "l_partkey",        // payload
-      "l_linenumber",     // payload
-      "l_quantity",       // payload
-      "l_extendedprice",  // payload
-      "l_discount",       // payload
-      "l_tax",            // payload
-      "l_shipdate",       // payload
-      "l_commitdate",     // payload
-      "l_receiptdate",    // payload
-      "l_shipinstruct",   // payload (VARCHAR)
-      "l_shipmode"        // payload (VARCHAR)
-      // l_comment excluded to get 16 columns
-  };
+  // Build-side columns (R): 4 join keys + up to 12 payload columns.
+  // Payload order interleaves the two VARCHARs early so width sweeps
+  // (--synth_payload_cols=2/4/8/12) include string payloads from N=4 on.
+  static const std::vector<std::string> kJoinKeys = {
+      "row_id", "l_suppkey", "l_returnflag", "l_linestatus"};
+  static const std::vector<std::string> kPayloadOrder = {
+      "l_orderkey",       "l_partkey",  "l_extendedprice", "l_shipmode",
+      "l_shipinstruct",   "l_quantity", "l_discount",      "l_tax",
+      "l_linenumber",     "l_shipdate", "l_commitdate",    "l_receiptdate",
+      "l_comment"}; // 13th payload: wide VARCHAR (~27B avg)
+  const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 0, 13);
+  std::vector<std::string> rColumns = kJoinKeys;
+  rColumns.insert(
+      rColumns.end(), kPayloadOrder.begin(), kPayloadOrder.begin() + numPayloads);
 
   // Probe-side columns (S) - only join keys (will be renamed to avoid conflicts)
   std::vector<std::string> sColumns = {
@@ -3369,44 +3368,45 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
                .captureScanNodeId(rPlanNodeId)
                .planNode();
 
-  // HashJoin: S (probe) x R (build) on 4 join keys
-  // Rename S columns to avoid duplicate names with R
-  // Sort by (row_id, l_suppkey) - 2 sort keys
-  auto plan =
-      PlanBuilder(planNodeIdGenerator, pool_.get())
-          .filtersAsNode(filtersAsNode_)
-          .tableScan(kTableS, sSelectedRowType, sFileColumns)
-          .captureScanNodeId(sPlanNodeId)
-          .project({"row_id AS s_row_id",
-                    "l_suppkey AS s_suppkey",
-                    "l_returnflag AS s_returnflag",
-                    "l_linestatus AS s_linestatus"})
-          .hashJoin(
-              {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},  // probe keys (4)
-              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus"},     // build keys (4)
-              r,
-              "",                          // no filter
-              {"row_id",                   // build-side (sort key 1)
-               "l_suppkey",                // build-side (sort key 2)
-               "l_returnflag",             // (sort key 3)
-               "l_linestatus",             // (sort key 4)
-               "l_orderkey",               // payload
-               "l_partkey",                // payload
-               "l_linenumber",             // payload
-               "l_quantity",               // payload
-               "l_extendedprice",          // payload
-               "l_discount",               // payload
-               "l_tax",                    // payload
-               "l_shipdate",               // payload
-               "l_commitdate",             // payload
-               "l_receiptdate",            // payload
-               "l_shipinstruct",           // payload
-               "l_shipmode"})              // payload (16 columns total)
-          .orderBy({"row_id", "l_suppkey", "l_returnflag", "l_linestatus"}, false)  // Sort by 4 keys
-          .planNode();
+  // HashJoin: S (probe) x R (build) on the first --synth_join_keys of the
+  // 4 key columns (row_id alone is unique, so match cardinality is
+  // identical for any key count; extra keys only add key-processing cost).
+  // --s_selectivity_pct thins the probe stream via row_id % 10 (uniform,
+  // matching rows only); --synth_join_sort appends the 4-key sort.
+  const int numJoinKeys = std::clamp(FLAGS_synth_join_keys, 1, 4);
+  static const std::vector<std::string> kProbeRenames = {
+      "row_id AS s_row_id", "l_suppkey AS s_suppkey",
+      "l_returnflag AS s_returnflag", "l_linestatus AS s_linestatus"};
+  static const std::vector<std::string> kProbeKeys = {
+      "s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"};
+  PlanBuilder sBuilder(planNodeIdGenerator, pool_.get());
+  sBuilder.filtersAsNode(filtersAsNode_)
+      .tableScan(kTableS, sSelectedRowType, sFileColumns)
+      .captureScanNodeId(sPlanNodeId);
+  if (FLAGS_s_selectivity_pct < 100) {
+    sBuilder.filter(
+        fmt::format("(row_id % 10) < {}", FLAGS_s_selectivity_pct / 10));
+  }
+  sBuilder
+      .project({kProbeRenames.begin(), kProbeRenames.begin() + numJoinKeys})
+      .hashJoin(
+          {kProbeKeys.begin(), kProbeKeys.begin() + numJoinKeys},
+          {kJoinKeys.begin(), kJoinKeys.begin() + numJoinKeys},
+          r,
+          "", // no filter
+          rColumns); // output: 4 key cols + selected payloads
+  if (FLAGS_synth_join_sort) {
+    sBuilder.orderBy(kJoinKeys, false);
+  }
+  auto plan = sBuilder.planNode();
 
   TpchPlan context;
-  context.planName = "q31";
+  context.planName = fmt::format(
+      "q31_p{}_sel{}_j{}{}",
+      numPayloads,
+      FLAGS_s_selectivity_pct,
+      numJoinKeys,
+      FLAGS_synth_join_sort ? "_sort" : "");
   context.plan = std::move(plan);
   context.dataFiles[sPlanNodeId] = getTableFilePaths(kTableS);
   context.dataFiles[rPlanNodeId] = getTableFilePaths(kTableR);
@@ -4183,18 +4183,31 @@ TpchPlan TpchQueryBuilder::getQ36Plan() const {
 // This query tests hybrid sort performance on a simple TableScan -> Sort pattern
 // without join overhead.
 TpchPlan TpchQueryBuilder::getQ40Plan() const {
-  // Define sort keys (all numeric for deterministic ordering)
-  // Ordered by increasing cardinality: low cardinality first
-  std::vector<std::string> sortKeys = {
+  // Sort keys ordered by increasing cardinality; --synth_sort_keys=k
+  // takes the first k. --synth_payload_cols=N controls carried payload
+  // width (same ordering as Q31: VARCHARs from N=4 on).
+  static const std::vector<std::string> kAllSortKeys = {
       "l_linenumber",  // INTEGER - 1-7 values
       "l_suppkey",     // BIGINT - ~10K unique values
       "l_partkey",     // BIGINT - ~200K unique values
       "l_orderkey"     // BIGINT - ~60M unique values
   };
-  
-  // Full lineitem schema (16 columns)
-  const auto& selectedColumns = kTables_.at(kLineitem);
-  
+  static const std::vector<std::string> kPayloadOrder = {
+      "l_extendedprice", "l_shipmode",   "l_shipinstruct", "l_quantity",
+      "l_discount",      "l_tax",        "l_shipdate",     "l_commitdate",
+      "l_receiptdate",   "l_returnflag", "l_linestatus",   "l_comment"};
+  const int numKeys = std::clamp(FLAGS_synth_sort_keys, 1, 4);
+  const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 0, 12);
+  std::vector<std::string> sortKeys(
+      kAllSortKeys.begin(), kAllSortKeys.begin() + numKeys);
+  // Scan carries all sort-key candidates plus the selected payloads so
+  // total width is k-independent within a payload setting.
+  std::vector<std::string> selectedColumns = kAllSortKeys;
+  selectedColumns.insert(
+      selectedColumns.end(),
+      kPayloadOrder.begin(),
+      kPayloadOrder.begin() + numPayloads);
+
   const auto selectedRowType = getRowType(kLineitem, selectedColumns);
   const auto& fileColumnNames = getFileColumnNames(kLineitem);
 
@@ -4210,7 +4223,8 @@ TpchPlan TpchQueryBuilder::getQ40Plan() const {
           .planNode();
 
   TpchPlan context;
-  context.planName = "q40_4keys_16cols";
+  context.planName =
+      fmt::format("q40_k{}_p{}", numKeys, numPayloads);
   context.plan = std::move(plan);
   context.dataFiles[lineitemPlanNodeId] = getTableFilePaths(kLineitem);
   context.dataFileFormat = format_;
