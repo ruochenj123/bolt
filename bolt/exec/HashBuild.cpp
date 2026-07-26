@@ -997,8 +997,14 @@ void HashBuild::runSpill(const std::vector<Operator*>& spillOperators) {
   for (auto& spillOp : spillOperators) {
     HashBuild* build = dynamic_cast<HashBuild*>(spillOp);
     // Coalesce batches before spilling to ensure hybrid data is properly laid
-    // out.
+    // out. Scattered mode cannot coalesce here: stored rowIds encode
+    // (batchId, rowInBatch) which coalescing invalidates, and
+    // decodedPayloads_ would keep dangling references into the freed
+    // batches.
     if (build->hybridJoin_ && build->table_->hybridData()) {
+      BOLT_CHECK(
+          !build->scatteredModeEnabled_,
+          "Spilling is not supported for hybrid join in scattered mode");
       build->table_->hybridData()->coalesceBatches();
     }
     build->spiller_->spill();

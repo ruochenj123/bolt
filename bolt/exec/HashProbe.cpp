@@ -1475,13 +1475,17 @@ void HashProbe::fillFilterInput(vector_size_t size) {
       outputRowMapping_,
       filterColumns);
 
+  // allowSorting must stay false here: probe-side filter columns above are
+  // wrapped in original row order, so permuting build columns by containerId
+  // would evaluate the filter on misaligned rows.
   extractColumns(
       table_.get(),
       folly::Range<char**>(outputTableRows_.data(), size),
       filterTableProjections_,
       pool(),
       filterInputType_->children(),
-      filterColumns);
+      filterColumns,
+      /*allowSorting=*/false);
 
   filterInput_ = std::make_shared<RowVector>(
       pool(), filterInputType_, nullptr, size, std::move(filterColumns));
