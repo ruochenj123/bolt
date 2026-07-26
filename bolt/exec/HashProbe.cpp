@@ -93,7 +93,9 @@ void extractColumns(
   BOLT_CHECK_EQ(resultTypes.size(), resultVectors.size())
   auto hybridData = table->hybridData();
   if (hybridData != nullptr) {
-    std::vector<HybridRowId> outputRowIds;
+    // Per-driver scratch: reused across output batches to avoid a fresh
+    // 16B-per-row heap allocation on every call.
+    static thread_local std::vector<HybridRowId> outputRowIds;
     outputRowIds.resize(rows.size());
     hybridData->getRowIds(rows.data(), rows.size(), outputRowIds);
 

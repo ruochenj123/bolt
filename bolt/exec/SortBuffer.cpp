@@ -167,13 +167,7 @@ void SortBuffer::addInput(const VectorPtr& input) {
           rows,
           columnProjection.inputChannel);
     }
-    // Gather payload columns
-    std::vector<std::unique_ptr<DecodedVector>> decoders;
-    decoders.reserve(payloadColumnMap_.size());
-    for (const auto& columnProjection : payloadColumnMap_) {
-      decoders.emplace_back(std::make_unique<DecodedVector>(
-          *inputRow->childAt(columnProjection.outputChannel), allRows));
-    }
+    // Gather payload columns (zero-copy: shares the input's children)
     auto payloadInput = wrapColumns(
         input->as<RowVector>(), payloadChannels_, payloadTypes_, pool());
     hybridData_->addPayload(std::move(payloadInput));
@@ -515,7 +509,8 @@ void SortBuffer::prepareOutput(uint32_t maxOutputRows) {
 void SortBuffer::getOutputWithoutSpill() {
   BOLT_DCHECK_EQ(numInputRows_, sortedRows_.size());
   if (hybridSortEnabled_) {
-    std::vector<HybridRowId> outputRowIds;
+    // Reused across output batches; getOutput is single-threaded per buffer.
+    static thread_local std::vector<HybridRowId> outputRowIds;
     outputRowIds.resize(output_->size());
     hybridData_->getRowIds(
         sortedRows_.data() + numOutputRows_, output_->size(), outputRowIds);

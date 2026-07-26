@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <memory>
 #include <unordered_map>
@@ -2058,9 +2059,12 @@ class HybridContainer {
   }
 
   // Returns whether sorting should be used for extraction.
-  // Sorting is used when: reorder is enabled AND there are multiple containers.
+  // Sorting is used when: reorder is enabled AND there are multiple
+  // containers AND payload is coalesced. In scattered mode locality is
+  // per batch, not per container, so container-major reorder costs an
+  // O(n) permutation per output batch and buys nothing.
   bool shouldUseSorting() const {
-    return reorderEnabled_ && !isSingleContainer();
+    return reorderEnabled_ && !isSingleContainer() && !scatteredModeEnabled_;
   }
 
   /// Get hybridRowId from a row pointer
@@ -2176,17 +2180,22 @@ class HybridContainer {
     for (int32_t col = 0; col < numPayloadCols; ++col) {
       payloadNames.push_back(fmt::format("c{}", col));
     }
-    // Flatten each payload column into a single FlatVector.
+    // Flatten payload columns batch-major and release each source batch as
+    // soon as all its columns are copied: column-major order would keep the
+    // full original payload alive until the last column finishes, doubling
+    // transient memory at peak.
     for (int32_t col = 0; col < numPayloadCols; ++col) {
-      auto flat = BaseVector::create(payloadTypes_[col], totalRows, pool);
-      vector_size_t offset = 0;
-      for (const auto& batch : owningInputs_) {
-        auto* child = batch->childAt(col).get();
-        const auto batchSize = batch->size();
-        flat->copy(child, offset, 0, batchSize);
-        offset += batchSize;
+      newChildren.push_back(
+          BaseVector::create(payloadTypes_[col], totalRows, pool));
+    }
+    vector_size_t offset = 0;
+    for (auto& batch : owningInputs_) {
+      const auto batchSize = batch->size();
+      for (int32_t col = 0; col < numPayloadCols; ++col) {
+        newChildren[col]->copy(batch->childAt(col).get(), offset, 0, batchSize);
       }
-      newChildren.push_back(std::move(flat));
+      batch.reset();
+      offset += batchSize;
     }
 
     // Rebuild owningInputs_ with a single RowVector.
@@ -2710,9 +2719,15 @@ class HybridContainer {
     auto values = valuesBuffer->asMutableRange<T>();
     auto* rowIdPtr = outputRowIds.data();
 
-    // Cache current container's decodedPayloads pointer
+    // Flat containerId -> decodedPayloads table; rows interleave containers
+    // under multi-driver probes, so a per-switch hash lookup runs ~per row.
+    std::array<const std::vector<std::vector<std::unique_ptr<DecodedVector>>>*,
+               256> payloadsById{};
+    for (const auto& [id, container] : allContainers_) {
+      payloadsById[id] = &container->decodedPayloads_;
+    }
     uint8_t currentContainerId = UINT8_MAX;
-    std::vector<std::vector<std::unique_ptr<DecodedVector>>>* currentDecodedPayloads = nullptr;
+    const std::vector<std::vector<std::unique_ptr<DecodedVector>>>* currentDecodedPayloads = nullptr;
 
     for (int32_t i = 0; i < numRows; ++i) {
       const char* row;
@@ -2735,9 +2750,9 @@ class HybridContainer {
       // Switch container if needed
       if (rid.containerId_ != currentContainerId) {
         currentContainerId = rid.containerId_;
-        auto it = allContainers_.find(currentContainerId);
-        BOLT_CHECK(it != allContainers_.end(), "Container {} not found", currentContainerId);
-        currentDecodedPayloads = &(it->second->decodedPayloads_);
+        currentDecodedPayloads = payloadsById[currentContainerId];
+        BOLT_CHECK(currentDecodedPayloads != nullptr,
+                   "Container {} not found", currentContainerId);
       }
 
       auto batchIdx = rid.batchId();
@@ -2771,9 +2786,14 @@ class HybridContainer {
     auto values = valuesBuffer->asMutableRange<T>();
     auto* rowIdPtr = outputRowIds.data();
 
-    // Cache current container's decodedPayloads pointer
+    // Flat containerId -> decodedPayloads table (see NoNullsMulti above).
+    std::array<const std::vector<std::vector<std::unique_ptr<DecodedVector>>>*,
+               256> payloadsById{};
+    for (const auto& [id, container] : allContainers_) {
+      payloadsById[id] = &container->decodedPayloads_;
+    }
     uint8_t currentContainerId = UINT8_MAX;
-    std::vector<std::vector<std::unique_ptr<DecodedVector>>>* currentDecodedPayloads = nullptr;
+    const std::vector<std::vector<std::unique_ptr<DecodedVector>>>* currentDecodedPayloads = nullptr;
 
     for (int32_t i = 0; i < numRows; ++i) {
       const char* row;
@@ -2795,9 +2815,9 @@ class HybridContainer {
       // Switch container if needed
       if (rid.containerId_ != currentContainerId) {
         currentContainerId = rid.containerId_;
-        auto it = allContainers_.find(currentContainerId);
-        BOLT_CHECK(it != allContainers_.end(), "Container {} not found", currentContainerId);
-        currentDecodedPayloads = &(it->second->decodedPayloads_);
+        currentDecodedPayloads = payloadsById[currentContainerId];
+        BOLT_CHECK(currentDecodedPayloads != nullptr,
+                   "Container {} not found", currentContainerId);
       }
 
       auto batchIdx = rid.batchId();
