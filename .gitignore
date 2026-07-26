@@ -340,3 +340,9 @@ log.txt
 late-m-exps/
 late-m-exps/
 tpcds-exps/
+
+# local build/compile helper scripts and logs (OSC)
+buildlogs/
+compile_*.log
+slurm-*.out
+.clangd
