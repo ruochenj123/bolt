@@ -454,13 +454,11 @@ void HashProbe::asyncWaitForHashTable() {
   // table (extraction-by-row-pointer uses stock RowContainer::extractColumn).
   // The materialization hop keeps the standard path and post-processes refs.
   if (fusionHop_ != nullptr) {
-    const bool tableIsPlain = table_->hybridData() == nullptr;
-    fusionDeferActive_ = !fusionHop_->isMaterializationPoint && tableIsPlain &&
+    // Composes with both plain and hybrid builds: refs are build key-row
+    // pointers either way, and materialization goes through extractColumns,
+    // which dispatches to the hybrid payload path when hybridData is present.
+    fusionDeferActive_ = !fusionHop_->isMaterializationPoint &&
         !fusionHop_->deferredChannels.empty();
-    if (!tableIsPlain) {
-      // Hybrid+fusion composition is v2.1; run this hop unfused.
-      fusionDeferActive_ = false;
-    }
   }
 
   maybeSetupSpillInput(
@@ -1108,8 +1106,6 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
     BOLT_CHECK_NOT_NULL(peer, "fusion v2: producing probe not found: {}", hopId);
     const auto* peerHop = peer->fusionHop();
     BOLT_CHECK_NOT_NULL(peerHop);
-    auto* peerRows = peer->fusionTableFor()->rows();
-    BOLT_CHECK_NOT_NULL(peerRows);
 
     // Align the ref column to output rows via this hop's probe dictionary,
     // then decode to raw row pointers.
@@ -1124,10 +1120,13 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
     }
 
     // Extract every deferred channel of the producing hop into the final
-    // output channel of the same NAME.
+    // output channel of the same NAME, remapping projections to OUR output
+    // channels and delegating to extractColumns (handles plain AND hybrid
+    // builds, including the prefetch-optimized hybrid payload path).
     std::unordered_set<column_index_t> peerDeferred(
         peerHop->deferredChannels.begin(), peerHop->deferredChannels.end());
     const auto& peerOutputType = peer->outputType_->asRow();
+    std::vector<IdentityProjection> remapped;
     for (auto projection : peer->fusionTableProjections()) {
       if (peerDeferred.count(projection.outputChannel) == 0) {
         continue;
@@ -1137,15 +1136,17 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
       if (!ourChannel.has_value()) {
         continue;  // column projected away before the run end
       }
-      auto& target = output_->childAt(ourChannel.value());
-      if (!target || !BaseVector::isVectorWritable(target) ||
-          !target->isFlatEncoding()) {
-        target = BaseVector::create(
-            outputType_->childAt(ourChannel.value()), size, pool());
-      }
-      target->resize(size);
-      peerRows->extractColumn(
-          rowPtrs.data(), size, projection.inputChannel, target);
+      remapped.emplace_back(projection.inputChannel, ourChannel.value());
+    }
+    if (!remapped.empty()) {
+      extractColumns(
+          peer->fusionTableFor(),
+          folly::Range<char**>(rowPtrs.data(), size),
+          remapped,
+          pool(),
+          outputType_->children(),
+          output_->children(),
+          /*allowSorting=*/false);
     }
   }
 }
