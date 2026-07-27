@@ -360,6 +360,12 @@ class HashProbe : public Operator {
   bool fusionDeferActive_{false};
   /// outputType_ + trailing ref columns (this hop's + passed-through upstream).
   RowTypePtr fusionExtendedType_;
+  // Reusable scratch vectors for the deferred-output fast path.
+  VectorPtr fusionRefsScratch_;
+  std::vector<VectorPtr> fusionUpstreamScratch_;
+  bool fusionSplitInit_{false};
+  std::vector<IdentityProjection> fusionImmediate_;
+  std::vector<VectorPtr> fusionNullConstants_;
 
   // Indicates whether there was no input. Used for right semi join project.
   bool noInput_{true};

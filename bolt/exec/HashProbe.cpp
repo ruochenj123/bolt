@@ -450,15 +450,18 @@ void HashProbe::asyncWaitForHashTable() {
   table_ = std::move(hashBuildResult->table);
   BOLT_CHECK_NOT_NULL(table_);
 
-  // Fusion v2: activate deferral only on the standard path with a non-hybrid
-  // table (extraction-by-row-pointer uses stock RowContainer::extractColumn).
-  // The materialization hop keeps the standard path and post-processes refs.
+  // Fusion v2: intermediate hops defer their build payloads; the
+  // materialization hop keeps the standard output path and resolves refs
+  // afterwards. Composes with both plain and hybrid builds: refs are build
+  // key-row pointers either way, and materialization goes through
+  // extractColumns, which dispatches to the hybrid payload path when
+  // hybridData is present.
   if (fusionHop_ != nullptr) {
-    // Composes with both plain and hybrid builds: refs are build key-row
-    // pointers either way, and materialization goes through extractColumns,
-    // which dispatches to the hybrid payload path when hybridData is present.
-    fusionDeferActive_ = !fusionHop_->isMaterializationPoint &&
-        !fusionHop_->deferredChannels.empty();
+    // Intermediate hops must run the deferred path even with no deferrable
+    // channels of their own: they still have to forward upstream ref
+    // columns (the standard path would silently drop them). The per-batch
+    // dispatch additionally requires own deferrals or incoming refs.
+    fusionDeferActive_ = !fusionHop_->isMaterializationPoint;
   }
 
   maybeSetupSpillInput(
@@ -923,7 +926,9 @@ void HashProbe::fillLeftSemiProjectMatchColumn(vector_size_t size) {
 
 void HashProbe::fillOutput(vector_size_t size) {
   // Fusion v2 deferred-output path (docs/fusion-v2-design.md).
-  if (fusionDeferActive_) {
+  if (fusionDeferActive_ &&
+      (!fusionHop_->deferredChannels.empty() ||
+       input_->childrenSize() > probeType_->size())) {
     fillOutputFusionDeferred(size);
     return;
   }
@@ -1028,23 +1033,39 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
       output_->children());
 
   // Split build-side projections: deferred channels become null-constants (the
-  // channel must exist so downstream indexing is stable); the rest extract now.
-  std::unordered_set<column_index_t> deferredSet(
-      fusionHop_->deferredChannels.begin(), fusionHop_->deferredChannels.end());
-  std::vector<IdentityProjection> immediate;
-  for (auto projection : tableOutputProjections_) {
-    if (deferredSet.count(projection.outputChannel) > 0) {
-      output_->childAt(projection.outputChannel) = BaseVector::createNullConstant(
-          outputType_->childAt(projection.outputChannel), size, pool());
-    } else {
-      immediate.push_back(projection);
+  // channel must exist so downstream indexing is stable); the rest extract
+  // now. The split and the constants are stable per hop — computed once.
+  // Null constants are created at a size covering any batch (children longer
+  // than the parent RowVector are allowed), so no per-batch allocation.
+  if (!fusionSplitInit_) {
+    std::unordered_set<column_index_t> deferredSet(
+        fusionHop_->deferredChannels.begin(),
+        fusionHop_->deferredChannels.end());
+    constexpr vector_size_t kMaxBatch = 65536;
+    fusionNullConstants_.resize(outputType_->size());
+    for (auto projection : tableOutputProjections_) {
+      if (deferredSet.count(projection.outputChannel) > 0) {
+        fusionNullConstants_[projection.outputChannel] =
+            BaseVector::createNullConstant(
+                outputType_->childAt(projection.outputChannel), kMaxBatch,
+                pool());
+      } else {
+        fusionImmediate_.push_back(projection);
+      }
+    }
+    fusionSplitInit_ = true;
+  }
+  for (column_index_t c = 0; c < fusionNullConstants_.size(); ++c) {
+    if (fusionNullConstants_[c] != nullptr) {
+      BOLT_CHECK_LE(size, fusionNullConstants_[c]->size());
+      output_->childAt(c) = fusionNullConstants_[c];
     }
   }
-  if (!immediate.empty()) {
+  if (!fusionImmediate_.empty()) {
     extractColumns(
         table_.get(),
         folly::Range<char**>(outputTableRows_.data(), size),
-        immediate,
+        fusionImmediate_,
         pool(),
         outputType_->children(),
         output_->children(),
@@ -1052,34 +1073,84 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
   }
 
   // Assemble extended output: planned channels + upstream ref pass-through
-  // (re-wrapped with this hop's probe dictionary) + this hop's own ref column.
-  std::vector<VectorPtr> children = output_->children();
-  std::vector<std::string> names;
-  std::vector<TypePtr> types;
-  names.reserve(outputType_->size() + 4);
-  types.reserve(outputType_->size() + 4);
-  for (column_index_t c = 0; c < outputType_->size(); ++c) {
-    names.push_back(outputType_->nameOf(c));
-    types.push_back(outputType_->childAt(c));
-  }
+  // + this hop's own ref column. The extended row type is stable across
+  // batches, so build it once; per-batch we only assemble children.
   const auto& inputRowType = input_->type()->asRow();
+  if (fusionExtendedType_ == nullptr) {
+    std::vector<std::string> names;
+    std::vector<TypePtr> types;
+    names.reserve(outputType_->size() + 4);
+    types.reserve(outputType_->size() + 4);
+    for (column_index_t c = 0; c < outputType_->size(); ++c) {
+      names.push_back(outputType_->nameOf(c));
+      types.push_back(outputType_->childAt(c));
+    }
+    for (auto i = probeType_->size(); i < input_->childrenSize(); ++i) {
+      names.push_back(inputRowType.nameOf(i));
+      types.push_back(inputRowType.childAt(i));
+    }
+    if (!fusionHop_->deferredChannels.empty()) {
+      names.push_back(fmt::format("$fref${}", planNodeId()));
+      types.push_back(BIGINT());
+    }
+    fusionExtendedType_ = ROW(std::move(names), std::move(types));
+  }
+
+  std::vector<VectorPtr> children = output_->children();
+  // Upstream ref columns are flat by construction (flattened at each hop);
+  // realign them through this hop's row mapping into flat vectors instead of
+  // stacking another dictionary layer per hop. Scratch vectors are reused
+  // when the previous batch has been released downstream.
+  const auto* rawMapping = outputRowMapping_ == nullptr
+      ? nullptr
+      : outputRowMapping_->as<vector_size_t>();
+  size_t upstreamIdx = 0;
   for (auto i = probeType_->size(); i < input_->childrenSize(); ++i) {
-    children.push_back(wrapChild(size, outputRowMapping_, input_->childAt(i)));
-    names.push_back(inputRowType.nameOf(i));
-    types.push_back(inputRowType.childAt(i));
+    const auto& in = input_->childAt(i);
+    if (fusionUpstreamScratch_.size() <= upstreamIdx) {
+      fusionUpstreamScratch_.emplace_back(nullptr);
+    }
+    auto& scratch = fusionUpstreamScratch_[upstreamIdx++];
+    const auto* flatIn = in->asFlatVector<int64_t>();
+    if (flatIn != nullptr && !flatIn->mayHaveNulls()) {
+      if (scratch == nullptr) {
+        scratch = BaseVector::create(BIGINT(), size, pool());
+      } else {
+        BaseVector::prepareForReuse(scratch, size);
+      }
+      auto* out = scratch->asFlatVector<int64_t>()->mutableRawValues();
+      const auto* rawIn = flatIn->rawValues();
+      if (rawMapping == nullptr) {
+        std::memcpy(out, rawIn, size * sizeof(int64_t));
+      } else {
+        for (vector_size_t r = 0; r < size; ++r) {
+          out[r] = rawIn[rawMapping[r]];
+        }
+      }
+      children.push_back(scratch);
+    } else {
+      // Fallback for unexpected encodings: keep the dictionary wrap.
+      children.push_back(wrapChild(size, outputRowMapping_, in));
+    }
   }
-  auto refs = BaseVector::create<FlatVector<int64_t>>(BIGINT(), size, pool());
-  auto* rawRefs = refs->mutableRawValues();
-  for (vector_size_t i = 0; i < size; ++i) {
-    rawRefs[i] = reinterpret_cast<int64_t>(outputTableRows_[i]);
+
+  if (!fusionHop_->deferredChannels.empty()) {
+    if (fusionRefsScratch_ == nullptr) {
+      fusionRefsScratch_ = BaseVector::create(BIGINT(), size, pool());
+    } else {
+      BaseVector::prepareForReuse(fusionRefsScratch_, size);
+    }
+    auto* rawRefs =
+        fusionRefsScratch_->asFlatVector<int64_t>()->mutableRawValues();
+    for (vector_size_t i = 0; i < size; ++i) {
+      rawRefs[i] = reinterpret_cast<int64_t>(outputTableRows_[i]);
+    }
+    children.push_back(fusionRefsScratch_);
   }
-  children.push_back(refs);
-  names.push_back(fmt::format("$fref${}", planNodeId()));
-  types.push_back(BIGINT());
 
   output_ = std::make_shared<RowVector>(
       pool(),
-      ROW(std::move(names), std::move(types)),
+      fusionExtendedType_,
       BufferPtr(nullptr),
       size,
       std::move(children));
@@ -1107,16 +1178,29 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
     const auto* peerHop = peer->fusionHop();
     BOLT_CHECK_NOT_NULL(peerHop);
 
-    // Align the ref column to output rows via this hop's probe dictionary,
-    // then decode to raw row pointers.
-    auto aligned = wrapChild(size, outputRowMapping_, input_->childAt(i));
-    SelectivityVector allRows(size);
-    DecodedVector decoded(*aligned, allRows);
+    // Align the ref column to output rows via this hop's row mapping. Refs
+    // are flat by construction (flattened at every hop), so this is a plain
+    // gather; fall back to decoding for unexpected encodings.
     std::vector<char*> rowPtrs(size);
-    for (vector_size_t r = 0; r < size; ++r) {
-      rowPtrs[r] = decoded.isNullAt(r)
+    const auto* flatRefs = input_->childAt(i)->asFlatVector<int64_t>();
+    if (flatRefs != nullptr && !flatRefs->mayHaveNulls()) {
+      const auto* rawIn = flatRefs->rawValues();
+      const auto* rawMapping = outputRowMapping_ == nullptr
           ? nullptr
-          : reinterpret_cast<char*>(decoded.valueAt<int64_t>(r));
+          : outputRowMapping_->as<vector_size_t>();
+      for (vector_size_t r = 0; r < size; ++r) {
+        rowPtrs[r] = reinterpret_cast<char*>(
+            rawIn[rawMapping == nullptr ? r : rawMapping[r]]);
+      }
+    } else {
+      auto aligned = wrapChild(size, outputRowMapping_, input_->childAt(i));
+      SelectivityVector allRows(size);
+      DecodedVector decoded(*aligned, allRows);
+      for (vector_size_t r = 0; r < size; ++r) {
+        rowPtrs[r] = decoded.isNullAt(r)
+            ? nullptr
+            : reinterpret_cast<char*>(decoded.valueAt<int64_t>(r));
+      }
     }
 
     // Extract every deferred channel of the producing hop into the final

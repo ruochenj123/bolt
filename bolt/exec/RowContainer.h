@@ -3199,8 +3199,21 @@ class HybridContainer {
     // We still need to extract rowIds for upstream traversal.
     // The rowIdColumnOffset_ is always valid since it's the uint64_t column
     // appended after the key columns.
+    constexpr int32_t kPrefetchDist = 16;
     for (int32_t i = 0; i < numRows; ++i) {
       const char* row;
+      if (i + kPrefetchDist < numRows) {
+        const char* pfRow;
+        if constexpr (useRowNumbers) {
+          auto pfNumber = rowNumbers[i + kPrefetchDist];
+          pfRow = pfNumber >= 0 ? rows[pfNumber] : nullptr;
+        } else {
+          pfRow = rows[i + kPrefetchDist];
+        }
+        if (pfRow != nullptr) {
+          __builtin_prefetch(pfRow + rowIdColumnOffset_, 0, 1);
+        }
+      }
       if constexpr (useRowNumbers) {
         auto rowNumber = rowNumbers[i];
         row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
