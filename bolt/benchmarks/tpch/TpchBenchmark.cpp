@@ -91,6 +91,11 @@ DEFINE_bool(
     "Q31 join bench: append the 4-key sort after the join.");
 
 DEFINE_int32(
+    synth_chain_joins,
+    2,
+    "Q37 chain bench: number of PK-FK joins in the left-deep chain (2..3).");
+
+DEFINE_int32(
     synth_join_keys,
     4,
     "Q31 join bench: number of join keys (1..4; row_id first, so match "

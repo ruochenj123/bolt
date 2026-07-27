@@ -44,6 +44,7 @@ DECLARE_int32(synth_payload_cols);
 DECLARE_int32(synth_sort_keys);
 DECLARE_bool(synth_join_sort);
 DECLARE_int32(synth_join_keys);
+DECLARE_int32(synth_chain_joins);
 DECLARE_int32(t_selectivity_pct);
 DECLARE_int32(u_selectivity_pct);
 
@@ -240,6 +241,8 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ35Plan();
     case 36:
       return getQ36Plan();
+    case 37:
+      return getQ37Plan();
     case 40:
       return getQ40Plan();
     default:
@@ -3414,6 +3417,137 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
   return context;
 }
 
+
+// Q37: Left-deep PK-FK join chain for inter-operator fusion evaluation.
+// F (probe, 200M rows) joins dimension tables R, T (and U) on fk1/fk2
+// (/fk3); every hop is a single-key PK-FK join whose build-side payload
+// width is controlled by --synth_payload_cols; --synth_chain_joins picks
+// the chain depth (2 or 3); --s_selectivity_pct thins the probe stream.
+TpchPlan TpchQueryBuilder::getQ37Plan() const {
+  const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 0, 12);
+  const int depth = std::clamp(FLAGS_synth_chain_joins, 2, 3);
+  static const std::vector<std::string> kRPay = {
+      "l_orderkey",     "l_partkey",  "l_extendedprice", "l_shipmode",
+      "l_shipinstruct", "l_quantity", "l_discount",      "l_tax",
+      "l_linenumber",   "l_shipdate", "l_commitdate",    "l_receiptdate"};
+  auto prefixed = [&](const std::string& pfx) {
+    std::vector<std::string> cols;
+    for (int i = 0; i < numPayloads; ++i) {
+      cols.push_back(pfx + kRPay[i].substr(2));
+    }
+    return cols;
+  };
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId fScanId, rScanId, tScanId, uScanId;
+
+  // Build sides: unique key + first N payloads each.
+  std::vector<std::string> rCols = {"row_id"};
+  rCols.insert(rCols.end(), kRPay.begin(), kRPay.begin() + numPayloads);
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, getRowType(kTableR, rCols),
+                          getFileColumnNames(kTableR))
+               .captureScanNodeId(rScanId)
+               .planNode();
+  // Per-hop selectivity: thinning the T/U build sides drops matching
+  // probe rows at hops 2/3, after hop-1 payloads were already deferred.
+  std::vector<std::string> tCols = {"t_row_id"};
+  auto tPay = prefixed("t_");
+  tCols.insert(tCols.end(), tPay.begin(), tPay.end());
+  PlanBuilder tb(planNodeIdGenerator, pool_.get());
+  tb.filtersAsNode(filtersAsNode_)
+      .tableScan(kTableT, getRowType(kTableT, tCols),
+                 getFileColumnNames(kTableT))
+      .captureScanNodeId(tScanId);
+  if (FLAGS_t_selectivity_pct < 100) {
+    tb.filter(
+        fmt::format("(t_row_id % 10) < {}", FLAGS_t_selectivity_pct / 10));
+  }
+  auto t = tb.planNode();
+  core::PlanNodePtr u = nullptr;
+  std::vector<std::string> uPay;
+  if (depth == 3) {
+    std::vector<std::string> uCols = {"u_row_id"};
+    uPay = prefixed("u_");
+    uCols.insert(uCols.end(), uPay.begin(), uPay.end());
+    PlanBuilder ub(planNodeIdGenerator, pool_.get());
+    ub.filtersAsNode(filtersAsNode_)
+        .tableScan(kTableU, getRowType(kTableU, uCols),
+                   getFileColumnNames(kTableU))
+        .captureScanNodeId(uScanId);
+    if (FLAGS_u_selectivity_pct < 100) {
+      ub.filter(
+          fmt::format("(u_row_id % 10) < {}", FLAGS_u_selectivity_pct / 10));
+    }
+    u = ub.planNode();
+  }
+
+  // Probe: F carries only the foreign keys used by the chain.
+  std::vector<std::string> fCols = {"fk1", "fk2"};
+  if (depth == 3) {
+    fCols.push_back("fk3");
+  }
+  PlanBuilder fb(planNodeIdGenerator, pool_.get());
+  fb.filtersAsNode(filtersAsNode_)
+      .tableScan(kTableF, getRowType(kTableF, fCols),
+                 getFileColumnNames(kTableF))
+      .captureScanNodeId(fScanId);
+  if (FLAGS_s_selectivity_pct < 100) {
+    fb.filter(fmt::format("(fk1 % 10) < {}", FLAGS_s_selectivity_pct / 10));
+  }
+
+  auto rPay = std::vector<std::string>(
+      kRPay.begin(), kRPay.begin() + numPayloads);
+  // Hop 1: F x R on fk1. Carry fk1 plus the remaining hop keys.
+  std::vector<std::string> out1 = {"fk1", "fk2"};
+  if (depth == 3) {
+    out1.push_back("fk3");
+  }
+  out1.insert(out1.end(), rPay.begin(), rPay.end());
+  fb.hashJoin({"fk1"}, {"row_id"}, r, "", out1);
+
+  // Hop 2: x T on fk2.
+  std::vector<std::string> out2 = {"fk1"};
+  if (depth == 3) {
+    out2.push_back("fk3");
+  }
+  out2.insert(out2.end(), rPay.begin(), rPay.end());
+  out2.insert(out2.end(), tPay.begin(), tPay.end());
+  fb.hashJoin({"fk2"}, {"t_row_id"}, t, "", out2);
+
+  // Hop 3: x U on fk3.
+  if (depth == 3) {
+    std::vector<std::string> out3 = {"fk1"};
+    out3.insert(out3.end(), rPay.begin(), rPay.end());
+    out3.insert(out3.end(), tPay.begin(), tPay.end());
+    out3.insert(out3.end(), uPay.begin(), uPay.end());
+    fb.hashJoin({"fk3"}, {"u_row_id"}, u, "", out3);
+  }
+  if (FLAGS_synth_join_sort) {
+    fb.orderBy({"fk1"}, false);
+  }
+  auto plan = fb.planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format(
+      "q37_d{}_p{}_sel{}_hop{}{}",
+      depth,
+      numPayloads,
+      FLAGS_s_selectivity_pct,
+      FLAGS_t_selectivity_pct,
+      FLAGS_synth_join_sort ? "_sort" : "");
+  context.plan = std::move(plan);
+  context.dataFiles[fScanId] = getTableFilePaths(kTableF);
+  context.dataFiles[rScanId] = getTableFilePaths(kTableR);
+  context.dataFiles[tScanId] = getTableFilePaths(kTableT);
+  if (depth == 3) {
+    context.dataFiles[uScanId] = getTableFilePaths(kTableU);
+  }
+  context.dataFileFormat = format_;
+  return context;
+}
+
 // Q32: N-way join with custom R, S, T tables following Q27 pattern
 // Pattern: T (probe₂) × (S × R) (build₂) → Sort
 // Uses 4 join keys for both joins, 16 output columns total
@@ -4286,13 +4420,19 @@ const std::unordered_map<std::string, std::vector<std::string>>
         std::make_pair(
             "T",
             std::vector<std::string>{
-                "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
-                "t_payload1", "t_payload2", "t_payload3", "t_payload4", "t_payload5"}),  // 4 join keys + 5 payloads
-        // U uses same schema as T (will reuse T's data files)
+                "t_row_id", "t_orderkey", "t_partkey", "t_extendedprice",
+                "t_shipmode", "t_shipinstruct", "t_quantity", "t_discount",
+                "t_tax", "t_linenumber", "t_shipdate", "t_commitdate",
+                "t_receiptdate"}),  // unique key + 12 lineitem-derived payloads
         std::make_pair(
             "U",
             std::vector<std::string>{
-                "t_row_id", "t_suppkey", "t_returnflag", "t_linestatus",
-                "t_payload1", "t_payload2", "t_payload3", "t_payload4", "t_payload5"})};  // Same columns as T, renamed in query
+                "u_row_id", "u_orderkey", "u_partkey", "u_extendedprice",
+                "u_shipmode", "u_shipinstruct", "u_quantity", "u_discount",
+                "u_tax", "u_linenumber", "u_shipdate", "u_commitdate",
+                "u_receiptdate"}),  // unique key + 12 lineitem-derived payloads
+        std::make_pair(
+            "F",
+            std::vector<std::string>{"fk1", "fk2", "fk3"})};
 
 } // namespace bytedance::bolt::exec::test

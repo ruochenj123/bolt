@@ -144,6 +144,7 @@ class TpchQueryBuilder {
   TpchPlan getQ33Plan() const;  // T JOIN (S JOIN R) (2-way N-way without Sort)
   TpchPlan getQ34Plan() const;  // Q33 + Sort (2-way with Sort)
   TpchPlan getQ35Plan() const;  // U JOIN (T JOIN (S JOIN R)) (3-way N-way without Sort)
+  TpchPlan getQ37Plan() const;  // Left-deep PK-FK chain F x R x T (x U) for fusion v2
   TpchPlan getQ36Plan() const;  // Q35 + Sort (3-way with Sort)
   TpchPlan getQ40Plan() const;  // Configurable sort benchmark on lineitem (4 sort keys, 16 cols)
 
@@ -185,6 +186,7 @@ class TpchQueryBuilder {
   static constexpr const char* kTableS = "S";
   static constexpr const char* kTableT = "T";
   static constexpr const char* kTableU = "U";
+  static constexpr const char* kTableF = "F";
   std::shared_ptr<memory::MemoryPool> pool_ =
       memory::memoryManager()->addLeafPool();
   const bool filtersAsNode_;
