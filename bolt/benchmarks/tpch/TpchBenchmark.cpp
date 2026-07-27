@@ -91,6 +91,16 @@ DEFINE_bool(
     "Q31 join bench: append the 4-key sort after the join.");
 
 DEFINE_int32(
+    synth_payload_cols_t,
+    -1,
+    "Q37: payload width override for dim T (-1 = use synth_payload_cols).");
+
+DEFINE_int32(
+    synth_payload_cols_u,
+    -1,
+    "Q37: payload width override for dim U (-1 = use synth_payload_cols).");
+
+DEFINE_int32(
     synth_chain_joins,
     2,
     "Q37 chain bench: number of PK-FK joins in the left-deep chain (2..3).");

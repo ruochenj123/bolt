@@ -38,6 +38,13 @@ struct FusionHopPlan {
   /// For each ref column visible in this hop's INPUT (upstream hops), the input
   /// channel it occupies. Needed by the materialization point.
   std::vector<column_index_t> upstreamRefInputChannels;
+  /// Number of hops between this one and the run's materialization point
+  /// (0 for the materialization point itself). Used by the adaptive
+  /// controller's deferral-cost model.
+  int32_t hopsAfter{0};
+  /// Plan node id of the run's materialization point (for reading its
+  /// observed output cardinality at runtime).
+  core::PlanNodeId materializationNodeId;
 };
 
 /// Immutable description of all fused runs in one query plan, keyed by join

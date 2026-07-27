@@ -598,6 +598,9 @@ class QueryConfig {
 
   /// Fusion v2 (deferred-ref columns; docs/fusion-v2-design.md).
   static constexpr const char* kFusionV2Enabled = "fusion_v2_enabled";
+  static constexpr const char* kFusionAdaptiveEnabled =
+      "fusion_adaptive_enabled";
+  static constexpr const char* kFusionAdaptiveTrace = "fusion_adaptive_trace";
 
   /**
    * LLVM JIT enabled
@@ -1034,6 +1037,19 @@ class QueryConfig {
   /// Returns whether fusion v2 (deferred-ref columns) is enabled.
   bool fusionV2Enabled() const {
     return get<bool>(kFusionV2Enabled, false);
+  }
+
+  /// Adaptive materialization placement: fused hops start deferring and may
+  /// switch to eager per-hop after a warmup, based on the deferral-cost
+  /// model (payload width x observed downstream elimination vs ref cost).
+  bool fusionAdaptiveEnabled() const {
+    return get<bool>(kFusionAdaptiveEnabled, false);
+  }
+
+  /// Per-batch tracing of fused hops (batch index, rows, output bytes,
+  /// defer decision, duration) to stderr, for offline timeline analysis.
+  bool fusionAdaptiveTrace() const {
+    return get<bool>(kFusionAdaptiveTrace, false);
   }
 
   /// Returns 'is aggregation spilling enabled' flag. Must also check the

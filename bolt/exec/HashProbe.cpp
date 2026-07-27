@@ -29,6 +29,8 @@
  */
 
 #include "bolt/exec/HashProbe.h"
+
+#include <chrono>
 #include <common/time/Timer.h>
 #include <core/PlanNode.h>
 #include <core/QueryConfig.h>
@@ -462,6 +464,9 @@ void HashProbe::asyncWaitForHashTable() {
     // columns (the standard path would silently drop them). The per-batch
     // dispatch additionally requires own deferrals or incoming refs.
     fusionDeferActive_ = !fusionHop_->isMaterializationPoint;
+    const auto& qc = operatorCtx_->driverCtx()->queryConfig();
+    fusionAdaptiveEnabled_ = qc.fusionAdaptiveEnabled();
+    fusionTraceEnabled_ = qc.fusionAdaptiveTrace();
   }
 
   maybeSetupSpillInput(
@@ -925,6 +930,9 @@ void HashProbe::fillLeftSemiProjectMatchColumn(vector_size_t size) {
 }
 
 void HashProbe::fillOutput(vector_size_t size) {
+  if (fusionHop_ != nullptr) {
+    fusionOutRows_ += size;
+  }
   // Fusion v2 deferred-output path (docs/fusion-v2-design.md).
   if (fusionDeferActive_ &&
       (!fusionHop_->deferredChannels.empty() ||
@@ -1011,6 +1019,9 @@ void HashProbe::fillOutput(vector_size_t size) {
 void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
   // The previous batch replaced output_ with the extended (ref-carrying)
   // vector; prepareOutput would reuse it and mismatch outputType_. Reset.
+  // (Stashing the planned vector for reuse was tried and regressed: its
+  // children are shared into the emitted extended vector, so reuse never
+  // fires and the stash only extends lifetimes.)
   if (output_ != nullptr && output_->childrenSize() != outputType_->size()) {
     output_ = nullptr;
   }
@@ -1021,6 +1032,47 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
       LOG(INFO) << "[fusion-v2] deferred output ACTIVE at node " << planNodeId();
     }
   }
+  const auto traceStart = fusionTraceEnabled_
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
+  ++fusionBatchCount_;
+
+  // Adaptive controller: after warmup, evaluate the deferral-cost model
+  // once. Deferral pays when the deferred payload bytes eliminated
+  // downstream exceed the per-row ref cost across the remaining hops:
+  //   B * e > kappa * (1 + hopsAfter),
+  // with elimination e read from the materialization point's observed
+  // output counter (same driver, so peer access is race-free).
+  constexpr int64_t kFusionWarmupBatches = 32;
+  constexpr double kFusionKappaBytes = 12.0;
+  if (fusionAdaptiveEnabled_ && !fusionDecisionMade_ &&
+      !fusionHop_->deferredChannels.empty() &&
+      fusionBatchCount_ >= kFusionWarmupBatches) {
+    auto* matOp = operatorCtx_->driverCtx()->driver->findOperator(
+        fusionHop_->materializationNodeId);
+    auto* mat = dynamic_cast<HashProbe*>(matOp);
+    // Postpone until the materialization point has produced output, so the
+    // observed elimination is meaningful (deep chains lag at startup); give
+    // up postponing after 8x the warmup and default to deferring.
+    if (mat != nullptr && mat->fusionOutputRows() == 0 &&
+        fusionBatchCount_ < 8 * kFusionWarmupBatches) {
+      // keep deferring, retry next batch
+    } else if (mat != nullptr && fusionOutRows_ > 0) {
+      fusionDecisionMade_ = true;
+      const double e = 1.0 -
+          static_cast<double>(mat->fusionOutputRows()) /
+              static_cast<double>(fusionOutRows_);
+      const bool deferPays = fusionDeferredBytesPerRow_ * std::max(e, 0.0) >
+          kFusionKappaBytes * (1 + fusionHop_->hopsAfter);
+      fusionEager_ = !deferPays;
+      LOG(ERROR) << "[fusion-adaptive] node " << planNodeId()
+                 << (fusionEager_ ? " -> EAGER" : " -> DEFER")
+                 << " at batch " << fusionBatchCount_
+                 << " (B=" << fusionDeferredBytesPerRow_ << " e=" << e
+                 << " hopsAfter=" << fusionHop_->hopsAfter << ")";
+    }
+  }
+
   prepareOutput(size);
   for (auto projection : projectedInputColumns_) {
     ensureLoadedIfNotAtEnd(projection.inputChannel);
@@ -1053,23 +1105,44 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
         fusionImmediate_.push_back(projection);
       }
     }
+    for (column_index_t c = 0; c < fusionNullConstants_.size(); ++c) {
+      if (fusionNullConstants_[c] != nullptr) {
+        const auto& t = outputType_->childAt(c);
+        fusionDeferredBytesPerRow_ +=
+            t->isFixedWidth() ? t->cppSizeInBytes() : 16.0;
+      }
+    }
     fusionSplitInit_ = true;
   }
-  for (column_index_t c = 0; c < fusionNullConstants_.size(); ++c) {
-    if (fusionNullConstants_[c] != nullptr) {
-      BOLT_CHECK_LE(size, fusionNullConstants_[c]->size());
-      output_->childAt(c) = fusionNullConstants_[c];
-    }
-  }
-  if (!fusionImmediate_.empty()) {
+  if (fusionEager_) {
+    // Adaptive switch: extract every build channel here; the ref column
+    // becomes a null constant that downstream forwards and the
+    // materialization point skips.
     extractColumns(
         table_.get(),
         folly::Range<char**>(outputTableRows_.data(), size),
-        fusionImmediate_,
+        tableOutputProjections_,
         pool(),
         outputType_->children(),
         output_->children(),
         /*allowSorting=*/false);
+  } else {
+    for (column_index_t c = 0; c < fusionNullConstants_.size(); ++c) {
+      if (fusionNullConstants_[c] != nullptr) {
+        BOLT_CHECK_LE(size, fusionNullConstants_[c]->size());
+        output_->childAt(c) = fusionNullConstants_[c];
+      }
+    }
+    if (!fusionImmediate_.empty()) {
+      extractColumns(
+          table_.get(),
+          folly::Range<char**>(outputTableRows_.data(), size),
+          fusionImmediate_,
+          pool(),
+          outputType_->children(),
+          output_->children(),
+          /*allowSorting=*/false);
+    }
   }
 
   // Assemble extended output: planned channels + upstream ref pass-through
@@ -1111,6 +1184,11 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
       fusionUpstreamScratch_.emplace_back(nullptr);
     }
     auto& scratch = fusionUpstreamScratch_[upstreamIdx++];
+    if (in->isConstantEncoding() && in->isNullAt(0)) {
+      // Upstream hop switched to eager: its ref is a null-constant marker.
+      children.push_back(in);
+      continue;
+    }
     const auto* flatIn = in->asFlatVector<int64_t>();
     if (flatIn != nullptr && !flatIn->mayHaveNulls()) {
       if (scratch == nullptr) {
@@ -1135,17 +1213,26 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
   }
 
   if (!fusionHop_->deferredChannels.empty()) {
-    if (fusionRefsScratch_ == nullptr) {
-      fusionRefsScratch_ = BaseVector::create(BIGINT(), size, pool());
+    if (fusionEager_) {
+      if (fusionNullRefConstant_ == nullptr) {
+        fusionNullRefConstant_ =
+            BaseVector::createNullConstant(BIGINT(), 65536, pool());
+      }
+      BOLT_CHECK_LE(size, fusionNullRefConstant_->size());
+      children.push_back(fusionNullRefConstant_);
     } else {
-      BaseVector::prepareForReuse(fusionRefsScratch_, size);
+      if (fusionRefsScratch_ == nullptr) {
+        fusionRefsScratch_ = BaseVector::create(BIGINT(), size, pool());
+      } else {
+        BaseVector::prepareForReuse(fusionRefsScratch_, size);
+      }
+      auto* rawRefs =
+          fusionRefsScratch_->asFlatVector<int64_t>()->mutableRawValues();
+      for (vector_size_t i = 0; i < size; ++i) {
+        rawRefs[i] = reinterpret_cast<int64_t>(outputTableRows_[i]);
+      }
+      children.push_back(fusionRefsScratch_);
     }
-    auto* rawRefs =
-        fusionRefsScratch_->asFlatVector<int64_t>()->mutableRawValues();
-    for (vector_size_t i = 0; i < size; ++i) {
-      rawRefs[i] = reinterpret_cast<int64_t>(outputTableRows_[i]);
-    }
-    children.push_back(fusionRefsScratch_);
   }
 
   output_ = std::make_shared<RowVector>(
@@ -1154,6 +1241,16 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
       BufferPtr(nullptr),
       size,
       std::move(children));
+
+  if (fusionTraceEnabled_) {
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - traceStart)
+                        .count();
+    LOG(ERROR) << "[fusion-trace] node=" << planNodeId()
+               << " batch=" << fusionBatchCount_ << " rows=" << size
+               << " bytes=" << output_->estimateFlatSize()
+               << " deferred=" << (fusionEager_ ? 0 : 1) << " us=" << us;
+  }
 }
 
 void HashProbe::materializeFusionRefs(vector_size_t size) {
@@ -1169,6 +1266,12 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
   for (auto i = planned; i < input_->childrenSize(); ++i) {
     const auto& name = inputRowType.nameOf(i);
     if (name.rfind("$fref$", 0) != 0) {
+      continue;
+    }
+    if (input_->childAt(i)->isConstantEncoding() &&
+        input_->childAt(i)->isNullAt(0)) {
+      // The producing hop switched to eager materialization: its channels
+      // already carry real values through the probe pass-through.
       continue;
     }
     const auto hopId = name.substr(6);

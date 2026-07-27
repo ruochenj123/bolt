@@ -100,6 +100,16 @@ DEFINE_bool(
 DEFINE_bool(fusion_v2_enabled, false, "Enable fusion v2 (deferred-ref columns)");
 
 DEFINE_bool(
+    fusion_adaptive_enabled,
+    false,
+    "Adaptive materialization placement for fused runs");
+
+DEFINE_bool(
+    fusion_adaptive_trace,
+    false,
+    "Per-batch trace of fused hops to stderr");
+
+DEFINE_bool(
     hybrid_join_scattered_mode_enabled,
     true,
     "Enable scattered (non-coalesced) mode for hybrid join payload extraction "
@@ -301,6 +311,12 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       if (FLAGS_fusion_v2_enabled) {
         params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
       }
+      if (FLAGS_fusion_adaptive_enabled) {
+        params.queryConfigs[core::QueryConfig::kFusionAdaptiveEnabled] = "true";
+      }
+      if (FLAGS_fusion_adaptive_trace) {
+        params.queryConfigs[core::QueryConfig::kFusionAdaptiveTrace] = "true";
+      }
       params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
           FLAGS_hybrid_join_scattered_mode_enabled ? "true" : "false";
       params.queryConfigs[core::QueryConfig::kHybridJoinReorderEnabled] =
@@ -361,6 +377,12 @@ QueryBenchmarkBase::run(const TpcdsPlan& tpcdsPlan) {
       }
       if (FLAGS_fusion_v2_enabled) {
         params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
+      }
+      if (FLAGS_fusion_adaptive_enabled) {
+        params.queryConfigs[core::QueryConfig::kFusionAdaptiveEnabled] = "true";
+      }
+      if (FLAGS_fusion_adaptive_trace) {
+        params.queryConfigs[core::QueryConfig::kFusionAdaptiveTrace] = "true";
       }
       params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
           FLAGS_hybrid_join_scattered_mode_enabled ? "true" : "false";

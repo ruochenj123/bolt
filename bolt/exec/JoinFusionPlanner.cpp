@@ -68,11 +68,14 @@ std::vector<FusionHopPlan> JoinFusionPlanner::planPipeline(
       std::unordered_set<std::string> laterKeyNames;
       // Walk hops from last to first so each hop sees keys of hops AFTER it.
       std::vector<FusionHopPlan> hops(run.size());
+      const auto& matId = run.back()->id();
       for (int k = static_cast<int>(run.size()) - 1; k >= 0; --k) {
         const auto& join = *run[k];
         FusionHopPlan hop;
         hop.joinNodeId = join.id();
         hop.isMaterializationPoint = (k == static_cast<int>(run.size()) - 1);
+        hop.hopsAfter = static_cast<int32_t>(run.size()) - 1 - k;
+        hop.materializationNodeId = matId;
         for (auto c : buildSideChannels(join)) {
           const auto& name = join.outputType()->nameOf(c);
           if (laterKeyNames.count(name) == 0) {

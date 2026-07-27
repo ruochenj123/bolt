@@ -45,6 +45,8 @@ DECLARE_int32(synth_sort_keys);
 DECLARE_bool(synth_join_sort);
 DECLARE_int32(synth_join_keys);
 DECLARE_int32(synth_chain_joins);
+DECLARE_int32(synth_payload_cols_t);
+DECLARE_int32(synth_payload_cols_u);
 DECLARE_int32(t_selectivity_pct);
 DECLARE_int32(u_selectivity_pct);
 
@@ -3425,14 +3427,20 @@ TpchPlan TpchQueryBuilder::getQ31Plan() const {
 // the chain depth (2 or 3); --s_selectivity_pct thins the probe stream.
 TpchPlan TpchQueryBuilder::getQ37Plan() const {
   const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 0, 12);
+  const int numPayloadsT = FLAGS_synth_payload_cols_t >= 0
+      ? std::clamp(FLAGS_synth_payload_cols_t, 0, 12)
+      : numPayloads;
+  const int numPayloadsU = FLAGS_synth_payload_cols_u >= 0
+      ? std::clamp(FLAGS_synth_payload_cols_u, 0, 12)
+      : numPayloads;
   const int depth = std::clamp(FLAGS_synth_chain_joins, 2, 3);
   static const std::vector<std::string> kRPay = {
       "l_orderkey",     "l_partkey",  "l_extendedprice", "l_shipmode",
       "l_shipinstruct", "l_quantity", "l_discount",      "l_tax",
       "l_linenumber",   "l_shipdate", "l_commitdate",    "l_receiptdate"};
-  auto prefixed = [&](const std::string& pfx) {
+  auto prefixed = [&](const std::string& pfx, int n) {
     std::vector<std::string> cols;
-    for (int i = 0; i < numPayloads; ++i) {
+    for (int i = 0; i < n; ++i) {
       cols.push_back(pfx + kRPay[i].substr(2));
     }
     return cols;
@@ -3453,7 +3461,7 @@ TpchPlan TpchQueryBuilder::getQ37Plan() const {
   // Per-hop selectivity: thinning the T/U build sides drops matching
   // probe rows at hops 2/3, after hop-1 payloads were already deferred.
   std::vector<std::string> tCols = {"t_row_id"};
-  auto tPay = prefixed("t_");
+  auto tPay = prefixed("t_", numPayloadsT);
   tCols.insert(tCols.end(), tPay.begin(), tPay.end());
   PlanBuilder tb(planNodeIdGenerator, pool_.get());
   tb.filtersAsNode(filtersAsNode_)
@@ -3469,7 +3477,7 @@ TpchPlan TpchQueryBuilder::getQ37Plan() const {
   std::vector<std::string> uPay;
   if (depth == 3) {
     std::vector<std::string> uCols = {"u_row_id"};
-    uPay = prefixed("u_");
+    uPay = prefixed("u_", numPayloadsU);
     uCols.insert(uCols.end(), uPay.begin(), uPay.end());
     PlanBuilder ub(planNodeIdGenerator, pool_.get());
     ub.filtersAsNode(filtersAsNode_)

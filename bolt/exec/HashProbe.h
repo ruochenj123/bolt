@@ -367,6 +367,27 @@ class HashProbe : public Operator {
   std::vector<IdentityProjection> fusionImmediate_;
   std::vector<VectorPtr> fusionNullConstants_;
 
+  // Adaptive materialization placement. A deferring hop starts in kDefer;
+  // after kFusionWarmupBatches it evaluates the deferral-cost model against
+  // the observed downstream elimination and may switch (once) to kEager:
+  // extract all build channels at this hop and emit a null-constant ref that
+  // downstream forwards and the materialization point skips.
+  bool fusionAdaptiveEnabled_{false};
+  bool fusionTraceEnabled_{false};
+  bool fusionEager_{false};
+  bool fusionDecisionMade_{false};
+  int64_t fusionBatchCount_{0};
+  int64_t fusionOutRows_{0};
+  double fusionDeferredBytesPerRow_{0};
+  VectorPtr fusionNullRefConstant_;
+
+ public:
+  int64_t fusionOutputRows() const {
+    return fusionOutRows_;
+  }
+
+ private:
+
   // Indicates whether there was no input. Used for right semi join project.
   bool noInput_{true};
 
