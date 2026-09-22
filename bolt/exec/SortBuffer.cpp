@@ -53,8 +53,7 @@ SortBuffer::SortBuffer(
     const common::SpillConfig* spillConfig,
     uint64_t spillMemoryThreshold,
     OperatorCtx* operatorCtx,
-    bool hybridSortEnabled,
-    bool scatteredModeEnabled)
+    bool hybridSortEnabled)
     : input_(input),
       sortCompareFlags_(sortCompareFlags),
       pool_(pool),
@@ -62,8 +61,7 @@ SortBuffer::SortBuffer(
       spillConfig_(spillConfig),
       spillMemoryThreshold_(spillMemoryThreshold),
       operatorCtx_(operatorCtx),
-      hybridSortEnabled_(hybridSortEnabled),
-      scatteredMode_(hybridSortEnabled && scatteredModeEnabled) {
+      hybridSortEnabled_(hybridSortEnabled) {
   BOLT_CHECK_GE(input_->size(), sortCompareFlags_.size());
   BOLT_CHECK_GT(sortCompareFlags_.size(), 0);
   BOLT_CHECK_EQ(sortColumnIndices.size(), sortCompareFlags_.size());
@@ -126,8 +124,6 @@ SortBuffer::SortBuffer(
     std::unordered_map<uint8_t, HybridContainer*> hybridDataChannel;
     hybridDataChannel[0] = hybridData_.get();
     hybridData_->setAllContainers(hybridDataChannel);
-    // Set scattered mode
-    hybridData_->setScatteredModeEnabled(scatteredMode_);
 
     payloadTypes_ =
         ROW(std::move(nonSortedColumnNames), std::move(nonSortedColumnTypes));
@@ -159,23 +155,11 @@ void SortBuffer::addInput(const VectorPtr& input) {
     rows[row] = data_->newRow();
   }
   if (hybridSortEnabled_) {
-    // Get batch/row info before processing
-    auto batchId = hybridData_->getNumBatches(); // for scattered mode
-    auto baseRow = hybridData_->getNumRows(); // for coalesced mode
+    // rowId = global row index (container id 0 for Sort).
+    auto baseRow = hybridData_->getNumRows();
     for (int row = 0; row < input->size(); ++row) {
-      // Store RowId - encoding depends on mode
-      uint64_t encodedId;
-      if (scatteredMode_) {
-        // Scattered mode: rowId = (batchId << 32) | rowInBatch
-        // driverId stored in top 8 bits (always 0 for Sort)
-        BOLT_CHECK_LT(batchId, (1u << 24));
-        encodedId = (static_cast<uint64_t>(0) << 56) |
-            ((static_cast<uint64_t>(batchId) << 32) | row);
-      } else {
-        // Coalesced mode: rowId = global row index
-        encodedId = (static_cast<uint64_t>(0) << 56) |
-            (static_cast<uint64_t>(row + baseRow) & ((1ULL << 56) - 1));
-      }
+      const uint64_t encodedId =
+          static_cast<uint64_t>(row + baseRow) & ((1ULL << 56) - 1);
       data_->storeSingleRowId(encodedId, rows[row]);
     }
     // Store key columns
@@ -226,10 +210,8 @@ void SortBuffer::noMoreInput() {
   // batches; the sort touches only the key container (data_), so the two are
   // disjoint. The thread is joined before updateEstimatedOutputRowSize(),
   // the first reader of hybridData_ after this point. On the spill path the
-  // sort happens later, so coalesce synchronously as before. Scattered mode
-  // never coalesces.
-  const bool hybridCoalesce =
-      hybridSortEnabled_ && hybridData_ != nullptr && !scatteredMode_;
+  // sort happens later, so coalesce synchronously as before.
+  const bool hybridCoalesce = hybridSortEnabled_ && hybridData_ != nullptr;
   std::thread coalesceThread;
   std::exception_ptr coalesceError;
   if (hybridCoalesce && spiller_ == nullptr) {
@@ -404,10 +386,9 @@ void SortBuffer::ensureInputFits(const VectorPtr& input) {
   // If current memory usage exceeds spilling threshold, trigger spilling.
   // For hybrid sort in coalesced mode, include the payload memory that will be
   // needed when coalescing batches. This ensures we trigger spill early enough
-  // to have headroom for the coalesce operation. Skip in scattered mode since
-  // we don't coalesce.
+  // to have headroom for the coalesce operation.
   auto currentMemoryUsage = pool_->currentBytes();
-  if (hybridSortEnabled_ && hybridData_ != nullptr && !scatteredMode_) {
+  if (hybridSortEnabled_ && hybridData_ != nullptr) {
     currentMemoryUsage += hybridData_->payloadMemoryBytes();
   }
   if (spillMemoryThreshold_ != 0 &&
@@ -521,8 +502,8 @@ void SortBuffer::spillInput() {
   // Coalesce batches BEFORE every spill, not just the first one.
   // After each spill, hybridData_->clear() is called which clears
   // owningInputs_. New data added via addInput() needs to be coalesced before
-  // the next spill. Skip in scattered mode since we keep batches separate.
-  if (hybridSortEnabled_ && hybridData_ != nullptr && !scatteredMode_) {
+  // the next spill.
+  if (hybridSortEnabled_ && hybridData_ != nullptr) {
     hybridData_->coalesceBatches();
   }
   spiller_->spill();

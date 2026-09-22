@@ -123,8 +123,6 @@ OrderBy::OrderBy(
         &nonReclaimableSection_);
   } else {
     auto hybridSortEnabled = driverCtx->queryConfig().hybridSortEnabled();
-    auto scatteredModeEnabled =
-        driverCtx->queryConfig().hybridSortScatteredModeEnabled();
     sortBuffer_ = std::make_unique<SortBuffer>(
         outputType_,
         sortColumnIndices,
@@ -134,8 +132,7 @@ OrderBy::OrderBy(
         spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
         operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold(),
         operatorCtx_.get(),
-        hybridSortEnabled,
-        scatteredModeEnabled);
+        hybridSortEnabled);
   }
 
   this->setRuntimeMetric(

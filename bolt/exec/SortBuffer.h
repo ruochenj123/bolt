@@ -61,8 +61,7 @@ class SortBuffer : public SortBufferBase {
       const common::SpillConfig* spillConfig = nullptr,
       uint64_t spillMemoryThreshold = 0,
       OperatorCtx* operatorCtx = nullptr,
-      bool hybridSortEnabled = false,
-      bool scatteredModeEnabled = false);
+      bool hybridSortEnabled = false);
 
   ~SortBuffer() override;
 
@@ -249,8 +248,6 @@ class SortBuffer : public SortBufferBase {
 
   // For hybrid design
   bool hybridSortEnabled_{false};
-  bool scatteredMode_{
-      false}; // Use scattered (non-coalesced) mode for hybrid sort
   std::unique_ptr<HybridContainer> hybridData_{nullptr};
   std::vector<IdentityProjection> keyColumnMap_;
   std::vector<IdentityProjection> payloadColumnMap_;

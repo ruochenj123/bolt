@@ -669,21 +669,6 @@ class QueryConfig {
 
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
-  /// If true, use scattered (non-coalesced) mode for hybrid sort payload
-  /// extraction. In scattered mode, payload batches are kept separate instead
-  /// of being merged into one large batch. This avoids the coalesceBatches()
-  /// overhead.
-  static constexpr const char* kHybridSortScatteredModeEnabled =
-      "hybrid_sort_scattered_mode_enabled";
-
-  /// If true, use scattered (non-coalesced) mode for hybrid join payload
-  /// extraction. In scattered mode, payload batches are kept separate instead
-  /// of being merged into one large batch. Row IDs encode (batchId, rowInBatch)
-  /// instead of global row index. This avoids the coalesceBatches() overhead
-  /// but may have worse cache locality during extraction.
-  static constexpr const char* kHybridJoinScatteredModeEnabled =
-      "hybrid_join_scattered_mode_enabled";
-
   /// Fusion v2 (deferred-ref columns; docs/fusion-v2-design.md).
   static constexpr const char* kFusionV2Enabled = "fusion_v2_enabled";
   static constexpr const char* kFusionAdaptiveEnabled =
@@ -1139,20 +1124,6 @@ class QueryConfig {
 
   bool hybridSortEnabled() const {
     return get<bool>(kHybridSortEnabled, false);
-  }
-
-  /// Returns whether scattered (non-coalesced) mode is enabled for hybrid sort.
-  /// When enabled, payload batches are kept separate instead of being merged,
-  /// avoiding coalesceBatches() overhead. Default true.
-  bool hybridSortScatteredModeEnabled() const {
-    return get<bool>(kHybridSortScatteredModeEnabled, true);
-  }
-
-  /// Returns whether scattered (non-coalesced) mode is enabled for hybrid join.
-  /// When enabled, payload batches are kept separate instead of being merged,
-  /// avoiding coalesceBatches() overhead. Default true (use scattered mode).
-  bool hybridJoinScatteredModeEnabled() const {
-    return get<bool>(kHybridJoinScatteredModeEnabled, true);
   }
 
   /// Returns whether fusion v2 (deferred-ref columns) is enabled.

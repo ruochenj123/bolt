@@ -118,16 +118,6 @@ DEFINE_bool(
     false,
     "Per-batch trace of fused hops to stderr");
 
-DEFINE_bool(
-    hybrid_join_scattered_mode_enabled,
-    true,
-    "Enable scattered (non-coalesced) mode for hybrid join payload extraction "
-    "(matches QueryConfig default; set =false to force coalesced mode)");
-DEFINE_bool(
-    hybrid_sort_scattered_mode_enabled,
-    true,
-    "Hybrid sort keeps payload batches scattered (no coalesce); false = coalesced "
-    "mode as in the original hybrid sort.");
 
 DEFINE_bool(
     hybrid_join_reorder_enabled,
@@ -333,10 +323,6 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
       if (FLAGS_fusion_adaptive_trace) {
         params.queryConfigs[core::QueryConfig::kFusionAdaptiveTrace] = "true";
       }
-      params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
-          FLAGS_hybrid_join_scattered_mode_enabled ? "true" : "false";
-      params.queryConfigs[core::QueryConfig::kHybridSortScatteredModeEnabled] =
-          FLAGS_hybrid_sort_scattered_mode_enabled ? "true" : "false";
       params.queryConfigs[core::QueryConfig::kHybridJoinReorderEnabled] =
           FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
       if (FLAGS_max_output_batch_rows != 10000) {
@@ -402,10 +388,6 @@ QueryBenchmarkBase::run(const TpcdsPlan& tpcdsPlan) {
       if (FLAGS_fusion_adaptive_trace) {
         params.queryConfigs[core::QueryConfig::kFusionAdaptiveTrace] = "true";
       }
-      params.queryConfigs[core::QueryConfig::kHybridJoinScatteredModeEnabled] =
-          FLAGS_hybrid_join_scattered_mode_enabled ? "true" : "false";
-      params.queryConfigs[core::QueryConfig::kHybridSortScatteredModeEnabled] =
-          FLAGS_hybrid_sort_scattered_mode_enabled ? "true" : "false";
       params.queryConfigs[core::QueryConfig::kHybridJoinReorderEnabled] =
           FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
       if (FLAGS_max_output_batch_rows != 10000) {
