@@ -171,6 +171,10 @@ class TpchQueryBuilder {
   const dwio::common::FileFormat format_;
   static const std::unordered_map<std::string, std::vector<std::string>>
       kTables_;
+  /// SSB (star schema benchmark) support: set when <dataPath>/lineorder exists;
+  /// SSB queries are ids 101..113 (Q1.1..Q4.3), ported from the velox-cudf tree.
+  bool ssb_{false};
+  TpchPlan getSsbPlan(int queryId) const;
   static const std::vector<std::string> kTableNames_;
 
   static constexpr const char* kLineitem = "lineitem";
