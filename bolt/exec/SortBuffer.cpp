@@ -156,8 +156,6 @@ void SortBuffer::addInput(const VectorPtr& input) {
   for (int row = 0; row < input->size(); ++row) {
     rows[row] = data_->newRow();
   }
-  auto* inputRow = input->as<RowVector>();
-  MicrosecondTimer timer(&sortColToRowTimeUs_);
   if (hybridSortEnabled_) {
     // Get batch/row info before processing
     auto batchId = hybridData_->getNumBatches(); // for scattered mode
