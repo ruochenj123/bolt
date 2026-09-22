@@ -31,8 +31,12 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include "bolt/exec/HashJoinBridge.h"
 #include "bolt/exec/HashTable.h"
@@ -471,6 +475,27 @@ class HashBuild final : public Operator {
   std::unique_ptr<HybridContainer> hybridData_;
 
   bool reuseHashTable_ = false;
+
+  // Joins this driver's background payload-coalesce thread (no-op if none)
+  // and, unless 'rethrow' is false, rethrows an error it captured. Serialized
+  // by 'hybridCoalesceMutex_' because the last build driver, the spill path
+  // and close() may all reach it.
+  void joinHybridCoalesceThread(bool rethrow = true);
+
+  // Background thread coalescing this driver's HybridContainer payload
+  // batches, overlapped with the remaining build work: for non-last drivers
+  // the merge runs while the last driver is still consuming input; for the
+  // last driver it runs under prepareJoinTable() (the coalesce touches only
+  // payload batches, the table build only the key rows). Joined before any
+  // reader of the payload: spill, the probe handoff, close().
+  std::thread hybridCoalesceThread_;
+  std::exception_ptr hybridCoalesceError_;
+  std::mutex hybridCoalesceMutex_;
+  // True while the coalesce thread may be running. Makes this operator
+  // non-reclaimable for that window (see nonReclaimableState()): a reclaim
+  // triggered by the coalesce thread's own allocations would otherwise try to
+  // join the thread from itself, and a peer reclaim would race the merge.
+  std::atomic<bool> hybridCoalesceInFlight_{false};
 };
 
 inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {

@@ -1038,6 +1038,7 @@ void HashBuild::runSpill(const std::vector<Operator*>& spillOperators) {
       BOLT_CHECK(
           !build->scatteredMode_,
           "Spilling is not supported for hybrid join in scattered mode");
+      build->joinHybridCoalesceThread();
       build->table_->hybridData()->coalesceBatches();
     }
     build->spiller_->spill();
@@ -1069,12 +1070,23 @@ void HashBuild::noMoreInput() {
 }
 
 void HashBuild::noMoreInputInternal() {
-  // Coalesce batches in this driver's HybridContainer before merging with
-  // peers. This handles both the normal path (from noMoreInput) and spill
-  // restore path (from processSpillInput). Each driver does this independently.
-  // Skip in scattered mode - we keep batches separate.
-  if (hybridJoin_ && table_->hybridData() && !scatteredMode_) {
-    table_->hybridData()->coalesceBatches();
+  // Coalesce batches in this driver's HybridContainer on a background thread
+  // (see hybridCoalesceThread_). This handles both the normal path (from
+  // noMoreInput) and the spill restore path (from processSpillInput); a
+  // previous thread, if any, is joined first. Scattered mode keeps batches
+  // separate and never coalesces.
+  if (hybridJoin_ && table_ != nullptr && table_->hybridData() != nullptr &&
+      !scatteredMode_) {
+    joinHybridCoalesceThread();
+    auto* hybridData = table_->hybridData();
+    hybridCoalesceInFlight_ = true;
+    hybridCoalesceThread_ = std::thread([this, hybridData]() {
+      try {
+        hybridData->coalesceBatches();
+      } catch (...) {
+        hybridCoalesceError_ = std::current_exception();
+      }
+    });
   }
 
   if (spillEnabled()) {
@@ -1230,6 +1242,14 @@ bool HashBuild::finishHashBuild() {
       dropDuplicates_,
       isInputFromSpill() ? spillConfig()->startPartitionBit
                          : BaseHashTable::kNoSpillInputStartPartitionBit);
+
+  // Join the background payload-coalesce threads (own + peers) so every
+  // hybrid container is fully coalesced before the probe side starts
+  // extracting from them.
+  joinHybridCoalesceThread();
+  for (auto* build : otherBuilds) {
+    build->joinHybridCoalesceThread();
+  }
   addRuntimeStats();
 
   // [Morsel-driven] early capture empty hashtable and stop build side
@@ -1748,6 +1768,7 @@ void HashBuild::reclaim(
             // separate.
             if (buildOp->hybridJoin_ && buildOp->table_->hybridData() &&
                 !buildOp->scatteredMode_) {
+              buildOp->joinHybridCoalesceThread();
               buildOp->table_->hybridData()->coalesceBatches();
             }
             buildOp->spiller_->spill();
@@ -1799,10 +1820,28 @@ bool HashBuild::nonReclaimableState() const {
   return ((state_ != State::kRunning) && (state_ != State::kWaitForBuild) &&
           (state_ != State::kYield)) ||
       nonReclaimableSection_ || intermediateStateCleared_ ||
-      spiller_->finalized();
+      spiller_->finalized() || hybridCoalesceInFlight_.load();
+}
+
+void HashBuild::joinHybridCoalesceThread(bool rethrow) {
+  std::lock_guard<std::mutex> l(hybridCoalesceMutex_);
+  if (hybridCoalesceThread_.joinable()) {
+    hybridCoalesceThread_.join();
+  }
+  hybridCoalesceInFlight_ = false;
+  if (hybridCoalesceError_ != nullptr) {
+    auto err = hybridCoalesceError_;
+    hybridCoalesceError_ = nullptr;
+    if (rethrow) {
+      std::rethrow_exception(err);
+    }
+  }
 }
 
 void HashBuild::close() {
+  // Defensive join on early teardown (e.g. query abort while parked waiting
+  // for peers); errors are irrelevant at close and deliberately swallowed.
+  joinHybridCoalesceThread(/*rethrow=*/false);
   Operator::close();
 
   {

@@ -31,6 +31,8 @@
 #include "SortBuffer.h"
 #include <algorithm>
 #include <numeric>
+#include <thread>
+#include <folly/ScopeGuard.h>
 #include "HashTable.h"
 #include "Spiller.h"
 #include "bolt/exec/MemoryReclaimer.h"
@@ -219,13 +221,36 @@ void SortBuffer::noMoreInput() {
   if (numInputRows_ == 0) {
     return;
   }
-  if (hybridSortEnabled_ && hybridData_ != nullptr && !scatteredMode_) {
+  // Coalesced hybrid mode: run the payload merge on a background thread,
+  // overlapped with the key sort below. The merge touches only the payload
+  // batches; the sort touches only the key container (data_), so the two are
+  // disjoint. The thread is joined before updateEstimatedOutputRowSize(),
+  // the first reader of hybridData_ after this point. On the spill path the
+  // sort happens later, so coalesce synchronously as before. Scattered mode
+  // never coalesces.
+  const bool hybridCoalesce =
+      hybridSortEnabled_ && hybridData_ != nullptr && !scatteredMode_;
+  std::thread coalesceThread;
+  std::exception_ptr coalesceError;
+  if (hybridCoalesce && spiller_ == nullptr) {
+    coalesceThread = std::thread([&]() {
+      try {
+        hybridData_->coalesceBatches();
+      } catch (...) {
+        coalesceError = std::current_exception();
+      }
+    });
+  } else if (hybridCoalesce) {
     hybridData_->coalesceBatches();
   }
+  auto coalesceGuard = folly::makeGuard([&]() {
+    if (coalesceThread.joinable()) {
+      coalesceThread.join();
+    }
+  });
 
   if (spiller_ == nullptr) {
     BOLT_CHECK_EQ(numInputRows_, data_->numRows());
-    updateEstimatedOutputRowSize();
     // Sort the pointers to the rows in RowContainer (data_) instead of sorting
     // the rows.
     // TODO: Reuse 'RowContainer::rowPointers_'.
@@ -279,6 +304,14 @@ void SortBuffer::noMoreInput() {
 #ifdef ENABLE_BOLT_JIT
     }
 #endif
+    if (coalesceThread.joinable()) {
+      coalesceThread.join();
+      if (coalesceError) {
+        std::rethrow_exception(coalesceError);
+      }
+    }
+    // Runs after the coalesce join: reads hybridData_ under hybrid mode.
+    updateEstimatedOutputRowSize();
   } else {
     // Spill the remaining in-memory state to disk if spilling has been
     // triggered on this sort buffer. This is to simplify query OOM prevention

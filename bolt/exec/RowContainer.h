@@ -32,6 +32,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <unordered_map>
 #include <folly/CPortability.h>
@@ -1921,6 +1922,14 @@ inline void ensureFlatChild(RowVector* batch, int32_t columnIndex) {
 
 class HybridContainer;
 
+// No-op releaser for BufferViews over payload string buffers: the view keeps
+// the source BufferPtr alive by value, so nothing to do on release.
+struct HybridPayloadBufferReleaser {
+  BufferPtr buffer;
+  void addRef() const {}
+  void release() const {}
+};
+
 class HybridContainer {
  public:
   HybridContainer(
@@ -2207,6 +2216,50 @@ class HybridContainer {
   }
 
   // Coalesce all payload batches into a single batch to improve locality.
+  // Nullability of a payload column across every registered container. The
+  // multi-container extraction runs on the merged table's container, whose
+  // own isNullable_ only reflects the batches this driver added; nulls that
+  // exist only in a peer driver's batches must still select the null-aware
+  // kernel.
+  bool anyContainerNullable(int32_t payloadColumn) const {
+    if (isNullable_[payloadColumn]) {
+      return true;
+    }
+    for (const auto& entry : allContainers_) {
+      if (entry.second->isNullable_[payloadColumn]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Zero-copy string extraction: extracted StringViews point into the source
+  // payload's string buffers, so attach those buffers to the result via a
+  // BufferView sized by the bytes this call referenced (bounded by the
+  // buffer). coalesceBatches() compacts each string column into one buffer;
+  // any extra buffers are acquired outright.
+  static void addSharedStringBufferViews(
+      FlatVector<StringView>* result,
+      const FlatVector<StringView>* source,
+      uint64_t referencedBytes) {
+    if (referencedBytes == 0) {
+      return;
+    }
+    bool first = true;
+    for (const auto& buffer : source->stringBuffers()) {
+      if (first) {
+        result->addStringBuffer(
+            BufferView<HybridPayloadBufferReleaser>::create(
+                buffer->as<uint8_t>(),
+                std::min<uint64_t>(referencedBytes, buffer->size()),
+                HybridPayloadBufferReleaser{buffer}));
+        first = false;
+      } else {
+        result->addStringBuffer(buffer);
+      }
+    }
+  }
+
   void coalesceBatches() {
     // Skip if no payload columns defined.
     if (payloadTypes_.empty()) {
@@ -2248,22 +2301,92 @@ class HybridContainer {
     for (int32_t col = 0; col < numPayloadCols; ++col) {
       payloadNames.push_back(fmt::format("c{}", col));
     }
-    // Flatten payload columns batch-major and release each source batch as
-    // soon as all its columns are copied: column-major order would keep the
-    // full original payload alive until the last column finishes, doubling
-    // transient memory at peak.
+    // Merge column-at-a-time and release each source batch's column slot as
+    // soon as it is copied: merged columns accumulate at the same rate source
+    // columns are freed, so the transient peak stays near 1x payload plus the
+    // single column being built.
     for (int32_t col = 0; col < numPayloadCols; ++col) {
+      // VARCHAR/VARBINARY: compact out-of-line string bodies into a single
+      // buffer instead of merging via BaseVector::copy. copy()'s string path
+      // shares the source string buffers, which would leave the merged child
+      // holding one BufferPtr per input batch (thousands); the extraction
+      // kernels then acquire those shared buffers into every output batch,
+      // and O(batches) BufferPtr transfers per extraction call dominate.
+      // With one compacted buffer, extraction acquires exactly one buffer
+      // per call and copies only 16-byte views.
+      const auto kind = payloadTypes_[col]->kind();
+      if (kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) {
+        // Pass 1: flatten sources and size the compacted body buffer.
+        uint64_t bodyBytes = 0;
+        for (auto& batch : owningInputs_) {
+          ensureFlatChild(batch.get(), col);
+          auto* src =
+              batch->childAt(col)->asUnchecked<FlatVector<StringView>>();
+          const auto* views = src->rawValues();
+          const auto* nulls = src->rawNulls();
+          const auto batchSize = batch->size();
+          for (vector_size_t i = 0; i < batchSize; ++i) {
+            if ((nulls == nullptr || !bits::isBitNull(nulls, i)) &&
+                !views[i].isInline()) {
+              bodyBytes += views[i].size();
+            }
+          }
+        }
+        auto merged = BaseVector::create(payloadTypes_[col], totalRows, pool);
+        auto* mergedFlat = merged->asUnchecked<FlatVector<StringView>>();
+        BufferPtr bodyBuffer;
+        char* bodyData = nullptr;
+        if (bodyBytes > 0) {
+          bodyBuffer = AlignedBuffer::allocate<char>(bodyBytes, pool);
+          bodyBuffer->setSize(bodyBytes);
+          bodyData = bodyBuffer->asMutable<char>();
+          mergedFlat->setStringBuffers({bodyBuffer});
+        }
+        // Pass 2: copy views (and bodies for out-of-line strings), then
+        // release each source batch's column slot.
+        auto* outViews = mergedFlat->mutableRawValues();
+        uint64_t bodyOffset = 0;
+        vector_size_t offset = 0;
+        for (auto& batch : owningInputs_) {
+          auto* src =
+              batch->childAt(col)->asUnchecked<FlatVector<StringView>>();
+          const auto* views = src->rawValues();
+          const auto* nulls = src->rawNulls();
+          const auto batchSize = batch->size();
+          for (vector_size_t i = 0; i < batchSize; ++i) {
+            const auto out = offset + i;
+            if (nulls != nullptr && bits::isBitNull(nulls, i)) {
+              mergedFlat->setNull(out, true);
+              continue;
+            }
+            const auto& v = views[i];
+            if (v.isInline()) {
+              outViews[out] = v;
+            } else {
+              memcpy(bodyData + bodyOffset, v.data(), v.size());
+              outViews[out] = StringView(bodyData + bodyOffset, v.size());
+              bodyOffset += v.size();
+            }
+          }
+          batch->childAt(col).reset();
+          offset += batchSize;
+        }
+        newChildren.push_back(std::move(merged));
+        continue;
+      }
       newChildren.push_back(
           BaseVector::create(payloadTypes_[col], totalRows, pool));
-    }
-    vector_size_t offset = 0;
-    for (auto& batch : owningInputs_) {
-      const auto batchSize = batch->size();
-      for (int32_t col = 0; col < numPayloadCols; ++col) {
-        newChildren[col]->copy(batch->childAt(col).get(), offset, 0, batchSize);
+      auto& merged = newChildren.back();
+      vector_size_t offset = 0;
+      for (auto& batch : owningInputs_) {
+        const auto batchSize = batch->size();
+        merged->copy(batch->childAt(col).get(), offset, 0, batchSize);
+        batch->childAt(col).reset();
+        offset += batchSize;
       }
+    }
+    for (auto& batch : owningInputs_) {
       batch.reset();
-      offset += batchSize;
     }
 
     // Rebuild owningInputs_ with a single RowVector.
@@ -2371,8 +2494,9 @@ class HybridContainer {
               outputRowIds);
         }
       } else {
-        // Multi-container scattered mode
-        if (isNullable_[columnIndex]) {
+        // Multi-container scattered mode: nullability must consider all
+        // registered containers (see anyContainerNullable()).
+        if (anyContainerNullable(columnIndex)) {
           extractPayloadScatteredWithNullsMulti<T, useRowNumbers>(
               rows,
               rowNumbers,
@@ -2419,8 +2543,9 @@ class HybridContainer {
       return;
     }
 
-    // Multi-container path (hash join after table merge)
-    if (isNullable_[columnIndex]) {
+    // Multi-container path (hash join after table merge): nullability must
+    // consider all registered containers (see anyContainerNullable()).
+    if (anyContainerNullable(columnIndex)) {
       extractPayloadWithNulls<T, useRowNumbers>(
           rows,
           rowNumbers,
@@ -2510,6 +2635,9 @@ class HybridContainer {
     BOLT_CHECK_NOT_NULL(flatChild);
     const T* rawValues = flatChild->rawValues();
     const uint64_t* rawNulls = flatChild->rawNulls();
+    // Strings are extracted as raw 16-byte views; out-of-line bodies stay in
+    // the source buffer, retained via a BufferView added after the loops.
+    [[maybe_unused]] uint64_t stringRefBytes = 0;
 
     constexpr vector_size_t kPrefetchDist = 128;
 
@@ -2552,7 +2680,11 @@ class HybridContainer {
 
         bits::setNull(nulls, resultIndex, false);
         if constexpr (std::is_same_v<T, StringView>) {
-          result->set(resultIndex, rawValues[rid]);
+          const auto& v = rawValues[rid];
+          if (!v.isInline()) {
+            stringRefBytes += v.size();
+          }
+          values[resultIndex] = v;
         } else {
           values[resultIndex] = rawValues[rid];
         }
@@ -2583,10 +2715,18 @@ class HybridContainer {
 
       bits::setNull(nulls, resultIndex, false);
       if constexpr (std::is_same_v<T, StringView>) {
-        result->set(resultIndex, rawValues[rid]);
+        const auto& v = rawValues[rid];
+        if (!v.isInline()) {
+          stringRefBytes += v.size();
+        }
+        values[resultIndex] = v;
       } else {
         values[resultIndex] = rawValues[rid];
       }
+    }
+
+    if constexpr (std::is_same_v<T, StringView>) {
+      addSharedStringBufferViews(result, flatChild, stringRefBytes);
     }
   }
 
@@ -2613,6 +2753,9 @@ class HybridContainer {
                           ->template as<FlatVector<T>>();
     BOLT_CHECK_NOT_NULL(flatChild);
     const T* rawValues = flatChild->rawValues();
+    // Strings are extracted as raw 16-byte views; out-of-line bodies stay in
+    // the source buffer, retained via a BufferView added after the loops.
+    [[maybe_unused]] uint64_t stringRefBytes = 0;
 
     constexpr vector_size_t kPrefetchDist = 128;
 
@@ -2650,7 +2793,11 @@ class HybridContainer {
         result->setNull(resultIndex, false);
         const auto rid = rowIdPtr[idx].rowId_;
         if constexpr (std::is_same_v<T, StringView>) {
-          result->set(resultIndex, rawValues[rid]);
+          const auto& v = rawValues[rid];
+          if (!v.isInline()) {
+            stringRefBytes += v.size();
+          }
+          values[resultIndex] = v;
         } else {
           values[resultIndex] = rawValues[rid];
         }
@@ -2676,10 +2823,18 @@ class HybridContainer {
       result->setNull(resultIndex, false);
       const auto rid = rowIdPtr[i].rowId_;
       if constexpr (std::is_same_v<T, StringView>) {
-        result->set(resultIndex, rawValues[rid]);
+        const auto& v = rawValues[rid];
+        if (!v.isInline()) {
+          stringRefBytes += v.size();
+        }
+        values[resultIndex] = v;
       } else {
         values[resultIndex] = rawValues[rid];
       }
+    }
+
+    if constexpr (std::is_same_v<T, StringView>) {
+      addSharedStringBufferViews(result, flatChild, stringRefBytes);
     }
   }
 
@@ -2952,6 +3107,12 @@ class HybridContainer {
     constexpr vector_size_t kPrefetchDist = 128;
 
     std::vector<const T*> rawValuesByContainer(maxContainerId_ + 1, nullptr);
+    // For strings: per-container sources and referenced-byte counters; a
+    // BufferView per contributing container is added after the loops.
+    [[maybe_unused]] std::vector<const FlatVector<T>*> sourceByContainer(
+        maxContainerId_ + 1, nullptr);
+    [[maybe_unused]] std::vector<uint64_t> stringRefBytesByContainer(
+        maxContainerId_ + 1, 0);
     std::vector<const uint64_t*> rawNullsByContainer(
         maxContainerId_ + 1, nullptr);
     for (const auto& entry : allContainers_) {
@@ -2965,6 +3126,7 @@ class HybridContainer {
                             ->template as<FlatVector<T>>();
       BOLT_CHECK_NOT_NULL(flatChild);
       rawValuesByContainer[entry.first] = flatChild->rawValues();
+      sourceByContainer[entry.first] = flatChild;
       rawNullsByContainer[entry.first] = flatChild->rawNulls();
     }
 
@@ -3058,7 +3220,11 @@ class HybridContainer {
 
         bits::setNull(nulls, resultIndex, false);
         if constexpr (std::is_same_v<T, StringView>) {
-          result->set(resultIndex, curRaw[rid]);
+          const auto& v = curRaw[rid];
+          if (!v.isInline()) {
+            stringRefBytesByContainer[curCid] += v.size();
+          }
+          values[resultIndex] = v;
         } else {
           values[resultIndex] = curRaw[rid];
         }
@@ -3096,9 +3262,22 @@ class HybridContainer {
 
       bits::setNull(nulls, resultIndex, false);
       if constexpr (std::is_same_v<T, StringView>) {
-        result->set(resultIndex, curRaw[rid]);
+        const auto& v = curRaw[rid];
+        if (!v.isInline()) {
+          stringRefBytesByContainer[curCid] += v.size();
+        }
+        values[resultIndex] = v;
       } else {
         values[resultIndex] = curRaw[rid];
+      }
+    }
+
+    if constexpr (std::is_same_v<T, StringView>) {
+      for (int32_t cid = 0; cid <= maxContainerId_; ++cid) {
+        if (stringRefBytesByContainer[cid] > 0) {
+          addSharedStringBufferViews(
+              result, sourceByContainer[cid], stringRefBytesByContainer[cid]);
+        }
       }
     }
   }
@@ -3125,6 +3304,12 @@ class HybridContainer {
     constexpr vector_size_t kPrefetchDist = 128;
 
     std::vector<const T*> rawValuesByContainer(maxContainerId_ + 1, nullptr);
+    // For strings: per-container sources and referenced-byte counters; a
+    // BufferView per contributing container is added after the loops.
+    [[maybe_unused]] std::vector<const FlatVector<T>*> sourceByContainer(
+        maxContainerId_ + 1, nullptr);
+    [[maybe_unused]] std::vector<uint64_t> stringRefBytesByContainer(
+        maxContainerId_ + 1, 0);
     for (const auto& entry : allContainers_) {
       // Skip containers with no data (e.g., drivers that received no input)
       if (entry.second->owningInputs_.empty()) {
@@ -3136,6 +3321,7 @@ class HybridContainer {
                             ->template as<FlatVector<T>>();
       BOLT_CHECK_NOT_NULL(flatChild);
       rawValuesByContainer[entry.first] = flatChild->rawValues();
+      sourceByContainer[entry.first] = flatChild;
     }
     // cached for load
     int32_t curCid = -1;
@@ -3232,7 +3418,11 @@ class HybridContainer {
 
         const auto rid = rowIdRec.rowId_;
         if constexpr (std::is_same_v<T, StringView>) {
-          result->set(resultIndex, curRaw[rid]);
+          const auto& v = curRaw[rid];
+          if (!v.isInline()) {
+            stringRefBytesByContainer[curCid] += v.size();
+          }
+          values[resultIndex] = v;
         } else {
           values[resultIndex] = curRaw[rid];
         }
@@ -3266,9 +3456,22 @@ class HybridContainer {
 
       const auto rid = rowIdRec.rowId_;
       if constexpr (std::is_same_v<T, StringView>) {
-        result->set(resultIndex, curRaw[rid]);
+        const auto& v = curRaw[rid];
+        if (!v.isInline()) {
+          stringRefBytesByContainer[curCid] += v.size();
+        }
+        values[resultIndex] = v;
       } else {
         values[resultIndex] = curRaw[rid];
+      }
+    }
+
+    if constexpr (std::is_same_v<T, StringView>) {
+      for (int32_t cid = 0; cid <= maxContainerId_; ++cid) {
+        if (stringRefBytesByContainer[cid] > 0) {
+          addSharedStringBufferViews(
+              result, sourceByContainer[cid], stringRefBytesByContainer[cid]);
+        }
       }
     }
   }
