@@ -35,7 +35,7 @@ static bool notEmpty(const char* /*flagName*/, const std::string& value) {
 DEFINE_validator(data_path, &notEmpty);
 
 DEFINE_int32(
-    run_query_verbose,
+    bolt_benchmark_run_query_verbose,
     -1,
     "Run a given query and print execution statistics");
 
