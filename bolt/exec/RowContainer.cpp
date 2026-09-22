@@ -1502,6 +1502,78 @@ bool RowComparator::operator()(
   return false;
 }
 
+namespace {
+// Typed gather for flattening a DICTIONARY view over a FLAT base (ported from
+// the velox-cudf tree, 2026-09-22). BaseVector::flattenVector goes through the
+// generic per-row copy path, which costs ~10 ns per cell when a selective
+// filter's output (thousands of small dictionary views per column) is
+// retained; a direct gather is ~1 ns per cell. Strings copy the StringViews
+// only and share the base's character buffers. Returns nullptr when the shape
+// is not handled (caller falls back to the generic flatten).
+template <typename T>
+VectorPtr gatherFlatDictionary(
+    const BaseVector& dict,
+    const std::shared_ptr<BaseVector>& base) {
+  const vector_size_t n = dict.size();
+  auto* pool = base->pool();
+  auto out = BaseVector::create<FlatVector<T>>(base->type(), n, pool);
+  const auto* idx = dict.wrapInfo()->as<vector_size_t>();
+  const auto* baseFlat = base->as<FlatVector<T>>();
+  const T* in = baseFlat->rawValues();
+  T* dst = out->mutableRawValues();
+  const bool anyNulls = dict.mayHaveNulls() || base->mayHaveNulls();
+  if (!anyNulls) {
+    for (vector_size_t i = 0; i < n; ++i) {
+      dst[i] = in[idx[i]];
+    }
+  } else {
+    DecodedVector decoded(dict);
+    for (vector_size_t i = 0; i < n; ++i) {
+      if (decoded.isNullAt(i)) {
+        out->setNull(i, true);
+      } else {
+        dst[i] = in[idx[i]];
+      }
+    }
+  }
+  if constexpr (std::is_same_v<T, StringView>) {
+    out->acquireSharedStringBuffers(base.get());
+  }
+  return out;
+}
+
+VectorPtr fastFlattenDictionary(const VectorPtr& v) {
+  if (v == nullptr || v->encoding() != VectorEncoding::Simple::DICTIONARY) {
+    return nullptr;
+  }
+  auto base = BaseVector::loadedVectorShared(v->valueVector());
+  if (base == nullptr || base->encoding() != VectorEncoding::Simple::FLAT) {
+    return nullptr;
+  }
+  switch (base->typeKind()) {
+    case TypeKind::BIGINT:
+      return gatherFlatDictionary<int64_t>(*v, base);
+    case TypeKind::INTEGER:
+      return gatherFlatDictionary<int32_t>(*v, base);
+    case TypeKind::SMALLINT:
+      return gatherFlatDictionary<int16_t>(*v, base);
+    case TypeKind::TINYINT:
+      return gatherFlatDictionary<int8_t>(*v, base);
+    case TypeKind::DOUBLE:
+      return gatherFlatDictionary<double>(*v, base);
+    case TypeKind::REAL:
+      return gatherFlatDictionary<float>(*v, base);
+    case TypeKind::TIMESTAMP:
+      return gatherFlatDictionary<Timestamp>(*v, base);
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+      return gatherFlatDictionary<StringView>(*v, base);
+    default:
+      return nullptr;
+  }
+}
+} // namespace
+
 HybridContainer::HybridContainer(
     const std::vector<TypePtr>& keyTypes,
     const std::vector<TypePtr>& payloadTypes,
@@ -1527,6 +1599,25 @@ HybridContainer::~HybridContainer() {
 
 void HybridContainer::addPayload(RowVectorPtr input) {
   BOLT_CHECK_EQ(input->childrenSize(), payloadTypes_.size());
+
+  // Flatten dictionary-encoded payload children. A dictionary view (e.g. a
+  // Filter's output) pins its full base vector for the container's lifetime;
+  // for selective filters that retains far more memory than the surviving
+  // rows, and extraction pays the indirection. Flattening copies the
+  // survivors only; flat children pass through zero-copy and constants stay
+  // constant. This mutates only this container's wrapper RowVector
+  // (wrapColumns), not the upstream vector the children came from.
+  for (int32_t i = 0; i < input->childrenSize(); ++i) {
+    auto& child = input->childAt(i);
+    if (child->encoding() == VectorEncoding::Simple::DICTIONARY) {
+      if (auto flat = fastFlattenDictionary(child)) {
+        child = std::move(flat);
+      } else {
+        BaseVector::flattenVector(child);
+      }
+    }
+  }
+
   totalRows_ += input->size();
   totalBatches_++;
 
