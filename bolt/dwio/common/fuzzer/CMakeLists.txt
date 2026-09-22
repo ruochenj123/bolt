@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(bolt_dwio_common_fuzzer_test DwioFuzzer.cpp)
+bolt_add_library(bolt_dwio_common_fuzzer_test DwioFuzzer.cpp)
 
 target_link_libraries(
   bolt_dwio_common_fuzzer_test
@@ -22,6 +22,5 @@ target_link_libraries(
   bolt_dwio_native_parquet_reader
   bolt_temp_path
   GTest::gtest
-  GTest::gtest_main
   fmt::fmt
 )

@@ -111,7 +111,7 @@ struct ScanState {
   DictionaryValues dictionary;
 
   // If the format, like ORC/DWRF has a base dictionary completed by
-  // local delta dictionaries over the furst one, this represents the
+  // local delta dictionaries over the first one, this represents the
   // local values, e.g. row group dictionary in ORC. TBD: If there is
   // a pattern of dictionaries completed by more dictionaries in other
   // formats, this will be modeled as an vector of n DictionaryValues.
@@ -300,7 +300,7 @@ class SelectiveColumnReader {
   void setNulls(BufferPtr resultNulls);
 
   // Adds 'bias' to outputt rows between 'firstRow' and end. Used
-  // whenn combining data from multiple encoding runs, where the
+  // when combining data from multiple encoding runs, where the
   // output rows are first in terms of position in the encoding entry.
   void offsetOutputRows(int32_t firstRow, int32_t bias) {
     for (auto i = firstRow; i < outputRows_.size(); ++i) {
@@ -471,11 +471,19 @@ class SelectiveColumnReader {
   template <typename T>
   void ensureValuesCapacity(vector_size_t numRows);
 
+  // Prepares output nulls for reading 'rows'. Keeps null decoding for
+  // filtering, but skips result nulls when the filter proves raw output values
+  // are non-null.
+  void prepareOutputNulls(
+      const RowSet& rows,
+      bool inputHasNulls,
+      int32_t extraRows = 0);
+
   // Prepares the result buffer for nulls for reading 'rows'. Leaves
-  // 'extraSpace' bits worth of space in the nulls buffer.
+  // 'extraRows' bits worth of space in the nulls buffer.
   void prepareNulls(const RowSet& rows, bool hasNulls, int32_t extraRows = 0);
 
-  void makeCastExpr();
+  void makeCastExpr(TypePtr castSourceType = nullptr);
 
   void doCastEvaluate(VectorPtr* result);
 
@@ -543,6 +551,8 @@ class SelectiveColumnReader {
   // should move null flags.  Return nullptr if nulls does not need to be moved.
   // Checks consistency of nulls-related state.
   const uint64_t* shouldMoveNulls(RowSet rows);
+
+  bool filterGuaranteesRawOutputNonNull() const;
 
   void addStringValue(folly::StringPiece value);
 
@@ -681,6 +691,7 @@ class SelectiveColumnReader {
   ScanState scanState_;
 
   std::unique_ptr<exec::ExprSet> castExprSet_;
+  TypePtr castSourceType_;
 
   const std::string dummyColumnName = "__innerc0__";
 };

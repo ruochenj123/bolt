@@ -59,11 +59,12 @@ class RowVector : public BaseVector {
       BufferPtr nulls,
       size_t length,
       std::vector<VectorPtr> children,
-      std::optional<vector_size_t> nullCount = std::nullopt)
+      std::optional<vector_size_t> nullCount = std::nullopt,
+      VectorEncoding::Simple encoding = VectorEncoding::Simple::ROW)
       : BaseVector(
             pool,
             type,
-            VectorEncoding::Simple::ROW,
+            encoding,
             nulls,
             length,
             std::nullopt,
@@ -251,7 +252,7 @@ class RowVector : public BaseVector {
 
   void validate(const VectorValidateOptions& options) const override;
 
-  /// Only calls BaseVector::resize and doesnt resize the children.
+  /// Only calls BaseVector::resize and doesn't resize the children.
   /// This function is present for backwards compatibility,
   /// until the few places that require it are migrated over.
   void unsafeResize(vector_size_t newSize, bool setNotNull = true);
@@ -262,7 +263,7 @@ class RowVector : public BaseVector {
   /// Note : If the child is null, then it will stay null after the resize.
   virtual void resize(vector_size_t newSize, bool setNotNull = true) override;
 
-  static bool isComposite(std::shared_ptr<RowVector>& input);
+  static bool isComposite(const std::shared_ptr<RowVector>& input);
 
  private:
   vector_size_t childSize() const {
@@ -523,7 +524,7 @@ class CompositeRowVector : public RowVector {
   // columns stored in columnar format
   std::unique_ptr<SelectivityVector> validChildren_;
 
-  // buffer that store row datas
+  // buffer that store row data
   std::unique_ptr<memory::RowBuffer> rowBuffer_;
 
   // map<row start index : buffer index rowBuffer_>
@@ -903,6 +904,9 @@ class MapVector : public ArrayVectorBase {
   // that keys[indices[i]] < keys[indices[i + 1]].
   std::vector<vector_size_t> sortedKeyIndices(vector_size_t index) const;
 
+  /// Returns true if the keys at 'index' are already in canonical order.
+  bool isSorted(vector_size_t index) const;
+
   void ensureWritable(const SelectivityVector& rows) override;
 
   bool isWritable() const override;
@@ -929,10 +933,6 @@ class MapVector : public ArrayVectorBase {
   }
 
  private:
-  // Returns true if the keys for map at 'index' are sorted from first
-  // to last in the type's collation order.
-  bool isSorted(vector_size_t index) const;
-
   // makes a Buffer with 0, 1, 2,... size-1. This is later sorted to
   // get elements in key order in each map.
   BufferPtr elementIndices() const;

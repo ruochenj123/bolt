@@ -32,6 +32,7 @@
 
 #include <boost/date_time.hpp>
 #include "bolt/common/base/Exceptions.h"
+#include "bolt/common/base/SparkCompatibility.h"
 #include "bolt/functions/lib/DateTimeFormatter.h"
 #include "bolt/functions/lib/TimeUtils.h"
 #include "bolt/functions/prestosql/DateTimeImpl.h"
@@ -1593,7 +1594,9 @@ struct DateFormatFunction : public TimestampWithTimezoneSupport<T> {
   bool isConstFormat_ = false;
 };
 
-template <typename T>
+template <
+    typename T,
+    bool SparkCompatible = ::bytedance::bolt::kSparkCompatible>
 struct JodaDateFormatFunction : public TimestampWithTimezoneSupport<T> {
   BOLT_DEFINE_FUNCTION_TYPES(T);
 
@@ -1623,14 +1626,12 @@ struct JodaDateFormatFunction : public TimestampWithTimezoneSupport<T> {
       const arg_type<Timestamp>* /*timestamp*/,
       const arg_type<Varchar>* formatString) {
     sessionTimeZone_ = getTimeZoneFromConfig(config);
-#ifdef SPARK_COMPATIBLE
-    timePolicy_ = parseTimePolicy(config.timeParserPolicy());
-#else
-    if (formatString != nullptr) {
+    if constexpr (SparkCompatible) {
+      timePolicy_ = parseTimePolicy(config.timeParserPolicy());
+    } else if (formatString != nullptr) {
       ensureFormatLegal(
           std::string_view(formatString->data(), formatString->size()));
     }
-#endif
     setFormatter(formatString);
   }
 
@@ -1639,14 +1640,12 @@ struct JodaDateFormatFunction : public TimestampWithTimezoneSupport<T> {
       const core::QueryConfig& config,
       const arg_type<TimestampWithTimezone>* /*timestamp*/,
       const arg_type<Varchar>* formatString) {
-#ifdef SPARK_COMPATIBLE
-    timePolicy_ = parseTimePolicy(config.timeParserPolicy());
-#else
-    if (formatString != nullptr) {
+    if constexpr (SparkCompatible) {
+      timePolicy_ = parseTimePolicy(config.timeParserPolicy());
+    } else if (formatString != nullptr) {
       ensureFormatLegal(
           std::string_view(formatString->data(), formatString->size()));
     }
-#endif
     setFormatter(formatString);
   }
 
@@ -1655,10 +1654,10 @@ struct JodaDateFormatFunction : public TimestampWithTimezoneSupport<T> {
       const arg_type<Timestamp>& timestamp,
       const arg_type<Varchar>& formatString) {
     if (!isConstFormat_) {
-#ifndef SPARK_COMPATIBLE
-      ensureFormatLegal(
-          std::string_view(formatString.data(), formatString.size()));
-#endif
+      if constexpr (!SparkCompatible) {
+        ensureFormatLegal(
+            std::string_view(formatString.data(), formatString.size()));
+      }
       setFormatter(&formatString);
     }
 
@@ -1941,6 +1940,15 @@ struct MonthsBetweenFunction {
       const core::QueryConfig& config,
       const arg_type<Timestamp>* /*toTimestamp*/,
       const arg_type<Timestamp>* /*fromTimestamp*/,
+      const arg_type<bool>* /*roundOff*/) {
+    sessionTimeZone_ = getTimeZoneFromConfig(config);
+  }
+
+  FOLLY_ALWAYS_INLINE void initialize(
+      const std::vector<TypePtr>& /*inputTypes*/,
+      const core::QueryConfig& config,
+      const arg_type<Timestamp>* /*toTimestamp*/,
+      const arg_type<Timestamp>* /*fromTimestamp*/,
       const arg_type<bool>* /*roundOff*/,
       const arg_type<Varchar>* timeZone) {
     if (timeZone == nullptr || timeZone->empty()) {
@@ -2021,6 +2029,15 @@ struct MonthsBetweenFunction {
       const arg_type<Timestamp>& fromTimestamp) {
     calcMonthsBetween(
         toTimestamp, fromTimestamp, false, sessionTimeZone_, tzID_, result);
+  }
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<double>& result,
+      const arg_type<Timestamp>& toTimestamp,
+      const arg_type<Timestamp>& fromTimestamp,
+      const arg_type<bool>& roundOff) {
+    calcMonthsBetween(
+        toTimestamp, fromTimestamp, roundOff, sessionTimeZone_, tzID_, result);
   }
 
   FOLLY_ALWAYS_INLINE void call(

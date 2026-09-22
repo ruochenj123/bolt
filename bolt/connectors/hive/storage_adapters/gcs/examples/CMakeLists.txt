@@ -25,14 +25,5 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_executable(bolt_gcsfile_example GCSFileSystemExample.cpp)
-target_link_libraries(
-  bolt_gcsfile_example
-  Folly::folly
-  bolt_file
-  bolt_gcs
-  bolt_core
-  bolt_hive_connector
-  bolt_dwio_common_exception
-  bolt_exec
-)
+add_executable(bolt_gcsfile_example GcsFileSystemExample.cpp)
+target_link_libraries(bolt_gcsfile_example bolt_testutils)

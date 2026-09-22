@@ -14,52 +14,29 @@
 # limitations under the License.
 
 if(${ENABLE_BOLT_JIT})
-
-  add_executable(bolt_thrustjit_test RowContainerIRTest.cpp ThrustJitEngineTest.cpp )
-  target_compile_features(bolt_thrustjit_test PUBLIC cxx_std_20)
-  target_link_libraries(
-    bolt_thrustjit_test bolt_process bolt_thrustjit bolt_exception GTest::gtest GTest::gtest_main
+  add_executable(
+    bolt_thrustjit_test
+    RowContainerIRTest.cpp
+    ThrustJITv2Test.cpp
   )
-
-  add_executable(bolt_rowEqVectors_test RowEqVectorsIRTest.cpp)
-  target_link_libraries(
-    bolt_rowEqVectors_test
-    bolt_process
-    bolt_exec
-    bolt_type
-    bolt_functions_lib
-    bolt_exec_test_lib
-    bolt_functions_prestosql
-    bolt_vector_fuzzer
-    bolt_vector_test_lib
-    Folly::folly
-    bolt_thrustjit
-    GTest::gtest
-    GTest::gtest_main
-  )
-
-  add_executable(bolt_rowEqRow_test RowEqRowIRTest.cpp)
-
-  target_link_libraries(
-    bolt_rowEqRow_test
-    bolt_process
-    bolt_exec
-    bolt_type
-    bolt_functions_lib
-    bolt_exec_test_lib
-    bolt_functions_prestosql
-    bolt_vector_fuzzer
-    bolt_vector_test_lib
-    Folly::folly
-    bolt_thrustjit
-    GTest::gtest
-    GTest::gtest_main
-  )
-
-  set_target_properties(bolt_thrustjit_test PROPERTIES ENABLE_EXPORTS ON)
-
+  target_link_libraries(bolt_thrustjit_test PRIVATE bolt_gtest_main)
   add_test(bolt_thrustjit_test bolt_thrustjit_test)
 
+  add_executable(bolt_row_row_cmp_test RowEqRowIRTest.cpp)
+  target_link_libraries(
+    bolt_row_row_cmp_test
+    bolt_gtest_main
+    Folly::follybenchmark
+  )
+  bolt_add_sharded_gtest(bolt_row_row_cmp_test 3)
+
+  add_executable(bolt_row_vec_cmp_test RowEqVectorsIRTest.cpp)
+  target_link_libraries(
+    bolt_row_vec_cmp_test
+    bolt_gtest_main
+    Folly::follybenchmark
+  )
+  add_test(bolt_row_vec_cmp_test bolt_row_vec_cmp_test)
 endif()
 
 # TODO: refactor expression codegen
@@ -68,7 +45,8 @@ if(${ENABLE_BOLT_EXPR_JIT})
   find_package(ThrustVector REQUIRED)
   add_test(
     NAME bolt_expr_jit_test
-    COMMAND bolt_expr_jit_test
+    COMMAND
+      bolt_expr_jit_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   )
 
@@ -76,7 +54,7 @@ if(${ENABLE_BOLT_EXPR_JIT})
 
   target_link_libraries(
     bolt_expr_jit_test
-    bolt_functions_test_lib
+    bolt_testutils
     bolt_exec
     bolt_dwio_common
     bolt_aggregates
@@ -92,22 +70,12 @@ if(${ENABLE_BOLT_EXPR_JIT})
     bolt_memory
     bolt_dwio_common_exception
     ThrustVector::JIT
-    ${Boost_ATOMIC_LIBRARIES}
-    ${Boost_CONTEXT_LIBRARIES}
-    ${Boost_DATE_TIME_LIBRARIES}
-    ${Boost_FILESYSTEM_LIBRARIES}
-    ${Boost_PROGRAM_OPTIONS_LIBRARIES}
-    ${Boost_REGEX_LIBRARIES}
-    ${Boost_THREAD_LIBRARIES}
-    ${Boost_SYSTEM_LIBRARIES}
-    ${FOLLY_WITH_DEPENDENCIES}
+    Folly::folly
     ${FOLLY_BENCHMARK}
-    ${DOUBLE_CONVERSION}
+    double-conversion::double-conversion
     ${gflags_LIBRARIES}
     bolt_process
     glog::glog
     ${FMT}
-    ${FILESYSTEM}
   )
-
 endif() # ENABLE_BOLT_EXPR_JIT

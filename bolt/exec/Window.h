@@ -123,7 +123,7 @@ class Window : public Operator {
 
       windowStats.windowSpillTotalTimeUs = windowSpilledStats.spillTotalTimeUs;
       windowStats.windowSpilledFiles = windowSpilledStats.spilledFiles;
-      windowStats.windowSpilledFiles = windowSpilledStats.spilledRows;
+      windowStats.windowSpilledRows = windowSpilledStats.spilledRows;
     }
     return windowStats;
   }
@@ -340,7 +340,7 @@ class Window : public Operator {
   bool isAggWindowFunc_ = false;
   std::vector<TypePtr> windowResultTypes_;
 
-  // When sort and window is merge, we need to sort the data in window oprator
+  // When sort and window is merge, we need to sort the data in window operator
   bool needSort_ = true;
 
   bool enableJit_ = false;

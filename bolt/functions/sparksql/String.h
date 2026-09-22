@@ -37,6 +37,7 @@
 #include <codecvt>
 #include <string>
 #include "bolt/common/base/Uuid.h"
+#include "bolt/expression/StringWriter.h"
 #include "bolt/expression/VectorFunction.h"
 #include "bolt/functions/Macros.h"
 #include "bolt/functions/UDFOutputString.h"
@@ -44,41 +45,67 @@
 #include "bolt/functions/lib/string/StringImpl.h"
 namespace bytedance::bolt::functions::sparksql {
 
-template <typename T, bool lpad>
+// Controls the dialect-specific behavior for negative sizes and empty pads.
+enum class PadInvalidInputPolicy {
+  kThrow,
+  kReturnNull,
+};
+
+template <
+    typename T,
+    bool lpad,
+    PadInvalidInputPolicy invalidInputPolicy = PadInvalidInputPolicy::kThrow>
 struct PadFunctionBase {
   BOLT_DEFINE_FUNCTION_TYPES(T);
 
   // ASCII input always produces ASCII result.
   static constexpr bool is_default_ascii_behavior = true;
 
-  FOLLY_ALWAYS_INLINE void call(
+  FOLLY_ALWAYS_INLINE bool call(
       out_type<Varchar>& result,
       const arg_type<Varchar>& string,
       const arg_type<int64_t>& size,
       const arg_type<Varchar>& padString) {
-    stringImpl::pad<lpad, false /*isAscii*/>(result, string, size, padString);
+    return applyPad<false /*isAscii*/>(result, string, size, padString);
   }
 
-  FOLLY_ALWAYS_INLINE void call(
+  FOLLY_ALWAYS_INLINE bool call(
       out_type<Varchar>& result,
       const arg_type<Varchar>& string,
       const arg_type<int64_t>& size) {
-    stringImpl::pad<lpad, false /*isAscii*/>(result, string, size, {" "});
+    return applyPad<false /*isAscii*/>(result, string, size, {" "});
   }
 
-  FOLLY_ALWAYS_INLINE void callAscii(
+  FOLLY_ALWAYS_INLINE bool callAscii(
       out_type<Varchar>& result,
       const arg_type<Varchar>& string,
       const arg_type<int64_t>& size,
       const arg_type<Varchar>& padString) {
-    stringImpl::pad<lpad, true /*isAscii*/>(result, string, size, padString);
+    return applyPad<true /*isAscii*/>(result, string, size, padString);
   }
 
-  FOLLY_ALWAYS_INLINE void callAscii(
+  FOLLY_ALWAYS_INLINE bool callAscii(
       out_type<Varchar>& result,
       const arg_type<Varchar>& string,
       const arg_type<int64_t>& size) {
-    stringImpl::pad<lpad, true /*isAscii*/>(result, string, size, {" "});
+    return applyPad<true /*isAscii*/>(result, string, size, {" "});
+  }
+
+ private:
+  template <bool isAscii>
+  FOLLY_ALWAYS_INLINE bool applyPad(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& string,
+      const arg_type<int64_t>& size,
+      const arg_type<Varchar>& padString) {
+    if constexpr (invalidInputPolicy == PadInvalidInputPolicy::kReturnNull) {
+      if (size < 0 || padString.empty()) {
+        return false;
+      }
+    }
+
+    stringImpl::pad<lpad, isAscii>(result, string, size, padString);
+    return true;
   }
 };
 
@@ -116,6 +143,17 @@ struct BitLengthFunction {
   template <typename TInput>
   FOLLY_ALWAYS_INLINE void call(int32_t& result, TInput& input) {
     result = input.size() * 8;
+  }
+};
+
+/// Returns the number of bytes in a string or binary value.
+template <typename T>
+struct OctetLengthFunction {
+  BOLT_DEFINE_FUNCTION_TYPES(T);
+
+  template <typename TInput>
+  FOLLY_ALWAYS_INLINE void call(int32_t& result, const TInput& input) {
+    result = input.size();
   }
 };
 
@@ -1226,7 +1264,7 @@ struct ConvFunction {
       toChars(result, unsignedValue, toBase, resultSize);
     }
 
-    // Converts to uppper case, consistent with Spark.
+    // Converts to upper case, consistent with Spark.
     if (std::abs(toBase) > 10) {
       toUpper(result.data(), result.size());
     }
@@ -1426,37 +1464,11 @@ struct ToTitleFunction {
   }
 };
 
-/// repeat(input, n) -> varchar
-///
-///    Returns the string which repeats input n times.
-///    Result size must be less than or equal to 1MB.
-///    If n is less than or equal to 0, empty string is returned.
-template <typename T>
-struct RepeatFunction {
-  BOLT_DEFINE_FUNCTION_TYPES(T);
-
-  static constexpr bool is_default_ascii_behavior = true;
-
-  FOLLY_ALWAYS_INLINE void
-  call(out_type<Varchar>& result, const arg_type<Varchar>& input, int32_t n) {
-    static constexpr size_t resultMaxSize = 1024 * 1024; // 1MB
-    auto inputSize = input.size();
-    if (inputSize == 0 || n <= 0) {
-      result.resize(0);
-      return;
-    }
-    int32_t newSize = bolt::checkedMultiply<int32_t>(inputSize, n);
-    BOLT_USER_CHECK_LE(
-        newSize,
-        resultMaxSize,
-        "Result size must be less than or equal to {}",
-        resultMaxSize);
-    result.resize(newSize);
-    for (auto i = 0; i < n; ++i) {
-      std::memcpy(result.data() + i * inputSize, input.data(), inputSize);
-    }
-  }
-};
+std::vector<std::shared_ptr<exec::FunctionSignature>> sparkRepeatSignatures();
+std::shared_ptr<exec::VectorFunction> makeRepeat(
+    const std::string& name,
+    const std::vector<exec::VectorFunctionArg>& inputArgs,
+    const core::QueryConfig& config);
 
 template <typename T>
 struct SoundexFunction {

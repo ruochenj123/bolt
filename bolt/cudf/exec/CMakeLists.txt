@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(bolt_cudf_exec HashAggregation.cpp InterOp.cpp OrderBy.cpp)
+bolt_add_library(bolt_cudf_exec HashAggregation.cpp InterOp.cpp OrderBy.cpp)
 
 target_include_directories(bolt_cudf_exec PRIVATE ${cudf_INCLUDE_DIRS})
 
 target_link_libraries(
-  bolt_cudf_exec PRIVATE arrow cudf::cudf bolt_arrow_bridge bolt_exception bolt_common_base
-                         bolt_exec
+  bolt_cudf_exec
+  PRIVATE
+    arrow::arrow
+    cudf::cudf
 )
 
 # The LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE macro enables the experimental
@@ -30,8 +32,15 @@ target_link_libraries(
 # https://nvidia.github.io/cccl/libcudacxx/extended_api/memory_resource.html
 target_compile_options(
   bolt_cudf_exec
-  PUBLIC -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
-  PRIVATE -Wno-missing-field-initializers -fcoroutines
+  PRIVATE
+    -Wno-missing-field-initializers
+    -fcoroutines
 )
 
-target_compile_definitions(bolt_cudf_exec PRIVATE BOLT_HAS_CUDF=1)
+target_compile_definitions(
+  bolt_cudf_exec
+  PUBLIC
+    LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE
+  PRIVATE
+    BOLT_HAS_CUDF=1
+)

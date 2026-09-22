@@ -13,7 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(bolt_functions_flink_impl JsonFunctions.cpp)
+bolt_add_library(
+  bolt_functions_flink_impl
+  HashCodeFunction.cpp
+  ICURegexFunctions.cpp
+  JsonFunctions.cpp
+  RegexFunctions.cpp
+  ElementAt.cpp
+  TemporalFunctions.cpp
+  specialforms/DecimalRound.cpp
+  specialforms/FlinkCastExpr.cpp
+)
 
 target_link_libraries(
   bolt_functions_flink_impl
@@ -28,7 +38,13 @@ target_link_libraries(
   simdjson::simdjson
 )
 
-set_property(TARGET bolt_functions_flink_impl PROPERTY JOB_POOL_COMPILE high_memory_pool)
+set_property(
+  TARGET
+    bolt_functions_flink_impl
+  PROPERTY
+    JOB_POOL_COMPILE
+      high_memory_pool
+)
 
 if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)

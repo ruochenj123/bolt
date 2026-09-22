@@ -28,6 +28,8 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/functions/prestosql/tests/utils/FunctionBaseTest.h"
 #include "bolt/type/TimestampConversion.h"
@@ -159,6 +161,19 @@ TEST_F(SequenceTest, invalidStep) {
       "try(sequence(C0, C1, C2))",
       {startVector, stopVector, stepVector},
       expected);
+}
+
+TEST_F(SequenceTest, equalBoundsWithZeroStep) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
+  const auto startVector = makeFlatVector<int64_t>({1});
+  const auto stopVector = makeFlatVector<int64_t>({1});
+  const auto stepVector = makeFlatVector<int64_t>({0});
+  testExpressionWithError(
+      "sequence(C0, C1, C2)",
+      {startVector, stopVector, stepVector},
+      "(0 vs. 0) step must not be zero");
 }
 
 TEST_F(SequenceTest, dateArguments) {

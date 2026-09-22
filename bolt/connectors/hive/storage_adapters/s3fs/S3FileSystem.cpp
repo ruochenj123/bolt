@@ -316,6 +316,7 @@ class S3FileSystem::Impl {
 
     client_ = std::make_shared<Aws::S3::S3Client>(
         credentialsProvider, nullptr /* endpointProvider */, clientConfig);
+    s3Config_ = std::make_shared<S3Config>(s3Config);
     ++fileSystemCount;
   }
 
@@ -453,6 +454,10 @@ class S3FileSystem::Impl {
     return client_.get();
   }
 
+  S3Config* s3Config() const {
+    return s3Config_.get();
+  }
+
   std::string getLogLevelName() const {
     return getAwsInstance()->getLogLevelName();
   }
@@ -463,6 +468,7 @@ class S3FileSystem::Impl {
 
  private:
   std::shared_ptr<Aws::S3::S3Client> client_;
+  std::shared_ptr<S3Config> s3Config_;
 };
 
 S3FileSystem::S3FileSystem(
@@ -494,8 +500,8 @@ std::unique_ptr<WriteFile> S3FileSystem::openFileForWrite(
     std::string_view s3Path,
     const FileOptions& options) {
   const auto path = getPath(s3Path);
-  auto s3file =
-      std::make_unique<S3WriteFile>(path, impl_->s3Client(), options.pool);
+  auto s3file = std::make_unique<S3WriteFile>(
+      path, impl_->s3Client(), options.pool, impl_->s3Config());
   return s3file;
 }
 
@@ -535,6 +541,54 @@ bool S3FileSystem::exists(std::string_view path) {
   request.SetKey(awsString(key));
 
   return impl_->s3Client()->HeadObject(request).IsSuccess();
+}
+
+FileInfo S3FileSystem::fileInfo(std::string_view path) {
+  const auto objectPath = getPath(path);
+  const auto separator = objectPath.find('/');
+  const std::string bucket(objectPath.substr(0, separator));
+  std::string key = separator == std::string_view::npos
+      ? ""
+      : std::string(objectPath.substr(separator + 1));
+
+  if (!key.empty()) {
+    Aws::S3::Model::HeadObjectRequest request;
+    request.SetBucket(awsString(bucket));
+    request.SetKey(awsString(key));
+    const auto outcome = impl_->s3Client()->HeadObject(request);
+    if (outcome.IsSuccess()) {
+      const auto& metadata = outcome.GetResult();
+      const bool isDirectory = key.back() == '/';
+      return {
+          .isDirectory = isDirectory,
+          .size = isDirectory
+              ? 0
+              : static_cast<uint64_t>(metadata.GetContentLength()),
+          .modificationTimeMs = metadata.GetLastModified().Millis()};
+    }
+    if (outcome.GetError().GetResponseCode() !=
+        Aws::Http::HttpResponseCode::NOT_FOUND) {
+      BOLT_CHECK_AWS_OUTCOME(
+          outcome, "Failed to get S3 file metadata", bucket, key);
+    }
+  }
+
+  // Object stores can represent directories solely by their children's prefix.
+  const bool isBucket = key.empty();
+  if (!isBucket && key.back() != '/') {
+    key += '/';
+  }
+  Aws::S3::Model::ListObjectsRequest request;
+  request.SetBucket(awsString(bucket));
+  request.SetPrefix(awsString(key));
+  request.SetMaxKeys(1);
+  const auto outcome = impl_->s3Client()->ListObjects(request);
+  BOLT_CHECK_AWS_OUTCOME(
+      outcome, "Failed to get S3 directory metadata", bucket, key);
+  if (isBucket || !outcome.GetResult().GetContents().empty()) {
+    return {.isDirectory = true};
+  }
+  BOLT_FILE_NOT_FOUND_ERROR("S3 path not found: {}", path);
 }
 
 void S3FileSystem::mkdir(std::string_view path) {

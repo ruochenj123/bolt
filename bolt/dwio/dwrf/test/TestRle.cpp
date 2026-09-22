@@ -58,7 +58,7 @@ std::vector<int64_t> decodeRLEv2(
     size_t remaining = count - i;
     size_t nread = std::min(n, remaining);
     if (nulls) {
-      remainingNulls.reserve(bits::nwords(nread));
+      remainingNulls.reserve(bits::nwords(static_cast<uint64_t>(nread)));
       for (int32_t j = 0; j < nread; j++) {
         bits::setNull(
             remainingNulls.data(), j, bits::isBitNull(nulls, j + totalRead));
@@ -623,7 +623,7 @@ TEST_F(RLEv2Test, basicDirectSeek) {
 TEST_F(RLEv2Test, bitsLeftByPreviousStream) {
   auto pool = memory::memoryManager()->addLeafPool();
   // test for #109
-  // 118 DIRECT values, followed by PATHCED values
+  // 118 DIRECT values, followed by PATCHED values
   const unsigned char bytes[] = {
       0x5a, 0x75, 0x92, 0x42, 0x49, 0x09, 0x2b, 0xa4, 0xae, 0x92, 0xc2, 0x4b,
       0x89, 0x2f, 0x24, 0xbc, 0x93, 0x2a, 0x4c, 0xa9, 0x34, 0x24, 0xe0, 0x93,

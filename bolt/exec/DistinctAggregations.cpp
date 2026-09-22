@@ -153,7 +153,7 @@ class TypedDistinctAggregations : public DistinctAggregations {
           groups.data(), groups.size(), &result->childAt(aggregate.output));
 
       // Release memory back to HashStringAllocator to allow next
-      // aggregate to re-use it.
+      // aggregate to reuse it.
       aggregate.function->destroy(groups);
 
       // Overwrite empty groups over the destructed groups to keep the container
@@ -255,6 +255,9 @@ std::unique_ptr<DistinctAggregations> DistinctAggregations::create(
           aggregates, inputType, pool);
     case TypeKind::BIGINT:
       return std::make_unique<TypedDistinctAggregations<int64_t>>(
+          aggregates, inputType, pool);
+    case TypeKind::HUGEINT:
+      return std::make_unique<TypedDistinctAggregations<int128_t>>(
           aggregates, inputType, pool);
     case TypeKind::REAL:
       return std::make_unique<TypedDistinctAggregations<float>>(

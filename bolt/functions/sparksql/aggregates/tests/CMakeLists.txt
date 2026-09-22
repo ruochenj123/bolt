@@ -28,32 +28,27 @@
 add_executable(
   bolt_functions_spark_aggregates_test
   AverageAggregationTest.cpp
+  BitmapConstructAggAggregateTest.cpp
+  BitmapOrAggAggregateTest.cpp
   BitwiseXorAggregationTest.cpp
   BloomFilterAggAggregateTest.cpp
   CentralMomentsAggregationTest.cpp
   CollectListAggregateTest.cpp
   CollectSetAggregateTest.cpp
+  CovarianceAggregatesTest.cpp
   FirstAggregateTest.cpp
   LastAggregateTest.cpp
-  Main.cpp
   MinMaxByAggregationTest.cpp
-  PercentileAggregateTest.cpp
+  ModeAggregateTest.cpp
   PercentileApproxTest.cpp
   RegrReplacementAggregationTest.cpp
   SumAggregationTest.cpp
 )
 
+if(BOLT_ENABLE_SPARK_COMPATIBLE)
+  target_sources(bolt_functions_spark_aggregates_test PRIVATE PercentileAggregateTest.cpp)
+endif()
+
 add_test(bolt_functions_spark_aggregates_test bolt_functions_spark_aggregates_test)
 
-target_link_libraries(
-  bolt_functions_spark_aggregates_test
-  bolt_exec_test_lib
-  bolt_vector_test_lib
-  bolt_functions_aggregates_test_lib
-  bolt_functions_spark
-  bolt_functions_spark_aggregates
-  bolt_hive_connector
-  gflags::gflags
-  GTest::gtest
-  GTest::gtest_main
-)
+target_link_libraries(bolt_functions_spark_aggregates_test bolt_gtest_main)

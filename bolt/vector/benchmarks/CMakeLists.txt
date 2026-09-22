@@ -25,39 +25,25 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
+set(
+  BOLT_BENCHMARK_DEPS
+  bolt_testutils
+  ${FOLLY_BENCHMARK}
+  GTest::gtest
+)
 add_executable(bolt_vector_hash_all_benchmark SimpleVectorHashAllBenchmark.cpp)
 
-target_link_libraries(
-  bolt_vector_hash_all_benchmark bolt_vector Folly::folly ${FOLLY_BENCHMARK} fmt::fmt
-)
+target_link_libraries(bolt_vector_hash_all_benchmark PRIVATE ${BOLT_BENCHMARK_DEPS})
 # This is a workaround for the use of VectorTestUtils.h which include gtest.h
-target_link_libraries(bolt_vector_hash_all_benchmark GTest::gtest)
+target_link_libraries(bolt_vector_hash_all_benchmark PRIVATE ${BOLT_BENCHMARK_DEPS})
 
 add_executable(bolt_vector_selectivity_vector_benchmark SelectivityVectorBenchmark.cpp)
 
-target_link_libraries(bolt_vector_selectivity_vector_benchmark bolt_vector
-                      Folly::folly ${FOLLY_BENCHMARK} $<LINK_LIBRARY:WHOLE_ARCHIVE,bolt_process>)
+target_link_libraries(bolt_vector_selectivity_vector_benchmark PRIVATE ${BOLT_BENCHMARK_DEPS})
 
 add_executable(copy_benchmark CopyBenchmark.cpp)
 
-target_link_libraries(copy_benchmark bolt_vector_test_lib Folly::folly ${FOLLY_BENCHMARK})
+target_link_libraries(copy_benchmark PRIVATE ${BOLT_BENCHMARK_DEPS})
 
 add_executable(copy_vectors_opt_bench CopyVecOptBenchmark.cpp)
-target_link_libraries(
-  copy_vectors_opt_bench
-  bolt_exec
-  bolt_hive_connector
-  bolt_functions_lib
-  bolt_exec_test_lib
-  bolt_functions_prestosql
-  bolt_dwio_common_exception
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  Folly::folly
-  ${FOLLY_BENCHMARK}
-  gflags::gflags
-)
-
-set_target_properties(bolt_vector_selectivity_vector_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(copy_vectors_opt_bench PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+target_link_libraries(copy_vectors_opt_bench PRIVATE ${BOLT_BENCHMARK_DEPS})

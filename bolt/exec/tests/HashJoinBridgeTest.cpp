@@ -135,9 +135,9 @@ class HashJoinBridgeTest : public testing::Test,
            tempDir_->path + "/Spill_" + std::to_string(fileId),
            1024,
            128,
-           1,
-           std::vector<CompareFlags>({}),
+           SpillState::makeSortingKeys(std::vector<CompareFlags>(1)),
            common::CompressionKind_NONE,
+           std::nullopt,
            std::nullopt});
     }
     return files;

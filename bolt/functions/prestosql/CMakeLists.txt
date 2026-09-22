@@ -29,7 +29,7 @@ add_subdirectory(json)
 add_subdirectory(types)
 add_subdirectory(window)
 
-add_library(
+bolt_add_library(
   bolt_functions_prestosql_impl
   ArrayAndMapMatch.cpp
   ArrayConstructor.cpp
@@ -60,7 +60,6 @@ add_library(
   Reverse.cpp
   RowFunction.cpp
   Sequence.cpp
-  Slice.cpp
   Split.cpp
   StringFunctions.cpp
   StringToMap.cpp
@@ -86,6 +85,7 @@ target_link_libraries(
   bolt_common_hyperloglog
   bolt_functions_json
   bolt_functions_lib
+  bolt_functions_string
   bolt_expression
   bolt_type_tz
   bolt_presto_types
@@ -96,7 +96,13 @@ target_link_libraries(
   Folly::folly
 )
 
-set_property(TARGET bolt_functions_prestosql_impl PROPERTY JOB_POOL_COMPILE high_memory_pool)
+set_property(
+  TARGET
+    bolt_functions_prestosql_impl
+  PROPERTY
+    JOB_POOL_COMPILE
+      high_memory_pool
+)
 
 if(${BOLT_ENABLE_AGGREGATES})
   add_subdirectory(aggregates)
@@ -110,7 +116,7 @@ elseif(${BOLT_BUILD_TEST_UTILS})
   add_subdirectory(tests/utils)
 endif()
 
-if(${BOLT_ENABLE_BENCHMARKS})
+if(${BOLT_BUILD_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
 

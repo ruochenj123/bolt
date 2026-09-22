@@ -51,7 +51,8 @@ SortBuffer::SortBuffer(
     const common::SpillConfig* spillConfig,
     uint64_t spillMemoryThreshold,
     OperatorCtx* operatorCtx,
-    bool hybridSortEnabled)
+    bool hybridSortEnabled,
+    bool scatteredModeEnabled)
     : input_(input),
       sortCompareFlags_(sortCompareFlags),
       pool_(pool),
@@ -59,17 +60,19 @@ SortBuffer::SortBuffer(
       spillConfig_(spillConfig),
       spillMemoryThreshold_(spillMemoryThreshold),
       operatorCtx_(operatorCtx),
-      hybridSortEnabled_(hybridSortEnabled) {
+      hybridSortEnabled_(hybridSortEnabled),
+      scatteredMode_(hybridSortEnabled && scatteredModeEnabled) {
   BOLT_CHECK_GE(input_->size(), sortCompareFlags_.size());
   BOLT_CHECK_GT(sortCompareFlags_.size(), 0);
   BOLT_CHECK_EQ(sortColumnIndices.size(), sortCompareFlags_.size());
   BOLT_CHECK_NOT_NULL(nonReclaimableSection_);
 
   // Validate that hybrid sort is not used with row-based spilling
-  if (hybridSortEnabled_ && spillConfig_ != nullptr) {
-    BOLT_CHECK(
-        spillConfig_->rowBasedSpillMode == common::RowBasedSpillMode::DISABLE,
-        "Hybrid sort is not compatible with row-based spilling");
+  if (hybridSortEnabled_ && spillConfig_ != nullptr &&
+      spillConfig_->rowBasedSpillMode != common::RowBasedSpillMode::DISABLE) {
+    LOG(ERROR) << "Hybrid sort is not compatible with row-based spilling, "
+               << "disabling hybrid sort";
+    hybridSortEnabled_ = false;
   }
 
   std::vector<TypePtr> sortedColumnTypes;
@@ -113,22 +116,32 @@ SortBuffer::SortBuffer(
   hybridSortEnabled_ = hybridSortEnabled_ && !nonSortedColumnTypes.empty();
   if (hybridSortEnabled_) {
     std::vector<TypePtr> rowIdType = {BIGINT()};
-    data_ = std::make_unique<RowContainer>(sortedColumnTypes, rowIdType, pool_);
+    data_ = std::make_unique<RowContainer>(
+        sortedColumnTypes, rowIdType, true /*useListRowIndex*/, pool_);
     hybridData_ = std::make_unique<HybridContainer>(
         sortedColumnTypes, nonSortedColumnTypes, data_.get());
     // Set allContainer
     std::unordered_map<uint8_t, HybridContainer*> hybridDataChannel;
     hybridDataChannel[0] = hybridData_.get();
     hybridData_->setAllContainers(hybridDataChannel);
+    // Set scattered mode
+    hybridData_->setScatteredModeEnabled(scatteredMode_);
 
     payloadTypes_ =
         ROW(std::move(nonSortedColumnNames), std::move(nonSortedColumnTypes));
   } else {
     data_ = std::make_unique<RowContainer>(
-        sortedColumnTypes, nonSortedColumnTypes, pool_);
+        sortedColumnTypes,
+        nonSortedColumnTypes,
+        true /*useListRowIndex*/,
+        pool_);
   }
   spillerStoreType_ =
       ROW(std::move(sortedSpillColumnNames), std::move(sortedSpillColumnTypes));
+}
+
+SortBuffer::~SortBuffer() {
+  pool_->release();
 }
 
 void SortBuffer::addInput(const VectorPtr& input) {
@@ -143,14 +156,26 @@ void SortBuffer::addInput(const VectorPtr& input) {
   for (int row = 0; row < input->size(); ++row) {
     rows[row] = data_->newRow();
   }
-  
+  auto* inputRow = input->as<RowVector>();
+  MicrosecondTimer timer(&sortColToRowTimeUs_);
   if (hybridSortEnabled_) {
-    auto currentRows = hybridData_->getNumRows();
-    
+    // Get batch/row info before processing
+    auto batchId = hybridData_->getNumBatches(); // for scattered mode
+    auto baseRow = hybridData_->getNumRows(); // for coalesced mode
     for (int row = 0; row < input->size(); ++row) {
-      // Store RowId: driverId (8 bits) | globalRowId (56 bits)
-      uint64_t encodedId = (static_cast<uint64_t>(0) << 56) |
-          (static_cast<uint64_t>(row + currentRows) & ((1ULL << 56) - 1));
+      // Store RowId - encoding depends on mode
+      uint64_t encodedId;
+      if (scatteredMode_) {
+        // Scattered mode: rowId = (batchId << 32) | rowInBatch
+        // driverId stored in top 8 bits (always 0 for Sort)
+        BOLT_CHECK_LT(batchId, (1u << 24));
+        encodedId = (static_cast<uint64_t>(0) << 56) |
+            ((static_cast<uint64_t>(batchId) << 32) | row);
+      } else {
+        // Coalesced mode: rowId = global row index
+        encodedId = (static_cast<uint64_t>(0) << 56) |
+            (static_cast<uint64_t>(row + baseRow) & ((1ULL << 56) - 1));
+      }
       data_->storeSingleRowId(encodedId, rows[row]);
     }
     // Store key columns
@@ -187,6 +212,8 @@ void SortBuffer::addInput(const VectorPtr& input) {
 }
 
 void SortBuffer::noMoreInput() {
+  bolt::common::testutil::TestValue::adjust(
+      "bytedance::bolt::exec::SortBuffer::noMoreInput", this);
   BOLT_CHECK(!noMoreInput_);
   noMoreInput_ = true;
 
@@ -194,7 +221,7 @@ void SortBuffer::noMoreInput() {
   if (numInputRows_ == 0) {
     return;
   }
-  if (hybridData_) {
+  if (hybridSortEnabled_ && hybridData_ != nullptr && !scatteredMode_) {
     hybridData_->coalesceBatches();
   }
 
@@ -203,6 +230,7 @@ void SortBuffer::noMoreInput() {
     updateEstimatedOutputRowSize();
     // Sort the pointers to the rows in RowContainer (data_) instead of sorting
     // the rows.
+    // TODO: Reuse 'RowContainer::rowPointers_'.
     sortedRows_.resize(numInputRows_);
     RowContainerIterator iter;
     data_->listRows(&iter, numInputRows_, sortedRows_.data());
@@ -263,18 +291,23 @@ void SortBuffer::noMoreInput() {
     finishSpill();
   }
 
-  // Releases the unused memory reservation after procesing input.
+  // Releases the unused memory reservation after processing input.
   pool_->release();
 }
 
-RowVectorPtr SortBuffer::getOutput(uint32_t maxOutputRows) {
+RowVectorPtr SortBuffer::getOutput(vector_size_t maxOutputRows) {
   BOLT_CHECK(noMoreInput_);
 
   if (numOutputRows_ == numInputRows_) {
     return nullptr;
   }
 
-  prepareOutput(maxOutputRows);
+  BOLT_CHECK_GT(maxOutputRows, 0);
+  BOLT_CHECK_GT(numInputRows_, numOutputRows_);
+  const vector_size_t batchSize =
+      std::min<uint64_t>(numInputRows_ - numOutputRows_, maxOutputRows);
+  ensureOutputFits(batchSize);
+  prepareOutput(batchSize);
   // bool oldNonReclaimableSection = *nonReclaimableSection_;
   // auto guard = folly::makeGuard([this, oldNonReclaimableSection]() {
   // *nonReclaimableSection_ = oldNonReclaimableSection; });
@@ -338,7 +371,14 @@ void SortBuffer::ensureInputFits(const VectorPtr& input) {
   }
 
   // If current memory usage exceeds spilling threshold, trigger spilling.
-  const auto currentMemoryUsage = pool_->currentBytes();
+  // For hybrid sort in coalesced mode, include the payload memory that will be
+  // needed when coalescing batches. This ensures we trigger spill early enough
+  // to have headroom for the coalesce operation. Skip in scattered mode since
+  // we don't coalesce.
+  auto currentMemoryUsage = pool_->currentBytes();
+  if (hybridSortEnabled_ && hybridData_ != nullptr && !scatteredMode_) {
+    currentMemoryUsage += hybridData_->payloadMemoryBytes();
+  }
   if (spillMemoryThreshold_ != 0 &&
       currentMemoryUsage > spillMemoryThreshold_) {
     spill();
@@ -382,6 +422,36 @@ void SortBuffer::ensureInputFits(const VectorPtr& input) {
                << ", reservation: " << succinctBytes(pool()->reservedBytes());
 }
 
+void SortBuffer::ensureOutputFits(vector_size_t batchSize) {
+  BOLT_CHECK_GT(batchSize, 0);
+  // Check if spilling is enabled or not.
+  if (spillConfig_ == nullptr) {
+    return;
+  }
+
+  // Test-only spill path.
+  if (testingTriggerSpill()) {
+    spill();
+    return;
+  }
+
+  if (estimatedOutputRowSize_.has_value() || spiller_ != nullptr) {
+    const uint64_t outputBufferSizeToReserve =
+        estimatedOutputRowSize_.value() * batchSize * 1.2;
+    {
+      memory::ReclaimableSectionGuard guard(nonReclaimableSection_);
+      if (pool_->maybeReserve(outputBufferSizeToReserve)) {
+        return;
+      }
+    }
+    LOG(WARNING) << "Failed to reserve "
+                 << succinctBytes(outputBufferSizeToReserve)
+                 << " for memory pool " << pool_->name()
+                 << ", usage: " << succinctBytes(pool_->usedBytes())
+                 << ", reservation: " << succinctBytes(pool_->reservedBytes());
+  }
+}
+
 void SortBuffer::updateEstimatedOutputRowSize() {
   const auto optionalRowSize = hybridSortEnabled_
       ? hybridData_->estimateRowSize()
@@ -401,12 +471,12 @@ void SortBuffer::updateEstimatedOutputRowSize() {
 void SortBuffer::spillInput() {
   if (spiller_ == nullptr) {
     BOLT_CHECK(!noMoreInput_);
+    const auto sortingKeys = SpillState::makeSortingKeys(sortCompareFlags_);
     spiller_ = std::make_unique<Spiller>(
         Spiller::Type::kOrderByInput,
         data_.get(),
         spillerStoreType_,
-        data_->keyTypes().size(),
-        sortCompareFlags_,
+        sortingKeys,
         spillConfig_);
     spiller_->setSpillConfig(spillConfig_);
     if (hybridSortEnabled_ && hybridData_ != nullptr) {
@@ -420,8 +490,8 @@ void SortBuffer::spillInput() {
   // Coalesce batches BEFORE every spill, not just the first one.
   // After each spill, hybridData_->clear() is called which clears
   // owningInputs_. New data added via addInput() needs to be coalesced before
-  // the next spill.
-  if (hybridSortEnabled_ && hybridData_ != nullptr) {
+  // the next spill. Skip in scattered mode since we keep batches separate.
+  if (hybridSortEnabled_ && hybridData_ != nullptr && !scatteredMode_) {
     hybridData_->coalesceBatches();
   }
   spiller_->spill();
@@ -470,19 +540,13 @@ void SortBuffer::spillOutput() {
   } else {
     data_->clear();
   }
-  sortedRows_.clear();
+  std::vector<char*>{}.swap(sortedRows_);
   // Finish right after spilling as the output spiller only spills at most
   // once.
   finishSpill();
 }
 
-void SortBuffer::prepareOutput(uint32_t maxOutputRows) {
-  BOLT_CHECK_GT(maxOutputRows, 0);
-  BOLT_CHECK_GT(numInputRows_, numOutputRows_);
-
-  const size_t batchSize =
-      std::min<size_t>(numInputRows_ - numOutputRows_, maxOutputRows);
-
+void SortBuffer::prepareOutput(vector_size_t batchSize) {
   if (output_ != nullptr) {
     VectorPtr output = std::move(output_);
     BaseVector::prepareForReuse(output, batchSize);
@@ -497,12 +561,12 @@ void SortBuffer::prepareOutput(uint32_t maxOutputRows) {
   }
 
   if (spiller_ != nullptr) {
-    spillSources_.resize(maxOutputRows);
-    spillSourceRows_.resize(maxOutputRows);
+    prepareOutputWithSpill();
+    spillSources_.resize(batchSize);
+    spillSourceRows_.resize(batchSize);
   }
 
   BOLT_CHECK_GT(output_->size(), 0);
-  BOLT_DCHECK_LE(output_->size(), maxOutputRows);
   BOLT_CHECK_LE(output_->size() + numOutputRows_, numInputRows_);
 }
 
@@ -625,17 +689,29 @@ void SortBuffer::getOutputWithSpill() {
 
 void SortBuffer::finishSpill() {
   BOLT_CHECK_NULL(spillMerger_);
-  auto spillPartition = spiller_->finishSpill();
+  BOLT_CHECK_NULL(rowBasedSpillMerger_);
+  BOLT_CHECK_NULL(pendingSpillPartition_);
+  pendingSpillPartition_ =
+      std::make_unique<SpillPartition>(spiller_->finishSpill());
+}
+
+void SortBuffer::prepareOutputWithSpill() {
+  if (spillMerger_ != nullptr || rowBasedSpillMerger_ != nullptr) {
+    BOLT_CHECK_NULL(pendingSpillPartition_);
+    return;
+  }
+  BOLT_CHECK_NOT_NULL(pendingSpillPartition_);
   if (spillConfig_->rowBasedSpillMode == common::RowBasedSpillMode::DISABLE) {
-    spillMerger_ = spillPartition.createOrderedReader(
+    spillMerger_ = pendingSpillPartition_->createOrderedReader(
         pool(), spillConfig_->spillUringEnabled);
   } else {
-    rowBasedSpillMerger_ = spillPartition.createRowBasedOrderedReader(
+    rowBasedSpillMerger_ = pendingSpillPartition_->createRowBasedOrderedReader(
         pool(),
         data_.get(),
         spillConfig_->getJITenabledForSpill(),
         spillConfig_->spillUringEnabled);
   }
+  pendingSpillPartition_.reset();
 }
 
 std::vector<size_t> SortBuffer::getOriginalRowIndices() const {

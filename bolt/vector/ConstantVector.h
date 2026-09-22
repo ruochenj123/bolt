@@ -143,7 +143,11 @@ class ConstantVector final : public SimpleVector<T> {
     setInternalState();
   }
 
-  virtual ~ConstantVector() override = default;
+  virtual ~ConstantVector() override {
+    if (valueVector_) {
+      valueVector_->clearContainingLazyAndWrapped();
+    }
+  }
 
   bool isNullAt(vector_size_t /*idx*/) const override {
     BOLT_DCHECK(initialized_);
@@ -203,7 +207,7 @@ class ConstantVector final : public SimpleVector<T> {
    * Note this method is implemented on each vector type, but is intentionally
    * not virtual for performance reasons
    *
-   * @param byteOffset - the byte offset to laod from
+   * @param byteOffset - the byte offset to load from
    */
   xsimd::batch<T> loadSIMDValueBufferAt(size_t /* byteOffset */) const {
     BOLT_DCHECK(initialized_);

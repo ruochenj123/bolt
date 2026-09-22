@@ -1,0 +1,441 @@
+/*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * --------------------------------------------------------------------------
+ * Copyright (c) ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * This file has been modified by ByteDance Ltd. and/or its affiliates on
+ * 2025-11-11.
+ *
+ * Original file was released under the Apache License 2.0,
+ * with the full license text available at:
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * This modified file is released under the same license.
+ * --------------------------------------------------------------------------
+ */
+#include "bolt/connectors/hive/storage_adapters/gcs/GcsFileSystem.h"
+#include "bolt/common/base/Exceptions.h"
+#include "bolt/common/config/Config.h"
+#include "bolt/connectors/hive/HiveConfig.h"
+#include "bolt/connectors/hive/storage_adapters/gcs/GcsReadFile.h"
+#include "bolt/connectors/hive/storage_adapters/gcs/GcsUtil.h"
+#include "bolt/connectors/hive/storage_adapters/gcs/GcsWriteFile.h"
+#include "bolt/core/QueryConfig.h"
+
+#include <fmt/format.h>
+#include <glog/logging.h>
+#include <chrono>
+#include <filesystem>
+#include <memory>
+#include <stdexcept>
+
+#include <google/cloud/storage/client.h>
+
+namespace bytedance::bolt {
+namespace filesystems {
+using namespace connector::hive;
+namespace gcs = ::google::cloud::storage;
+namespace gc = ::google::cloud;
+
+namespace {
+
+auto constexpr kGcsInvalidPath = "File {} is not a valid gcs file";
+
+folly::Synchronized<
+    std::unordered_map<std::string, GcsOAuthCredentialsProviderFactory>>&
+credentialsProviderFactories() {
+  static folly::Synchronized<
+      std::unordered_map<std::string, GcsOAuthCredentialsProviderFactory>>
+      factories;
+  return factories;
+}
+
+std::shared_ptr<GcsOAuthCredentialsProvider> getCredentialsProviderByName(
+    const std::string& providerName,
+    const std::shared_ptr<connector::hive::HiveConfig>& hiveConfig) {
+  BOLT_USER_CHECK(
+      !providerName.empty(),
+      "GcsOAuthCredentialsProviderFactory name cannot be empty");
+  return credentialsProviderFactories().withRLock([&](const auto& factories) {
+    const auto it = factories.find(providerName);
+    BOLT_USER_CHECK(
+        it != factories.end(),
+        "GcsOAuthCredentialsProviderFactory for '{}' not registered",
+        providerName);
+    const auto& factory = it->second;
+    return factory(hiveConfig);
+  });
+}
+
+} // namespace
+
+class GcsFileSystem::Impl {
+ public:
+  Impl(const std::string& bucket, const config::ConfigBase* config)
+      : bucket_(bucket),
+        hiveConfig_(std::make_shared<HiveConfig>(
+            std::make_shared<config::ConfigBase>(config->rawConfigsCopy()))) {}
+
+  ~Impl() = default;
+
+  // Use the input Config parameters and initialize the GcsClient.
+  void initializeClient() {
+    constexpr std::string_view kHttpsScheme{"https://"};
+    auto options = gc::Options{};
+    if (auto tokenProvider = hiveConfig_->gcsAuthAccessTokenProvider()) {
+      auto credentialsProvider =
+          getCredentialsProviderByName(tokenProvider.value(), hiveConfig_);
+      auto credentials = credentialsProvider->getCredentials(bucket_);
+      options.set<gcs::Oauth2CredentialsOption>(credentials);
+    } else {
+      auto endpointOverride = hiveConfig_->gcsEndpoint();
+      // Use secure credentials by default.
+      if (!endpointOverride.empty()) {
+        options.set<gcs::RestEndpointOption>(endpointOverride);
+        // Use Google default credentials if endpoint has https scheme.
+        if (endpointOverride.find(kHttpsScheme) == 0) {
+          options.set<gc::UnifiedCredentialsOption>(
+              gc::MakeGoogleDefaultCredentials());
+        } else {
+          options.set<gc::UnifiedCredentialsOption>(
+              gc::MakeInsecureCredentials());
+        }
+      } else {
+        options.set<gc::UnifiedCredentialsOption>(
+            gc::MakeGoogleDefaultCredentials());
+      }
+    }
+    options.set<gcs::UploadBufferSizeOption>(kUploadBufferSize);
+
+    auto max_retry_count = hiveConfig_->gcsMaxRetryCount();
+    if (max_retry_count) {
+      options.set<gcs::RetryPolicyOption>(
+          gcs::LimitedErrorCountRetryPolicy(max_retry_count.value()).clone());
+    }
+
+    auto max_retry_time = hiveConfig_->gcsMaxRetryTime();
+    if (max_retry_time) {
+      auto retry_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+          bytedance::bolt::config::toDuration(max_retry_time.value()));
+      options.set<gcs::RetryPolicyOption>(
+          gcs::LimitedTimeRetryPolicy(retry_time).clone());
+    }
+
+    auto credFile = hiveConfig_->gcsCredentialsPath();
+    if (!credFile.empty() && std::filesystem::exists(credFile)) {
+      std::ifstream jsonFile(credFile, std::ios::in);
+      if (!jsonFile.is_open()) {
+        LOG(WARNING) << "Error opening file " << credFile;
+      } else {
+        std::stringstream credsBuffer;
+        credsBuffer << jsonFile.rdbuf();
+        auto creds = credsBuffer.str();
+        auto credentials = gc::MakeServiceAccountCredentials(std::move(creds));
+        options.set<gc::UnifiedCredentialsOption>(credentials);
+      }
+    } else {
+      LOG(WARNING)
+          << "Config hive.gcs.json-key-file-path is empty or key file path not found";
+    }
+
+    client_ = std::make_shared<gcs::Client>(options);
+  }
+
+  std::shared_ptr<gcs::Client> getClient() const {
+    return client_;
+  }
+
+ private:
+  const std::string bucket_;
+  const std::shared_ptr<HiveConfig> hiveConfig_;
+  std::shared_ptr<gcs::Client> client_;
+};
+
+GcsFileSystem::GcsFileSystem(
+    const std::string& bucket,
+    std::shared_ptr<const config::ConfigBase> config)
+    : FileSystem(config) {
+  impl_ = std::make_shared<Impl>(bucket, config.get());
+}
+
+void GcsFileSystem::initializeClient() {
+  impl_->initializeClient();
+}
+
+std::unique_ptr<ReadFile> GcsFileSystem::openFileForRead(
+    std::string_view path,
+    const FileOptions& /*unused*/) {
+  const auto gcspath = gcsPath(path);
+  auto gcsfile = std::make_unique<GcsReadFile>(gcspath, impl_->getClient());
+  gcsfile->initialize();
+  return gcsfile;
+}
+
+std::unique_ptr<WriteFile> GcsFileSystem::openFileForWrite(
+    std::string_view path,
+    const FileOptions& /*unused*/) {
+  const auto gcspath = gcsPath(path);
+  auto gcsfile = std::make_unique<GcsWriteFile>(gcspath, impl_->getClient());
+  gcsfile->initialize();
+  return gcsfile;
+}
+
+void GcsFileSystem::remove(std::string_view path) {
+  if (!isGcsFile(path)) {
+    BOLT_FAIL(kGcsInvalidPath, path);
+  }
+
+  // We assume 'path' is well-formed here.
+  std::string bucket;
+  std::string object;
+  const auto file = gcsPath(path);
+  setBucketAndKeyFromGcsPath(file, bucket, object);
+
+  if (!object.empty()) {
+    auto stat = impl_->getClient()->GetObjectMetadata(bucket, object);
+    if (!stat.ok()) {
+      checkGcsStatus(
+          stat.status(),
+          "Failed to get metadata for GCS object",
+          bucket,
+          object);
+    }
+  }
+  auto ret = impl_->getClient()->DeleteObject(bucket, object);
+  if (!ret.ok()) {
+    checkGcsStatus(
+        ret, "Failed to get metadata for GCS object", bucket, object);
+  }
+}
+
+bool GcsFileSystem::exists(std::string_view path) {
+  BOLT_CHECK(isGcsFile(path), kGcsInvalidPath, path);
+  const auto file = gcsPath(path);
+  const auto separator = file.find('/');
+  const auto bucket = file.substr(0, separator);
+  const auto object =
+      separator == std::string::npos ? "" : file.substr(separator + 1);
+  return object.empty()
+      ? impl_->getClient()->GetBucketMetadata(bucket).ok()
+      : impl_->getClient()->GetObjectMetadata(bucket, object).ok();
+}
+
+FileInfo GcsFileSystem::fileInfo(std::string_view path) {
+  BOLT_CHECK(isGcsFile(path), kGcsInvalidPath, path);
+  const auto objectPath = gcsPath(path);
+  const auto separator = objectPath.find('/');
+  const std::string bucket = objectPath.substr(0, separator);
+  std::string key =
+      separator == std::string::npos ? "" : objectPath.substr(separator + 1);
+  const auto toMillis = [](auto time) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               time.time_since_epoch())
+        .count();
+  };
+
+  if (key.empty()) {
+    const auto metadata = impl_->getClient()->GetBucketMetadata(bucket);
+    checkGcsStatus(
+        metadata.status(), "Failed to get GCS bucket metadata", bucket, key);
+    return {
+        .isDirectory = true,
+        .size = 0,
+        .modificationTimeMs = toMillis(metadata->updated())};
+  }
+
+  const auto metadata = impl_->getClient()->GetObjectMetadata(bucket, key);
+  if (metadata.ok()) {
+    const bool isDirectory = key.back() == '/';
+    return {
+        .isDirectory = isDirectory,
+        .size = isDirectory ? 0 : metadata->size(),
+        .modificationTimeMs = toMillis(metadata->updated())};
+  }
+  if (metadata.status().code() != gc::StatusCode::kNotFound) {
+    checkGcsStatus(
+        metadata.status(), "Failed to get GCS file metadata", bucket, key);
+  }
+
+  if (key.back() != '/') {
+    key += '/';
+  }
+  for (auto&& entry : impl_->getClient()->ListObjects(
+           bucket, gcs::Prefix(key), gcs::MaxResults(1))) {
+    checkGcsStatus(
+        entry.status(), "Failed to get GCS directory metadata", bucket, key);
+    return {.isDirectory = true};
+  }
+  BOLT_FILE_NOT_FOUND_ERROR("GCS path not found: {}", path);
+}
+
+std::vector<std::string> GcsFileSystem::list(std::string_view path) {
+  std::vector<std::string> result;
+  if (!isGcsFile(path))
+    BOLT_FAIL(kGcsInvalidPath, path);
+
+  // We assume 'path' is well-formed here.
+  const auto file = gcsPath(path);
+  std::string bucket;
+  std::string object;
+  setBucketAndKeyFromGcsPath(file, bucket, object);
+  for (auto&& metadata : impl_->getClient()->ListObjects(bucket)) {
+    if (!metadata.ok()) {
+      checkGcsStatus(
+          metadata.status(),
+          "Failed to get metadata for GCS object",
+          bucket,
+          object);
+    }
+    result.push_back(metadata->name());
+  }
+
+  return result;
+}
+
+std::string GcsFileSystem::name() const {
+  return "GCS";
+}
+
+void GcsFileSystem::rename(
+    std::string_view originPath,
+    std::string_view newPath,
+    bool overwrite) {
+  if (!isGcsFile(originPath)) {
+    BOLT_FAIL(kGcsInvalidPath, originPath);
+  }
+
+  if (!isGcsFile(newPath)) {
+    BOLT_FAIL(kGcsInvalidPath, newPath);
+  }
+
+  std::string originBucket;
+  std::string originObject;
+  const auto originFile = gcsPath(originPath);
+  setBucketAndKeyFromGcsPath(originFile, originBucket, originObject);
+
+  std::string newBucket;
+  std::string newObject;
+  const auto newFile = gcsPath(newPath);
+  setBucketAndKeyFromGcsPath(newFile, newBucket, newObject);
+
+  if (!overwrite) {
+    auto objects = list(newPath);
+    if (std::find(objects.begin(), objects.end(), newObject) != objects.end()) {
+      BOLT_USER_FAIL(
+          "Failed to rename object {} to {} with as {} exists.",
+          originObject,
+          newObject,
+          newObject);
+      return;
+    }
+  }
+
+  // Copy the object to the new name.
+  auto copyStats = impl_->getClient()->CopyObject(
+      originBucket, originObject, newBucket, newObject);
+  if (!copyStats.ok()) {
+    checkGcsStatus(
+        copyStats.status(),
+        fmt::format(
+            "Failed to rename for GCS object {}/{}",
+            originBucket,
+            originObject),
+        originBucket,
+        originObject);
+  }
+
+  // Delete the original object.
+  auto delStatus = impl_->getClient()->DeleteObject(originBucket, originObject);
+  if (!delStatus.ok()) {
+    checkGcsStatus(
+        delStatus,
+        fmt::format(
+            "Failed to delete for GCS object {}/{} after copy when renaming. And the copied object is at {}/{}",
+            originBucket,
+            originObject,
+            newBucket,
+            newObject),
+        originBucket,
+        originObject);
+  }
+}
+
+void GcsFileSystem::mkdir(std::string_view path) {
+  if (!isGcsFile(path)) {
+    BOLT_FAIL(kGcsInvalidPath, path);
+  }
+
+  std::string bucket;
+  std::string object;
+  const auto file = gcsPath(path);
+  setBucketAndKeyFromGcsPath(file, bucket, object);
+
+  // Create an empty object to represent the directory.
+  auto status = impl_->getClient()->InsertObject(bucket, object, "");
+
+  checkGcsStatus(
+      status.status(),
+      fmt::format("Failed to mkdir for GCS object {}/{}", bucket, object),
+      bucket,
+      object);
+}
+
+void GcsFileSystem::rmdir(std::string_view path) {
+  if (!isGcsFile(path)) {
+    BOLT_FAIL(kGcsInvalidPath, path);
+  }
+
+  const auto file = gcsPath(path);
+  std::string bucket;
+  std::string object;
+  setBucketAndKeyFromGcsPath(file, bucket, object);
+  for (auto&& metadata : impl_->getClient()->ListObjects(bucket)) {
+    checkGcsStatus(
+        metadata.status(),
+        fmt::format("Failed to rmdir for GCS object {}/{}", bucket, object),
+        bucket,
+        object);
+
+    auto status = impl_->getClient()->DeleteObject(bucket, metadata->name());
+    checkGcsStatus(
+        metadata.status(),
+        fmt::format(
+            "Failed to delete for GCS object {}/{} when rmdir.",
+            bucket,
+            metadata->name()),
+        bucket,
+        metadata->name());
+  }
+}
+
+void registerOAuthCredentialsProvider(
+    const std::string& providerName,
+    const GcsOAuthCredentialsProviderFactory& factory) {
+  BOLT_CHECK(
+      !providerName.empty(),
+      "GcsOAuthCredentialsProviderFactory name cannot be empty");
+  credentialsProviderFactories().withWLock([&](auto& factories) {
+    BOLT_CHECK(
+        factories.find(providerName) == factories.end(),
+        "GcsOAuthCredentialsProviderFactory '{}' already registered",
+        providerName);
+    factories.insert({providerName, factory});
+  });
+}
+
+} // namespace filesystems
+} // namespace bytedance::bolt

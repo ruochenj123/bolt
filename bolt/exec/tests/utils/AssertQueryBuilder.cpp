@@ -87,6 +87,11 @@ AssertQueryBuilder& AssertQueryBuilder::serialExecution(bool serial) {
   return *this;
 }
 
+AssertQueryBuilder& AssertQueryBuilder::taskId(const std::string& taskId) {
+  params_.taskId = taskId;
+  return *this;
+}
+
 AssertQueryBuilder& AssertQueryBuilder::config(
     const std::string& key,
     const std::string& value) {

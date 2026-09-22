@@ -215,9 +215,9 @@ struct KllSketch {
   std::independent_bits_engine<std::default_random_engine, 1, uint32_t>
       randomBit_;
 
-  size_t n_;
-  T minValue_;
-  T maxValue_;
+  size_t n_{0};
+  T minValue_{};
+  T maxValue_{};
   std::vector<T, Allocator> items_;
   std::vector<uint32_t, AllocU32> levels_;
   bool isLevelZeroSorted_;

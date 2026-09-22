@@ -47,7 +47,15 @@ class FloatingPointColumnReader
       const TypePtr& requestedType,
       std::shared_ptr<const dwio::common::TypeWithId> fileType,
       ParquetParams& params,
-      common::ScanSpec& scanSpec);
+      common::ScanSpec& scanSpec,
+      TypePtr castSourceType = nullptr);
+
+  // Parquet floating point reader always supports a bulk path
+  static constexpr bool kHasBulkPath = true;
+
+  bool hasBulkPath() const override {
+    return kHasBulkPath;
+  }
 
   void seekToRowGroup(int64_t index) override {
     base::seekToRowGroup(index);
@@ -67,6 +75,18 @@ class FloatingPointColumnReader
 
   template <typename TVisitor>
   void readWithVisitor(const RowSet& rows, TVisitor visitor);
+
+  void getValues(const RowSet& rows, VectorPtr* result) override {
+    const bool needConversion =
+        this->castExprSet_ && this->castExprSet_->size() != 0;
+    auto& requestedType =
+        needConversion ? this->castSourceType_ : this->requestedType_;
+    this->template getFlatValues<TData, TRequested>(
+        rows, result, requestedType);
+    if (needConversion) {
+      this->doCastEvaluate(result);
+    }
+  }
 };
 
 template <typename TData, typename TRequested>
@@ -74,12 +94,30 @@ FloatingPointColumnReader<TData, TRequested>::FloatingPointColumnReader(
     const TypePtr& requestedType,
     std::shared_ptr<const dwio::common::TypeWithId> fileType,
     ParquetParams& params,
-    common::ScanSpec& scanSpec)
+    common::ScanSpec& scanSpec,
+    TypePtr castSourceType)
     : dwio::common::SelectiveFloatingPointColumnReader<TData, TRequested>(
           requestedType,
           std::move(fileType),
           params,
-          scanSpec) {}
+          scanSpec) {
+  const auto& decodedType = castSourceType ? castSourceType : requestedType;
+  BOLT_DCHECK(
+      (decodedType->kind() == TypeKind::REAL &&
+       std::is_same_v<TRequested, float>) ||
+          (decodedType->kind() == TypeKind::DOUBLE &&
+           std::is_same_v<TRequested, double>),
+      "TRequested type mismatch: template parameter is {}, but requestedType is {}",
+      folly::demangle(typeid(TRequested)),
+      this->requestedType_->toString());
+  if (castSourceType) {
+    this->makeCastExpr(castSourceType);
+    if (params.disableFloatingPointToVarcharMetadataFilter()) {
+      this->formatData_->template as<ParquetData>()
+          .disableTypeDependentMetadataFilters();
+    }
+  }
+}
 
 template <typename TData, typename TRequested>
 uint64_t FloatingPointColumnReader<TData, TRequested>::skip(

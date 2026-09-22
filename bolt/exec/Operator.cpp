@@ -75,13 +75,13 @@ OperatorCtx::createConnectorQueryCtx(
     const std::string& planNodeId,
     memory::MemoryPool* connectorPool,
     const common::SpillConfig* spillConfig,
-    connector::AsyncThreadCtx* const asyncThreadCtx) const {
+    std::shared_ptr<connector::AsyncThreadCtx> asyncThreadCtx) const {
   return std::make_shared<connector::ConnectorQueryCtx>(
       pool_,
       connectorPool,
       driverCtx_->task->queryCtx()->connectorSessionProperties(connectorId),
       spillConfig,
-      asyncThreadCtx,
+      std::move(asyncThreadCtx),
       std::make_unique<SimpleExpressionEvaluator>(
           execCtx()->queryCtx(), execCtx()->pool()),
       driverCtx_->task->queryCtx()->cache(),
@@ -292,12 +292,13 @@ int32_t OperatorCtx::getConcurrency() const {
 
 std::string OperatorCtx::toString() const {
   return fmt::format(
-      "{}#{}[taskId={}, pipelineId={}, driverId={}]",
+      "{}#{}[task={}, pipe={}, driver={}, op={}]",
       operatorType(),
-      operatorId(),
+      planNodeId(),
       taskId(),
       driverCtx_->pipelineId,
-      driverCtx_->driverId);
+      driverCtx_->driverId,
+      operatorId());
 }
 
 void OperatorCtx::traverseOpToGetRowCount(
@@ -331,7 +332,8 @@ void OperatorCtx::traverseOpToGetRowCount(
         BOLT_CHECK_NE(
             hasBeenProcessedRowCountStr,
             "",
-            "hasBeenProcessedRowCountStr can't be empty");
+            "hasBeenProcessedRowCountStr can't be empty, operator {}",
+            operators[i]->toString());
 
         totalRowCount = folly::to<uint64_t>(totalRowCountStr);
         processedRowCount = folly::to<uint64_t>(hasBeenProcessedRowCountStr);
@@ -467,7 +469,7 @@ OperatorStats Operator::stats(bool clear) {
   return stats;
 }
 
-uint32_t Operator::outputBatchRows(
+vector_size_t Operator::outputBatchRows(
     std::optional<uint64_t> averageRowSize) const {
   const auto& queryConfig = operatorCtx_->task()->queryCtx()->queryConfig();
 
@@ -483,12 +485,16 @@ uint32_t Operator::outputBatchRows(
       operatorType(),
       operatorId());
 
-  if (rowSize * queryConfig.maxOutputBatchRows() <
-      queryConfig.preferredOutputBatchBytes()) {
+  if (rowSize == 0) {
     return queryConfig.maxOutputBatchRows();
   }
-  return std::max<uint32_t>(
-      queryConfig.preferredOutputBatchBytes() / rowSize, 1);
+  const uint64_t batchSize =
+
+      queryConfig.preferredOutputBatchBytes() / rowSize;
+  if (batchSize > queryConfig.maxOutputBatchRows()) {
+    return queryConfig.maxOutputBatchRows();
+  }
+  return std::max<vector_size_t>(batchSize, 1);
 }
 
 int32_t Operator::getMaxReadBatchSize(
@@ -1121,15 +1127,18 @@ void Operator::MemoryReclaimer::enterArbitration() {
   }
 
   Driver* const runningDriver = driverThreadCtx->driverCtx()->driver;
-  if (auto opDriver = ensureDriver()) {
-    // NOTE: the current running driver might not be the driver of the operator
-    // that requests memory arbitration. The reason is that an operator might
-    // extend the buffer allocated from the other operator either from the same
-    // or different drivers. But they must be from the same task.
-    BOLT_CHECK_EQ(
-        runningDriver->task()->taskId(),
-        opDriver->task()->taskId(),
-        "The current running driver and the request driver must be from the same task");
+  if (!FLAGS_bolt_memory_pool_capacity_transfer_across_tasks) {
+    if (auto opDriver = ensureDriver()) {
+      // NOTE: the current running driver might not be the driver of the
+      // operator that requests memory arbitration. The reason is that an
+      // operator might extend the buffer allocated from the other operator
+      // either from the same or different drivers. But they must be from the
+      // same task.
+      BOLT_CHECK_EQ(
+          runningDriver->task()->taskId(),
+          opDriver->task()->taskId(),
+          "The current running driver and the request driver must be from the same task");
+    }
   }
   if (runningDriver->task()->enterSuspended(runningDriver->state()) !=
       StopReason::kNone) {
@@ -1147,11 +1156,13 @@ void Operator::MemoryReclaimer::leaveArbitration() noexcept {
     return;
   }
   Driver* const runningDriver = driverThreadCtx->driverCtx()->driver;
-  if (auto opDriver = ensureDriver()) {
-    BOLT_CHECK_EQ(
-        runningDriver->task()->taskId(),
-        opDriver->task()->taskId(),
-        "The current running driver and the request driver must be from the same task");
+  if (!FLAGS_bolt_memory_pool_capacity_transfer_across_tasks) {
+    if (auto opDriver = ensureDriver()) {
+      BOLT_CHECK_EQ(
+          runningDriver->task()->taskId(),
+          opDriver->task()->taskId(),
+          "The current running driver and the request driver must be from the same task");
+    }
   }
   runningDriver->task()->leaveSuspended(runningDriver->state());
 }
@@ -1191,7 +1202,7 @@ uint64_t Operator::MemoryReclaimer::reclaim(
       pool->name());
   BOLT_CHECK(driver->task()->pauseRequested());
 
-  TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::exec::Operator::MemoryReclaimer::reclaim", pool);
 
   // NOTE: we can't reclaim memory from an operator which is under

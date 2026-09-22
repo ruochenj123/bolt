@@ -28,8 +28,11 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include <gtest/gtest.h>
 
+#include "bolt/common/base/Doubles.h"
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/type/DecimalUtil.h"
 namespace bytedance::bolt {
@@ -85,6 +88,10 @@ void testToByteArray(int128_t value, int8_t* expected, int32_t size) {
   EXPECT_EQ(std::memcmp(expected, out.data(), length), 0);
 }
 
+std::string zeros(uint32_t numZeros) {
+  return std::string(numZeros, '0');
+}
+
 TEST(DecimalTest, toString) {
   EXPECT_EQ(std::to_string(HugeInt::build(0, 0)), "0");
   EXPECT_EQ(std::to_string(HugeInt::build(0, 1)), "1");
@@ -112,15 +119,13 @@ TEST(DecimalTest, decimalToString) {
 
   ASSERT_EQ("1000", DecimalUtil::toString(1000, DECIMAL(20, 0)));
   ASSERT_EQ("1.000", DecimalUtil::toString(1000, DECIMAL(20, 3)));
-#ifdef SPARK_COMPATIBLE
-  ASSERT_EQ("1.000E-7", DecimalUtil::toString(1000, DECIMAL(20, 10)));
+  ASSERT_EQ(
+      ::bytedance::bolt::kSparkCompatible ? "1.000E-7" : "0.0000001000",
+      DecimalUtil::toString(1000, DECIMAL(20, 10)));
   ASSERT_EQ("0.0000010000", DecimalUtil::toString(10000, DECIMAL(20, 10)));
-  ASSERT_EQ("0E-9", DecimalUtil::toString(0, DECIMAL(20, 9)));
-#else
-  ASSERT_EQ("0.0000001000", DecimalUtil::toString(1000, DECIMAL(20, 10)));
-  ASSERT_EQ("0.0000010000", DecimalUtil::toString(10000, DECIMAL(20, 10)));
-  ASSERT_EQ("0.000000000", DecimalUtil::toString(0, DECIMAL(20, 9)));
-#endif
+  ASSERT_EQ(
+      ::bytedance::bolt::kSparkCompatible ? "0E-9" : "0.000000000",
+      DecimalUtil::toString(0, DECIMAL(20, 9)));
   ASSERT_EQ("-0.001000", DecimalUtil::toString(-1000, DECIMAL(20, 6)));
 
   const auto minShortDecimal =
@@ -144,6 +149,36 @@ TEST(DecimalTest, decimalToString) {
       DecimalUtil::toString(DecimalUtil::kLongDecimalMax, DECIMAL(38, 0));
   ASSERT_EQ("99999999999999999999999999999999999999", maxLongDecimal);
   ASSERT_EQ(maxLongDecimal.length(), 38);
+}
+
+TEST(DecimalTest, toDecimalValueErrorMessage) {
+  const std::vector<std::pair<std::string, std::string>> testCases = {
+      {"1{", "Value is not a number. Chars '{' are invalid."},
+      {"1{}", "Value is not a number. Chars '{}' are invalid."},
+      {"1{0x}", "Value is not a number. Chars '{0x}' are invalid."},
+      {"1{{", "Value is not a number. Chars '{{' are invalid."},
+  };
+
+  for (const auto& [input, expectedMessage] : testCases) {
+    SCOPED_TRACE(input);
+    int64_t decimalValue{0};
+    const auto status = DecimalUtil::toDecimalValue<int64_t>(
+        StringView(input), 18, 2, decimalValue);
+    EXPECT_EQ(status.code(), StatusCode::kUserError);
+    EXPECT_EQ(status.message(), expectedMessage);
+  }
+}
+
+TEST(DecimalTest, unsignedDecimalToString) {
+  std::string result(32, '\0');
+  const auto size =
+      DecimalUtil::convertToString<DecimalUtil::DecimalStringFormat::kPlain>(
+          std::numeric_limits<uint64_t>::max(),
+          0,
+          result.size(),
+          result.data());
+  result.resize(size);
+  EXPECT_EQ("18446744073709551615", result);
 }
 
 TEST(DecimalTest, limits) {
@@ -370,6 +405,8 @@ TEST(DecimalTest, rescaleDouble) {
   assertRescaleFloatingPoint<double, int128_t>(
       0.034567890, DECIMAL(38, 18), 34'567'890'000'000'000);
   assertRescaleFloatingPoint<double, int128_t>(
+      0.03456789, DECIMAL(38, 33), HugeInt::parse("3456789" + zeros(25)));
+  assertRescaleFloatingPoint<double, int128_t>(
       0.999999999999999, DECIMAL(38, 18), 999'999'999'999'999'000);
   assertRescaleFloatingPoint<double, int128_t>(
       0.123456789123123, DECIMAL(38, 18), 123'456'789'123'123'000);
@@ -379,6 +416,16 @@ TEST(DecimalTest, rescaleDouble) {
       std::numeric_limits<double>::max(), DECIMAL(38, 38), "Result overflows.");
   assertRescaleFloatingPoint<double, int128_t>(
       std::numeric_limits<double>::min(), DECIMAL(38, 2), 0);
+
+  assertRescaleFloatingPoint<double, int128_t>(
+      0.9999999999999999, DECIMAL(17, 2), 100);
+
+  assertRescaleFloatingPoint<double, int128_t>(
+      -0.9999999999999999, DECIMAL(17, 2), -100);
+
+  assertRescaleFloatingPoint<double, int128_t>(
+      kMaxDoubleBelowInt64Max, DECIMAL(19, 0), 9'223'372'036'854'774'784);
+
   assertRescaleFloatingPointFail<double, int128_t>(
       std::numeric_limits<double>::lowest(),
       DECIMAL(38, 2),

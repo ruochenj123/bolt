@@ -23,17 +23,17 @@
 #include "bolt/dwio/paimon/deletionvectors/DeletionFileReader.h"
 #include "bolt/dwio/parquet/tests/ParquetTestBase.h"
 #include "bolt/vector/BaseVector.h"
+
 namespace bytedance::bolt::paimon {
 class DeleteionFileReaderTest : public parquet::ParquetTestBase {
  protected:
   static void SetUpTestCase() {
     memory::MemoryManager::testingSetInstance({});
-    common::testutil::TestValue::enable();
+    BOLT_TEST_VALUE_ENABLE();
     bytedance::bolt::connector::hive::CheckHiveConnectorFactoryInit<
         bytedance::bolt::connector::hive::HiveConnectorFactory>();
     auto hiveConnector =
-        connector::getConnectorFactory(
-            connector::hive::HiveConnectorFactory::kHiveConnectorName)
+        connector::getConnectorFactory(connector::kHiveConnectorName)
             ->newConnector(
                 kHiveConnectorId,
                 std::make_shared<config::ConfigBase>(
@@ -78,6 +78,7 @@ class DeleteionFileReaderTest : public parquet::ParquetTestBase {
     while (true) {
       auto part = rowReader->next(1024, output);
       if (part > 0) {
+        output->loadedVector();
         data.emplace_back(output);
       } else {
         break;
@@ -121,6 +122,7 @@ class DeleteionFileReaderTest : public parquet::ParquetTestBase {
       mutation.deletedRows = deletionVector->as<uint64_t>();
       auto part = reader->next(batchSize, result, &mutation);
       if (part > 0) {
+        result->loadedVector();
         assertEqualVectorPart(expected, result, total);
         total += result->size();
       } else {

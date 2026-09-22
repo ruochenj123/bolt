@@ -33,6 +33,7 @@
 #include <folly/Executor.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
+#include <initializer_list>
 #include "bolt/vector/FlatVector.h"
 #include "bolt/vector/tests/utils/VectorMaker.h"
 
@@ -216,6 +217,13 @@ class VectorTestBase {
   template <typename T>
   FlatVectorPtr<EvalType<T>> makeFlatVector(
       const std::vector<T>& data,
+      const TypePtr& type = CppToType<T>::create()) {
+    return vectorMaker_.flatVector<T>(data, type);
+  }
+
+  template <typename T>
+  FlatVectorPtr<EvalType<T>> makeFlatVector(
+      std::initializer_list<T> data,
       const TypePtr& type = CppToType<T>::create()) {
     return vectorMaker_.flatVector<T>(data, type);
   }
@@ -486,7 +494,7 @@ class VectorTestBase {
   //  Example:
   //   auto arrayVector = makeNullableArrayVector<int64_t>({
   //       {{1, 2, std::nullopt, 4}},
-  //       {{}},
+  //       emptyArray,Array,
   //       std::nullopt,
   //   });
   template <typename T>
@@ -1055,6 +1063,18 @@ class VectorTestBase {
   std::shared_ptr<folly::Executor> executor_{
       std::make_shared<folly::CPUThreadPoolExecutor>(
           std::thread::hardware_concurrency())};
+  std::shared_ptr<folly::Executor> spillExecutor_{
+      std::make_shared<folly::CPUThreadPoolExecutor>(
+          std::thread::hardware_concurrency())};
 };
+
+struct EmptyArray {
+  template <typename T>
+  operator std::optional<std::vector<T>>() const {
+    return std::make_optional<std::vector<T>>({});
+  }
+};
+
+inline constexpr EmptyArray emptyArray;
 
 } // namespace bytedance::bolt::test

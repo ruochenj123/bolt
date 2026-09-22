@@ -122,7 +122,7 @@ class HashProbe : public Operator {
       const RowTypePtr& probeType,
       const RowTypePtr& tableType);
 
-  // Check if output_ can be re-used and if not make a new one.
+  // Check if output_ can be reused and if not make a new one.
   void prepareOutput(vector_size_t size);
 
   /// Fusion v2: non-final hop output — probe columns wrapped as usual, deferred
@@ -178,13 +178,14 @@ class HashProbe : public Operator {
   }
 
   // Populate filter input columns.
-  void fillFilterInput(vector_size_t size);
+  RowVectorPtr fillFilterInput(vector_size_t size);
 
   // Prepare filter row selectivity for null-aware join. 'numRows'
   // specifies the number of rows in 'filterInputRows_' to process. If
   // 'filterPropagateNulls' is true, the probe input row which has null in any
   // probe filter column can't pass the filter.
   void prepareFilterRowsForNullAwareJoin(
+      const RowVector* filterInput,
       vector_size_t numRows,
       bool filterPropagateNulls);
 
@@ -296,7 +297,7 @@ class HashProbe : public Operator {
 
   void resetHashTable();
   // TODO: Define batch size as bytes based on RowContainer row sizes.
-  const uint32_t outputBatchSize_;
+  const vector_size_t outputBatchSize_;
 
   const std::shared_ptr<const core::HashJoinNode> joinNode_;
 
@@ -407,7 +408,7 @@ class HashProbe : public Operator {
   // side. Used by right semi project join.
   bool probeSideHasNullKeys_{false};
 
-  // Rows in 'filterInput_' to apply 'filter_' to.
+  // Rows in the temporary filter input to apply 'filter_' to.
   SelectivityVector filterInputRows_;
 
   // Join filter.
@@ -427,11 +428,6 @@ class HashProbe : public Operator {
 
   // Maps from column index in hash table to channel in 'filterInputType_'.
   std::vector<IdentityProjection> filterTableProjections_;
-
-  // Temporary projection from probe and build for evaluating
-  // 'filter_'. This can always be reused since this does not escape
-  // this operator.
-  RowVectorPtr filterInput_;
 
   // The following six fields are used in null-aware anti join filter
   // processing.

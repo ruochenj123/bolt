@@ -50,7 +50,7 @@ MergeJoin::MergeJoin(
           operatorId,
           joinNode->id(),
           "MergeJoin"),
-      outputBatchSize_{static_cast<vector_size_t>(outputBatchRows())},
+      outputBatchSize_{outputBatchRows()},
       joinType_{joinNode->joinType()},
       numKeys_{joinNode->leftKeys().size()},
       joinNode_(joinNode) {
@@ -241,7 +241,7 @@ int32_t MergeJoin::compare(
         otherIndex,
         compareFlags);
 
-    // Comparing null with null will return std::nullopt, otherwise determinated
+    // Comparing null with null will return std::nullopt, otherwise determined
     // by nullfirst.
     if (!compare.has_value()) {
       // The SQL semantics of Presto and Spark will always return false if
@@ -303,6 +303,27 @@ void copyRow(
     const auto& sourceChild = source->childAt(projection.inputChannel);
     const auto& targetChild = target->childAt(projection.outputChannel);
     targetChild->copy(sourceChild.get(), targetIndex, sourceIndex, 1);
+  }
+}
+
+// MergeJoin fills 'indices' incrementally as output rows are appended.
+// Therefore we must keep a dictionary directly over the input child and must
+// not use wrapIndirectChildren(), which may eagerly combine existing
+// dictionary layers by reading the current contents of 'indices'. That would
+// be incorrect for already dictionary-encoded projections because the mapping
+// is not finalized at prepareOutput() time.
+void wrapProjectedInputChildren(
+    const std::vector<IdentityProjection>& projections,
+    const RowVectorPtr& input,
+    vector_size_t outputBatchSize,
+    const BufferPtr& indices,
+    std::vector<VectorPtr>& outputChildren) {
+  for (const auto& projection : projections) {
+    outputChildren[projection.outputChannel] = BaseVector::wrapInDictionary(
+        BufferPtr(nullptr),
+        indices,
+        outputBatchSize,
+        input->childAt(projection.inputChannel));
   }
 }
 } // namespace
@@ -469,9 +490,9 @@ bool MergeJoin::prepareOutput(
           operatorCtx_->pool());
     }
   } else {
-    wrapIndirectChildren(
+    wrapProjectedInputChildren(
         leftProjections_,
-        newLeft->children(),
+        newLeft,
         outputBatchSize_,
         leftIndices_,
         localColumns);
@@ -488,9 +509,9 @@ bool MergeJoin::prepareOutput(
     }
     isRightFlattened_ = true;
   } else {
-    wrapIndirectChildren(
+    wrapProjectedInputChildren(
         rightProjections_,
-        right->children(),
+        right,
         outputBatchSize_,
         rightIndices_,
         localColumns);
@@ -526,6 +547,9 @@ bool MergeJoin::prepareOutput(
         child->as<ArrayVector>()->prepareForReuse();
       } else if (child->typeKind() == TypeKind::MAP) {
         child->as<MapVector>()->prepareForReuse();
+        // The filter input is scratch space that is repopulated in place for
+        // each output batch. Do not reuse map lookup state across batches.
+        child->setMayChangeContentUnderSameAddress(true);
       }
     }
   }

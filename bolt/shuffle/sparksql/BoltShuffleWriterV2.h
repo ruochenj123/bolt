@@ -218,6 +218,10 @@ class BoltShuffleWriterV2 final : public BoltShuffleWriter {
     assembleBufferPool_ = BufferPool(assemblePool_.get());
   }
 
+  std::string toString() const override {
+    return "BoltShuffleWriterV2";
+  }
+
  private:
   void checkLengthBuffer(uint32_t col, uint32_t pid);
 
@@ -341,9 +345,8 @@ class BoltShuffleWriterV2 final : public BoltShuffleWriter {
   std::vector<std::vector<std::unique_ptr<arrow::ResizableBuffer>>>
       partitionBooleanValueBuffers_;
   std::map<uint32_t, bool> fullBatch_;
-  std::vector<uint16_t> fixedColValueSize_;
   std::vector<uint8_t> needAlignmentBitmap_;
-  std::vector<uint32_t> partitionBytesPerBatch_;
+  std::vector<uint64_t> partitionBytesPerBatch_;
   std::vector<bool> isValidityBufferRowVectorMode_;
   int64_t rowVectorModeCompress_{0};
 
@@ -355,7 +358,6 @@ class BoltShuffleWriterV2 final : public BoltShuffleWriter {
   std::vector<uint32_t> combinedPartitionUsed_;
   int64_t combinedVectorNumber_{0};
   int64_t combineVectorTimes_{0};
-  uint64_t maxBatchBytes_{200UL << 20};
 
   // The PrestoVectorSerializer has a limit of INT32_MAX for the size after
   // serialization. In the case of hasComplexType_, limit total size of combined

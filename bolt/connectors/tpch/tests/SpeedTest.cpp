@@ -45,20 +45,20 @@ namespace {
 /// generated table, scale factor, number of splits, and number of threads
 /// (drivers) using the flags defined below.
 
-DEFINE_string(table, "lineitem", "TPC-H table name to generate.");
+DEFINE_string(bolt_testing_table, "lineitem", "TPC-H table name to generate.");
 
 DEFINE_int32(
-    scale_factor,
+    bolt_testing_scale_factor,
     1,
     "Scale factor for the TPC-H table being generated.");
 
 DEFINE_int32(
-    num_splits,
+    bolt_testing_num_splits,
     1,
     "Number of splits to generate for a particular TPC-H table scan.");
 
 DEFINE_int32(
-    max_drivers,
+    bolt_testing_max_drivers,
     1,
     "Maximum number of drivers (threads) per pipeline.");
 using namespace bytedance::bolt;
@@ -70,8 +70,7 @@ class TpchSpeedTest {
  public:
   TpchSpeedTest() {
     auto tpchConnector =
-        connector::getConnectorFactory(
-            connector::tpch::TpchConnectorFactory::kTpchConnectorName)
+        connector::getConnectorFactory(connector::kTpchConnectorName)
             ->newConnector(
                 kTpchConnectorId_,
                 std::make_shared<config::ConfigBase>(
@@ -105,7 +104,7 @@ class TpchSpeedTest {
 
     CursorParameters params;
     params.planNode = plan;
-    params.maxDrivers = FLAGS_max_drivers;
+    params.maxDrivers = FLAGS_bolt_testing_max_drivers;
 
     auto taskCursor = TaskCursor::create(params);
     taskCursor->start();
@@ -161,7 +160,7 @@ class TpchSpeedTest {
 
       LOG(INFO) << "Current throughput: " << printThroughput(bytesPerSec)
                 << " - " << rowsPerSec << " rows/s - " << totalRows_
-                << " rows cummulative.";
+                << " rows cumulative.";
       intervalStart_ = curTime;
       intervalRows_ = 0;
       intervalBytes_ = 0;
@@ -199,6 +198,8 @@ int main(int argc, char** argv) {
 
   TpchSpeedTest speedTest;
   speedTest.run(
-      tpch::fromTableName(FLAGS_table), FLAGS_scale_factor, FLAGS_num_splits);
+      tpch::fromTableName(FLAGS_bolt_testing_table),
+      FLAGS_bolt_testing_scale_factor,
+      FLAGS_bolt_testing_num_splits);
   return 0;
 }

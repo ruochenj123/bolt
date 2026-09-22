@@ -425,7 +425,7 @@ class SelectiveFlatMapReader : public SelectiveStructColumnReaderBase {
  private:
   // Sets the bits for present and selected positions in 'rowColumnBits_' for
   // 'columnIdx' for the 64 rows selected by the inMap and selected bitmaps.
-  // 'baseRow' is the number of selectd rows below the range covered by 'inMap'
+  // 'baseRow' is the number of selected rows below the range covered by 'inMap'
   // and 'selected'
   void setRowBits(
       uint64_t inMap,
@@ -595,7 +595,8 @@ class SelectiveFlatMapReader : public SelectiveStructColumnReaderBase {
       selectedInMap.setValid(row, true);
     }
     int32_t totalChildValues = 0;
-    rowColumnBits_.resize(bits::nwords(rows.size() * children_.size()));
+    rowColumnBits_.resize(
+        bits::nwords(static_cast<uint64_t>(rows.size() * children_.size())));
     std::fill(rowColumnBits_.begin(), rowColumnBits_.end(), 0);
     nullsInChildValues_ = false;
     for (auto i = 0; i < children_.size(); ++i) {

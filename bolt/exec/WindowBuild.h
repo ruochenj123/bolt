@@ -87,8 +87,15 @@ class WindowBuild {
 
   /// Returns the spiller stats including total bytes and rows spilled so far.
   std::optional<common::SpillStats> spilledStats() const {
-    return sortSpiller_ ? std::make_optional(sortSpiller_->stats())
-                        : windowSpilledStats();
+    auto spillStats = windowSpilledStats();
+    if (sortSpiller_) {
+      if (spillStats) {
+        spillStats.value() += sortSpiller_->stats();
+      } else {
+        spillStats = sortSpiller_->stats();
+      }
+    }
+    return spillStats;
   }
 
   /// Returns the spiller stats including total bytes and rows spilled so far.
@@ -105,7 +112,7 @@ class WindowBuild {
   // building partitions.
   virtual void noMoreInput() = 0;
 
-  // After all partitions being outputed, clear the memory used.
+  // After all partitions being outputted, clear the memory used.
   virtual void finish() {
     return;
   }
@@ -179,6 +186,8 @@ class WindowBuild {
   void sortSpill();
 
  protected:
+  virtual void clearStateBeforeSortSpill() {}
+
   void ensureInputFits(const RowVectorPtr& input);
 
   void sortPartitions();

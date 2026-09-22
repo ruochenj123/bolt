@@ -27,9 +27,13 @@
 #include "bolt/exec/tests/utils/PlanBuilder.h"
 #include "bolt/exec/tests/utils/QueryAssertions.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
+#include "bolt/shuffle/sparksql/CelebornReaderStreamIterator.h"
 #include "bolt/shuffle/sparksql/Options.h"
 #include "bolt/shuffle/sparksql/ShuffleReaderNode.h"
+#include "bolt/shuffle/sparksql/ShuffleRowToColumnarConverter.h"
 #include "bolt/shuffle/sparksql/ShuffleWriterNode.h"
+#include "bolt/shuffle/sparksql/partition_writer/rss/NativeCelebornClient.h"
+#include "bolt/shuffle/sparksql/tests/CelebornTestUtils.h"
 #include "bolt/shuffle/sparksql/tests/LocalFileReaderStreamIterator.h"
 #include "bolt/shuffle/sparksql/tests/MemoryReaderStreamIterator.h"
 #include "bolt/shuffle/sparksql/tests/MockRssClient.h"
@@ -38,9 +42,11 @@
 
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <utility>
 
 #include <fmt/format.h>
+#include <vector/ComplexVector.h>
 
 using namespace bytedance::bolt;
 using namespace bytedance::bolt::test;
@@ -111,6 +117,7 @@ std::string shuffleModeToString(int mode) {
 }
 
 constexpr uint32_t kPidSeed = 42;
+constexpr int kCelebornAttemptId = 0;
 
 const std::vector<DataTypeGroup> dataGroups = {
     DataTypeGroup::kInteger,
@@ -155,14 +162,16 @@ std::string ShuffleTestParam::toString() const {
   auto memStr = fmt::format("{}{}", v, units[u]);
 
   return fmt::format(
-      "{}_{}_{}_{}_M{}_P{}_{}",
+      "{}_{}_{}_{}_M{}_P{}_{}_{}",
       partitioning,
       shuffleModeToString(shuffleMode),
       writerTypeToString(writerType),
       dataTypeGroupToString(dataTypeGroup),
       numMappers,
       numPartitions,
-      memStr);
+      memStr,
+      rowFormat == bytedance::bolt::row::RowFormat::COMPACT ? "Compact"
+                                                            : "Dense");
 }
 
 bool ShuffleTestParam::isSupported() const {
@@ -343,6 +352,17 @@ RowVectorPtr ShuffleTestBase::prependPidColumn(
   for (int32_t row = 0; row < numRows; ++row) {
     pids[row] = dist(rng);
   }
+
+  if (RowVector::isComposite(input)) {
+    // CompositeRowVector should contains a pid column already.
+    auto compositeVector = std::dynamic_pointer_cast<CompositeRowVector>(input);
+    auto* pidVector = compositeVector->childAt(0)->asFlatVector<int32_t>();
+    for (int i = 0; i < numRows; ++i) {
+      pidVector->set(i, pids[i]);
+    }
+    return input;
+  }
+
   auto pidVector =
       makeFlatVector<int32_t>(numRows, [&](auto row) { return pids[row]; });
 
@@ -441,9 +461,24 @@ std::vector<std::vector<RowVectorPtr>> ShuffleTestBase::splitInputByPid(
 ShuffleRunResult ShuffleTestBase::runShuffle(
     const std::vector<std::vector<RowVectorPtr>>& inputsPerMapper,
     const RowTypePtr& outputType,
-    const ShuffleTestParam& param,
-    const ShuffleInputData& inputData) {
-  auto memoryManagerHolder = TestMemoryManagerHolder::create(param.memoryLimit);
+    const ShuffleTestParam& param) {
+  const bool useRealCeleborn =
+      param.writerType == PartitionWriterType::kCeleborn &&
+      readBoolEnv(kRealCelebornEnv);
+
+  // Parallel reads for real Celeborn with many partitions.
+  constexpr int kParallelReadThreshold = 32;
+  const int numReadThreads =
+      (useRealCeleborn && param.numPartitions >= kParallelReadThreshold)
+      ? std::clamp(
+            static_cast<int>(std::thread::hardware_concurrency()),
+            1,
+            param.numPartitions)
+      : 0;
+  // Scale memory pool so concurrent readers don't exceed capacity.
+  auto memoryManagerHolder = TestMemoryManagerHolder::create(
+      param.memoryLimit * std::max(1, numReadThreads));
+
   ShuffleRunResult result;
 
   auto tempDir = exec::test::TempDirectoryPath::create();
@@ -451,8 +486,22 @@ ShuffleRunResult ShuffleTestBase::runShuffle(
   std::filesystem::create_directories(localDir);
 
   std::shared_ptr<MockRssClient> mockRssClient;
+  std::shared_ptr<celeborn::client::ShuffleClient> realCelebornClient;
+  // The guard owns lifecycle cleanup and lazily allocates a unique shuffle id
+  // for real Celeborn runs, so call sites don't need separate id bookkeeping.
+  RealCelebornClientCleanupGuard realCelebornClientCleanupGuard(
+      useRealCeleborn ? &realCelebornClient : nullptr);
+  const int celebornShuffleId =
+      useRealCeleborn ? realCelebornClientCleanupGuard.shuffleId() : 0;
+
   if (param.writerType == PartitionWriterType::kCeleborn) {
-    mockRssClient = std::make_shared<MockRssClient>();
+    if (useRealCeleborn) {
+      auto appId =
+          getEnvOrDefault(kCelebornLmAppIdEnv, "bolt-shuffle-test-app");
+      realCelebornClient = createRealCelebornClientForTests(appId);
+    } else {
+      mockRssClient = std::make_shared<MockRssClient>();
+    }
   }
 
   std::vector<ShuffleWriterMetrics> mapperMetrics;
@@ -465,15 +514,27 @@ ShuffleRunResult ShuffleTestBase::runShuffle(
 
     ShuffleWriterOptions writerOptions;
     writerOptions.partitioning = toPartitioning(param.partitioning);
-    writerOptions.sort_before_repartition = false;
     writerOptions.partitionWriterOptions.numPartitions = param.numPartitions;
     writerOptions.forceShuffleWriterType = param.shuffleMode;
+    writerOptions.rowFormat = param.rowFormat;
     writerOptions.partitionWriterOptions.partitionWriterType = param.writerType;
-    writerOptions.taskAttemptId = 0;
-    writerOptions.partitionWriterOptions.shuffleBufferSize = 1024 * 1024; // 1MB
+    writerOptions.taskAttemptId = memoryManagerHolder->taskAttemptId();
+    writerOptions.partitionWriterOptions.shuffleBufferSize =
+        param.shuffleBufferSize;
 
     if (param.writerType == PartitionWriterType::kCeleborn) {
-      writerOptions.partitionWriterOptions.rssClient = mockRssClient;
+      if (useRealCeleborn) {
+        writerOptions.partitionWriterOptions.rssClient =
+            std::make_shared<NativeCelebornClient>(
+                realCelebornClient,
+                celebornShuffleId,
+                m,
+                kCelebornAttemptId,
+                param.numMappers,
+                param.numPartitions);
+      } else {
+        writerOptions.partitionWriterOptions.rssClient = mockRssClient;
+      }
     } else {
       writerOptions.partitionWriterOptions.dataFile = dataFile;
       writerOptions.partitionWriterOptions.configuredDirs = {localDir};
@@ -515,15 +576,47 @@ ShuffleRunResult ShuffleTestBase::runShuffle(
   }
 
   result.partitionOutputs.resize(param.numPartitions);
-  for (int i = 0; i < param.numPartitions; ++i) {
-    std::shared_ptr<ReaderStreamIterator> streamIter;
-    if (param.writerType == PartitionWriterType::kCeleborn) {
-      auto it = mockRssClient->getData().find(i);
-      if (it == mockRssClient->getData().end() || it->second.empty()) {
+  if (useRealCeleborn) {
+    realCelebornClient->updateReducerFileGroup(celebornShuffleId);
+  }
+
+  auto partitionHasOutput = [&](int partition) {
+    int64_t bytes = 0;
+    for (const auto& metric : mapperMetrics) {
+      if (metric.partitionLengths.empty()) {
         continue;
       }
-      streamIter = std::make_shared<MemoryReaderStreamIterator>(
-          std::vector<std::vector<char>>{it->second});
+      const auto idx = static_cast<size_t>(partition);
+      if (idx < metric.partitionLengths.size()) {
+        bytes += metric.partitionLengths[idx];
+      }
+    }
+    return bytes > 0;
+  };
+
+  auto readPartition = [&](int i) {
+    std::shared_ptr<ReaderStreamIterator> streamIter;
+    if (param.writerType == PartitionWriterType::kCeleborn) {
+      if (!partitionHasOutput(i)) {
+        return;
+      }
+      if (useRealCeleborn) {
+        streamIter = std::make_shared<CelebornReaderStreamIterator>(
+            realCelebornClient,
+            celebornShuffleId,
+            std::vector<int32_t>{i},
+            kCelebornAttemptId,
+            0,
+            param.numMappers,
+            false);
+      } else {
+        auto it = mockRssClient->getData().find(i);
+        if (it == mockRssClient->getData().end() || it->second.empty()) {
+          return;
+        }
+        streamIter = std::make_shared<MemoryReaderStreamIterator>(
+            std::vector<std::vector<char>>{it->second});
+      }
     } else {
       std::vector<SegmentInfo> segments;
       for (int m = 0; m < param.numMappers; ++m) {
@@ -542,7 +635,7 @@ ShuffleRunResult ShuffleTestBase::runShuffle(
         segments.push_back({mapperDataFiles[m], offset, length});
       }
       if (segments.empty()) {
-        continue;
+        return;
       }
       streamIter =
           std::make_shared<LocalFileReaderStreamIterator>(std::move(segments));
@@ -551,6 +644,7 @@ ShuffleRunResult ShuffleTestBase::runShuffle(
     ShuffleReaderOptions readerOptions;
     readerOptions.numPartitions = param.numPartitions;
     readerOptions.forceShuffleWriterType = param.shuffleMode;
+    readerOptions.rowFormat = param.rowFormat;
     readerOptions.partitionShortName = param.partitioning;
     readerOptions.shuffleBatchByteSize = 1024 * 1024; // 1MB
 
@@ -572,13 +666,71 @@ ShuffleRunResult ShuffleTestBase::runShuffle(
     while (readerCursor->moveNext()) {
       auto curBatch = readerCursor->current();
       // deep copy to avoid hold shuffle reader memory
-      VectorPtr copy =
-          BaseVector::create(curBatch->type(), curBatch->size(), pool());
-      copy->copy(curBatch.get(), 0, 0, curBatch->size());
-      result.partitionOutputs[i].push_back(
-          std::dynamic_pointer_cast<RowVector>(copy));
+      if (param.verifyOutput) {
+        if (RowVector::isComposite(curBatch)) {
+          auto composite =
+              std::dynamic_pointer_cast<CompositeRowVector>(curBatch);
+          std::vector<std::string_view> rows;
+          rows.reserve(composite->size());
+          for (auto row = 0; row < composite->size(); ++row) {
+            auto* data = composite->rowAt(row);
+            auto* end = row + 1 < composite->size()
+                ? composite->rowAt(row + 1)
+                : composite->rowAt(0) + composite->totalRowSize();
+            rows.emplace_back(data, end - data);
+          }
+          ShuffleRowToColumnarConverter converter(
+              outputType, pool(), param.rowFormat);
+          result.partitionOutputs[i].push_back(converter.convert(rows));
+          readerCursor->current().reset();
+          continue;
+        }
+        VectorPtr copy =
+            BaseVector::create(curBatch->type(), curBatch->size(), pool());
+        copy->copy(curBatch.get(), 0, 0, curBatch->size());
+        result.partitionOutputs[i].push_back(
+            std::dynamic_pointer_cast<RowVector>(copy));
+      }
       readerCursor->current().reset();
     }
+  };
+
+  // Read partitions in parallel to saturate multiple Celeborn workers.
+  if (numReadThreads > 0) {
+    std::atomic<int> nextPartition{0};
+    std::vector<std::exception_ptr> errors(numReadThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(numReadThreads);
+    for (int t = 0; t < numReadThreads; ++t) {
+      threads.emplace_back([&, t] {
+        try {
+          while (true) {
+            int i = nextPartition.fetch_add(1);
+            if (i >= param.numPartitions) {
+              break;
+            }
+            readPartition(i);
+          }
+        } catch (...) {
+          errors[t] = std::current_exception();
+        }
+      });
+    }
+    for (auto& th : threads) {
+      th.join();
+    }
+    for (auto& ep : errors) {
+      if (ep) {
+        std::rethrow_exception(ep);
+      }
+    }
+  } else {
+    for (int i = 0; i < param.numPartitions; ++i) {
+      readPartition(i);
+    }
+  }
+  if (useRealCeleborn) {
+    realCelebornClientCleanupGuard.cleanupNow();
   }
 
   return result;
@@ -586,7 +738,8 @@ ShuffleRunResult ShuffleTestBase::runShuffle(
 
 void ShuffleTestBase::executeTestWithCustomInput(
     const ShuffleTestParam& param,
-    ShuffleInputData& inputData) {
+    ShuffleInputData& inputData,
+    ShuffleRunResult* resultOut) {
   const bool needsPid =
       (param.partitioning == "hash" || param.partitioning == "range");
 
@@ -605,8 +758,15 @@ void ShuffleTestBase::executeTestWithCustomInput(
   BOLT_CHECK(!allBaseBatches.empty(), "Input batches should not be empty");
   auto outputType =
       std::dynamic_pointer_cast<const RowType>(allBaseBatches[0]->type());
+  if (needsPid && RowVector::isComposite(allBaseBatches[0])) {
+    auto names = outputType->names();
+    auto types = outputType->children();
+    names.erase(names.begin());
+    types.erase(types.begin());
+    outputType = ROW(std::move(names), std::move(types));
+  }
 
-  auto result = runShuffle(writerInputs, outputType, param, inputData);
+  auto result = runShuffle(writerInputs, outputType, param);
 
   int64_t totalRows = 0;
   for (const auto& batch : allBaseBatches) {
@@ -616,6 +776,13 @@ void ShuffleTestBase::executeTestWithCustomInput(
   EXPECT_EQ(result.metrics.partitionLengths.size(), param.numPartitions);
   if (totalRows > 0) {
     EXPECT_GT(result.metrics.totalBytesWritten, 0);
+  }
+
+  if (!param.verifyOutput) {
+    if (resultOut != nullptr) {
+      *resultOut = std::move(result);
+    }
+    return;
   }
 
   if (needsPid) {
@@ -651,11 +818,41 @@ void ShuffleTestBase::executeTestWithCustomInput(
   }
 
   result.partitionOutputs.clear();
+  if (resultOut != nullptr) {
+    *resultOut = std::move(result);
+  }
 }
 
 void ShuffleTestBase::executeTest(const ShuffleTestParam& param) {
   auto inputData = makeInputData(param);
   executeTestWithCustomInput(param, inputData);
+}
+
+std::shared_ptr<CompositeRowVector>
+ShuffleTestBase::createCompositeRowVectorWithPid(
+    const RowTypePtr& rowTypeWithoutPid,
+    vector_size_t rowCount) {
+  auto names = std::vector<std::string>{"c0"};
+  auto types = std::vector<TypePtr>{INTEGER()};
+  names.insert(
+      names.end(),
+      rowTypeWithoutPid->names().begin(),
+      rowTypeWithoutPid->names().end());
+  types.insert(
+      types.end(),
+      rowTypeWithoutPid->children().begin(),
+      rowTypeWithoutPid->children().end());
+  auto rowType = ROW(std::move(names), std::move(types));
+  auto validColumns =
+      std::make_unique<SelectivityVector>(rowType->size(), false);
+  validColumns->setValid(0, true);
+  auto pidVector = BaseVector::create(INTEGER(), rowCount, pool());
+  return std::make_shared<CompositeRowVector>(
+      rowType,
+      rowCount,
+      pool(),
+      std::move(validColumns),
+      std::vector<std::shared_ptr<BaseVector>>{pidVector});
 }
 
 } // namespace bytedance::bolt::shuffle::sparksql::test

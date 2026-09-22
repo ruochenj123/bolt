@@ -32,6 +32,7 @@
 #include "bolt/functions/lib/ArrayShuffle.h"
 #include "bolt/functions/lib/RegistrationHelpers.h"
 #include "bolt/functions/lib/Repeat.h"
+#include "bolt/functions/lib/Slice.h"
 #include "bolt/functions/prestosql/ArrayFunctions.h"
 #include "bolt/functions/sparksql/ArrayAppend.h"
 #include "bolt/functions/sparksql/ArrayFlattenFunction.h"
@@ -51,7 +52,8 @@ void registerSparkArrayFunctions(const std::string& prefix) {
   BOLT_REGISTER_VECTOR_FUNCTION(udf_reduce, prefix + "aggregate");
   BOLT_REGISTER_VECTOR_FUNCTION(udf_array_filter, prefix + "filter");
   BOLT_REGISTER_VECTOR_FUNCTION(udf_array_constructor, prefix + "array");
-  BOLT_REGISTER_VECTOR_FUNCTION(udf_array_contains, prefix + "array_contains");
+  BOLT_REGISTER_VECTOR_FUNCTION(
+      udf_spark_array_contains, prefix + "array_contains");
   BOLT_REGISTER_VECTOR_FUNCTION(
       udf_array_intersect, prefix + "array_intersect");
   BOLT_REGISTER_VECTOR_FUNCTION(udf_array_except, prefix + "array_except");
@@ -59,7 +61,7 @@ void registerSparkArrayFunctions(const std::string& prefix) {
       udf_array_slice_sum, prefix + "array_slice_sum");
   BOLT_REGISTER_VECTOR_FUNCTION(udf_any_match, prefix + "exists");
 
-  BOLT_REGISTER_VECTOR_FUNCTION(udf_zip, prefix + "arrays_zip");
+  BOLT_REGISTER_VECTOR_FUNCTION(udf_zip_spark, prefix + "arrays_zip");
   BOLT_REGISTER_VECTOR_FUNCTION(udf_zip_with, prefix + "zip_with");
 
   BOLT_REGISTER_VECTOR_FUNCTION(udf_all_match, prefix + "forall")
@@ -82,9 +84,11 @@ inline void registerArrayMinMaxFunctions(const std::string& prefix) {
   registerArrayMinMaxFunctions<float>(prefix);
   registerArrayMinMaxFunctions<double>(prefix);
   registerArrayMinMaxFunctions<bool>(prefix);
+  registerArrayMinMaxFunctions<Varbinary>(prefix);
   registerArrayMinMaxFunctions<Varchar>(prefix);
   registerArrayMinMaxFunctions<Timestamp>(prefix);
   registerArrayMinMaxFunctions<Date>(prefix);
+  registerArrayMinMaxFunctions<Orderable<T1>>(prefix);
 }
 
 template <typename T>
@@ -203,7 +207,11 @@ void registerArrayFunctions(const std::string& prefix) {
   exec::registerStatefulVectorFunction(
       prefix + "array_repeat",
       repeatSignatures(),
-      makeRepeatAllowNegativeCount);
+      makeRepeatAllowNegativeCountNoLimit);
+
+  registerIntegerSliceFunction(prefix);
+
+  BOLT_REGISTER_VECTOR_FUNCTION(udf_spark_sequence, prefix + "sequence");
 
   // for now, register ArrayRemoveFunctionString that takes String input and
   // output is enough for our use cases. In future, if need to support more

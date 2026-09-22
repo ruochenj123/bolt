@@ -29,28 +29,36 @@ add_executable(
   bolt_functions_spark_test
   ArithmeticTest.cpp
   ArrayAppendTest.cpp
+  ArrayContainsTest.cpp
   ArrayFlattenTest.cpp
   ArrayGetTest.cpp
   ArrayInsertTest.cpp
   ArrayMaxTest.cpp
   ArrayMinTest.cpp
   ArrayPrependTest.cpp
+  ArrayRepeatTest.cpp
   ArrayShuffleTest.cpp
   ArraySliceSumTest.cpp
   ArrayUnionTest.cpp
+  ArraysZipTest.cpp
   AtLeastNNonNullsTest.cpp
   Base64Test.cpp
+  BitmapCountTest.cpp
   BitwiseTest.cpp
+  CharVarcharTest.cpp
   ComparisonsTest.cpp
   DecimalArithmeticFuncTest.cpp
   DecimalArithmeticTest.cpp
   DecimalCompareTest.cpp
   DecimalRoundTest.cpp
   DecimalUtilTest.cpp
+  DecimalVectorFunctionsTest.cpp
   ElementAtTest.cpp
   FactorialTest.cpp
+  FormatNumberTest.cpp
   FromJsonTest.cpp
   FromJsonTest.cpp
+  FromToJsonRoundTripTest.cpp
   GetArrayStructFieldsTest.cpp
   GetStructFieldTest.cpp
   HashTest.cpp
@@ -64,24 +72,30 @@ add_executable(
   JsonToMapTest.cpp
   JsonTupleTest.cpp
   LeastGreatestTest.cpp
+  LuhnCheckTest.cpp
   MakeDecimalTest.cpp
   MakeTimestampTest.cpp
   MapConcatTest.cpp
+  MapFromArraysTest.cpp
   MapTest.cpp
   MaskTest.cpp
   MightContainTest.cpp
-  MightContainTest.cpp
+  MonotonicallyIncreasingIdTest.cpp
   RaiseErrorTest.cpp
   RandTest.cpp
   RegexFunctionsTest.cpp
+  SequenceTest.cpp
+  SliceTest.cpp
   SizeTest.cpp
   SortArrayTest.cpp
   SparkArraySortTest.cpp
-  SparkCastExprTest.cpp
   SparkPartitionIdTest.cpp
+  SparkRoundTest.cpp
   SparkSqlDateTimeFunctionsTest.cpp
   SplitFunctionsTest.cpp
+  StringSplitSQLTest.cpp
   StringTest.cpp
+  ToJsonTest.cpp
   UdfMapArrayCombineTest.cpp
   UdfMapFilterKeysTest.cpp
   UdfMapUpdateTest.cpp
@@ -89,23 +103,23 @@ add_executable(
   UnBase64Test.cpp
   UnscaledValueFunctionTest.cpp
   URLFunctionsTest.cpp
+  VariantFunctionTest.cpp
   XxHash64Test.cpp
 )
 
+if(BOLT_ENABLE_SPARK_COMPATIBLE)
+  target_sources(bolt_functions_spark_test PRIVATE SparkCastExprTest.cpp)
+endif()
+
 add_test(
   NAME bolt_functions_spark_test
-  COMMAND bolt_functions_spark_test
+  COMMAND
+    bolt_functions_spark_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_link_libraries(
   bolt_functions_spark_test
-  bolt_functions_spark
-  bolt_functions_test_lib
-  bolt_exec_test_lib
-  ${FMT}
-  GTest::gtest
-  GTest::gtest_main
+  bolt_gtest_main
   GTest::gmock
-  gflags::gflags
 )

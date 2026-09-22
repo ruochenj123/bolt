@@ -31,6 +31,7 @@
 #pragma once
 
 #include <gtest/gtest.h>
+#include <cstdlib>
 
 // gtest v1.10 deprecated *_TEST_CASE in favor of *_TEST_SUITE. These
 // macros are provided for portability between different gtest versions.
@@ -112,3 +113,11 @@
 #define DEBUG_ONLY_TEST_P(test_fixture, test_name) \
   TEST_P(test_fixture, DISABLED_##test_name)
 #endif
+
+namespace bytedance::bolt::test {
+inline struct GTestEnvSetter {
+  GTestEnvSetter() {
+    ::setenv("BOLT_IN_GTEST", "1", 1);
+  }
+} g_gtest_env_setter;
+} // namespace bytedance::bolt::test

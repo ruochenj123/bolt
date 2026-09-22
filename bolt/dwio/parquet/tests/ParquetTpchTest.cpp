@@ -28,7 +28,8 @@
  * --------------------------------------------------------------------------
  */
 
-#include <folly/init/Init.h>
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include <vector>
 
 #include "bolt/common/file/FileSystems.h"
@@ -61,9 +62,9 @@ class ParquetTpchTest : public testing::Test {
 
     functions::prestosql::registerAllScalarFunctions();
     aggregate::prestosql::registerAllAggregateFunctions();
-#ifdef SPARK_COMPATIBLE
-    functions::sparksql::registerFunctions("");
-#endif
+    if (::bytedance::bolt::kSparkCompatible) {
+      functions::sparksql::registerFunctions("");
+    }
 
     parse::registerTypeResolver();
     filesystems::registerLocalFileSystem();
@@ -72,8 +73,7 @@ class ParquetTpchTest : public testing::Test {
     bytedance::bolt::parquet::registerParquetWriterFactory();
 
     auto hiveConnector =
-        connector::getConnectorFactory(
-            connector::hive::HiveConnectorFactory::kHiveConnectorName)
+        connector::getConnectorFactory(connector::kHiveConnectorName)
             ->newConnector(
                 kHiveConnectorId,
                 std::make_shared<config::ConfigBase>(
@@ -81,8 +81,7 @@ class ParquetTpchTest : public testing::Test {
     connector::registerConnector(hiveConnector);
 
     auto tpchConnector =
-        connector::getConnectorFactory(
-            connector::tpch::TpchConnectorFactory::kTpchConnectorName)
+        connector::getConnectorFactory(connector::kTpchConnectorName)
             ->newConnector(
                 kBoltTpchConnectorId,
                 std::make_shared<config::ConfigBase>(
@@ -271,11 +270,4 @@ TEST_F(ParquetTpchTest, Q21) {
 TEST_F(ParquetTpchTest, Q22) {
   std::vector<uint32_t> sortingKeys{0};
   assertQuery(22, std::move(sortingKeys));
-}
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  // todo: use folly::Init init after upgrade folly lib
-  folly::init(&argc, &argv, false);
-  return RUN_ALL_TESTS();
 }

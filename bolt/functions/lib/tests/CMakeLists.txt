@@ -45,21 +45,14 @@ add_executable(
 
 add_test(
   NAME bolt_functions_lib_test
-  COMMAND bolt_functions_lib_test
+  COMMAND
+    bolt_functions_lib_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_link_libraries(
   bolt_functions_lib_test
-  bolt_functions_lib
-  bolt_functions_test_lib
-  bolt_is_null_functions
-  bolt_exec_test_lib
-  bolt_expression
-  bolt_memory
-  bolt_dwio_common_test_utils
-  GTest::gtest
-  GTest::gtest_main
+  bolt_gtest_main
   GTest::gmock
   gflags::gflags
 )

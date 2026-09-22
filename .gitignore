@@ -90,7 +90,6 @@ _build/
 a.out
 CMake/resolve_dependency_module/boost/FindBoost.cmake
 __cmake_systeminformation/
-bolt/version/version.h
 
 #==============================================================================#
 # Kate Swap Files
@@ -315,6 +314,7 @@ bolt/docs/sphinx/source/README_generated_*
 bolt/docs/bindings/python/_generate/*
 
 # conan / cmake
+.conan2/
 CMakeUserPresets.json
 CMakePresets.json
 conan.lock
@@ -333,7 +333,6 @@ conan.options
 .ccls
 .ccls-cache/*
 
-
 # makefile clang-format files
 files.txt
 log.txt
@@ -346,3 +345,5 @@ buildlogs/
 compile_*.log
 slurm-*.out
 .clangd
+
+bolt/version/version.h

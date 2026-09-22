@@ -25,25 +25,31 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(
+bolt_add_library(
   bolt_process ExceptionTrace.cpp ProcessBase.cpp StackTrace.cpp ThreadDebugInfo.cpp
                TraceContext.cpp
 )
 
 target_link_libraries(
   bolt_process
-  PUBLIC bolt_flag_definitions Folly::folly
-  PRIVATE fmt::fmt gflags::gflags glog::glog
+  PUBLIC
+    bolt_common_flags
+    Folly::folly
+  PRIVATE
+    fmt::fmt
+    gflags::gflags
+    glog::glog
 )
 
-find_package(libbacktrace REQUIRED CONFIG)
+bolt_add_library(bolt_process_crash_report CrashReport.cpp)
 
-add_library(bolt_process_crash_report CrashReport.cpp)
-
-target_link_libraries(bolt_process_crash_report libbacktrace::libbacktrace)
+target_link_libraries(
+  bolt_process_crash_report
+  libbacktrace::libbacktrace
+  ${CMAKE_DL_LIBS}
+)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
-  find_package(libunwind REQUIRED CONFIG)
   target_link_libraries(bolt_process_crash_report libunwind::libunwind)
 endif()
 

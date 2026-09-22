@@ -25,17 +25,31 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_executable(bolt_gcsfile_test GCSFileSystemTest.cpp GCSUtilTest.cpp)
-add_test(bolt_gcsfile_test bolt_gcsfile_test)
+add_executable(
+  bolt_gcs_file_test
+  GcsFileSystemTest.cpp
+  GcsUtilTest.cpp
+)
+add_test(bolt_gcs_file_test bolt_gcsfile_test)
 target_link_libraries(
-  bolt_gcsfile_test
-  bolt_file
-  bolt_gcs
-  bolt_core
-  bolt_hive_connector
-  bolt_dwio_common_exception
-  bolt_exec
+  bolt_gcs_file_test
+  google-cloud-cpp::storage
   GTest::gmock
-  GTest::gtest
-  GTest::gtest_main
+  bolt_gtest_main
+)
+
+add_executable(bolt_gcs_insert_test GcsInsertTest.cpp)
+add_test(bolt_gcs_insert_test bolt_gcs_insert_test)
+target_link_libraries(
+  bolt_gcs_insert_test
+  GTest::gmock
+  bolt_gtest_main
+)
+
+add_executable(bolt_gcs_multiendpoints_test GcsMultipleEndpointsTest.cpp)
+add_test(bolt_gcs_multiendpoints_test bolt_gcs_multiendpoints_test)
+target_link_libraries(
+  bolt_gcs_multiendpoints_test
+  GTest::gmock
+  bolt_gtest_main
 )

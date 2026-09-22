@@ -35,11 +35,11 @@
 #include "bolt/benchmarks/ExpressionBenchmarkBuilder.h"
 
 DEFINE_bool(
-    enable_cast_optimize,
+    bolt_benchmark_enable_cast_optimize,
     true,
     "Enable cast optimization in the benchmark");
 
-DEFINE_bool(primitive, true, "benchmark all primitive case");
+DEFINE_bool(bolt_benchmark_primitive, true, "benchmark all primitive case");
 using namespace bytedance;
 using namespace bytedance::bolt;
 
@@ -81,7 +81,7 @@ void benchmarkAll(
   ExpressionBenchmarkBuilder benchmarkBuilder;
   benchmarkBuilder.setConfig(
       {{core::QueryConfig::kEnableOptimizedCast,
-        FLAGS_enable_cast_optimize ? "true" : "false"}});
+        FLAGS_bolt_benchmark_enable_cast_optimize ? "true" : "false"}});
   const vector_size_t vectorSize = 1024 * 32;
   auto vectorMaker = benchmarkBuilder.vectorMaker();
   std::map<std::string, VectorPtr> cols;
@@ -169,8 +169,9 @@ void benchmarkAll(
       } else if (v.second == "short_decimal") {
         input = vectorMaker.flatVector<std::string>(vectorSize, [&](auto j) {
           char buf[32];
-          auto size =
-              DecimalUtil::convertToString<int64_t>(123456789 * j, 6, 32, buf);
+          auto size = DecimalUtil::convertToString<
+              DecimalUtil::DecimalStringFormat::kPlain>(
+              123456789 * j, 6, 32, buf);
           return std::string(buf, size);
         });
       } else if (v.second == "long_decimal") {
@@ -178,7 +179,8 @@ void benchmarkAll(
           char buf[128];
           auto v =
               bytedance::bolt::HugeInt::build(12345 * j, 56789 * j + 12345);
-          auto size = DecimalUtil::convertToString<int64_t>(v, 18, 128, buf);
+          auto size = DecimalUtil::convertToString<
+              DecimalUtil::DecimalStringFormat::kPlain>(v, 18, 128, buf);
           return std::string(buf, size);
         });
       } else {
@@ -218,7 +220,7 @@ int main(int argc, char** argv) {
   folly::init(&argc, &argv);
   memory::MemoryManager::initialize(memory::MemoryManager::Options{});
 
-  if (FLAGS_primitive) {
+  if (FLAGS_bolt_benchmark_primitive) {
     std::vector<std::string> types = {
         "bool",
         "tinyint",
@@ -251,7 +253,7 @@ int main(int argc, char** argv) {
     ExpressionBenchmarkBuilder benchmarkBuilder;
     benchmarkBuilder.setConfig(
         {{core::QueryConfig::kEnableOptimizedCast,
-          FLAGS_enable_cast_optimize ? "true" : "false"}});
+          FLAGS_bolt_benchmark_enable_cast_optimize ? "true" : "false"}});
     const vector_size_t vectorSize = 1024 * 32;
     auto vectorMaker = benchmarkBuilder.vectorMaker();
     auto invalidInput =

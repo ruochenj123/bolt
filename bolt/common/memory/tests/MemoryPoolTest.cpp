@@ -35,16 +35,13 @@
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/common/caching/AsyncDataCache.h"
 #include "bolt/common/caching/SsdCache.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/memory/MallocAllocator.h"
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/MemoryPool.h"
 #include "bolt/common/memory/MmapAllocator.h"
 #include "bolt/common/memory/SharedArbitrator.h"
 #include "bolt/common/testutil/TestValue.h"
-
-DECLARE_bool(bolt_memory_leak_check_enabled);
-DECLARE_bool(bolt_memory_pool_debug_enabled);
-DECLARE_int32(bolt_memory_num_shared_leaf_pools);
 
 using namespace ::testing;
 using namespace bytedance::bolt::cache;
@@ -91,7 +88,7 @@ class MemoryPoolTest : public testing::TestWithParam<TestParam> {
   static void SetUpTestCase() {
     SharedArbitrator::registerFactory();
     FLAGS_bolt_memory_leak_check_enabled = true;
-    TestValue::enable();
+    BOLT_TEST_VALUE_ENABLE();
   }
 
   MemoryPoolTest()
@@ -848,7 +845,7 @@ TEST_P(MemoryPoolTest, childUsageTest) {
 
 TEST_P(MemoryPoolTest, getPreferredSize) {
   MemoryManager& manager = *getMemoryManager();
-  auto& pool = dynamic_cast<MemoryPoolImpl&>(manager.deprecatedSysRootPool());
+  auto& pool = dynamic_cast<MemoryPoolImpl&>(*manager.spillPool()->parent());
 
   // size < 8
   EXPECT_EQ(8, pool.preferredSize(1));
@@ -865,7 +862,7 @@ TEST_P(MemoryPoolTest, getPreferredSize) {
 
 TEST_P(MemoryPoolTest, getPreferredSizeOverflow) {
   MemoryManager& manager = *getMemoryManager();
-  auto& pool = dynamic_cast<MemoryPoolImpl&>(manager.deprecatedSysRootPool());
+  auto& pool = dynamic_cast<MemoryPoolImpl&>(*manager.spillPool()->parent());
 
   EXPECT_EQ(1ULL << 32, pool.preferredSize((1ULL << 32) - 1));
   EXPECT_EQ(1ULL << 63, pool.preferredSize((1ULL << 62) - 1 + (1ULL << 62)));
@@ -873,7 +870,7 @@ TEST_P(MemoryPoolTest, getPreferredSizeOverflow) {
 
 TEST_P(MemoryPoolTest, allocatorOverflow) {
   MemoryManager& manager = *getMemoryManager();
-  auto& pool = dynamic_cast<MemoryPoolImpl&>(manager.deprecatedSysRootPool());
+  auto& pool = dynamic_cast<MemoryPoolImpl&>(*manager.spillPool()->parent());
   StlAllocator<int64_t> alloc(pool);
   EXPECT_THROW(alloc.allocate(1ULL << 62), BoltException);
   EXPECT_THROW(alloc.deallocate(nullptr, 1ULL << 62), BoltException);
@@ -2383,37 +2380,6 @@ TEST_P(MemoryPoolTest, concurrentUpdatesToTheSamePool) {
   ASSERT_EQ(root->stats().currentBytes, 0);
 }
 
-TEST_P(MemoryPoolTest, DISABLED_concurrentUpdateToSharedPools) {
-  // under some conditions bug.
-  constexpr int64_t kMaxMemory = 10 * GB;
-  MemoryManager& manager = *getMemoryManager();
-  const int32_t kNumThreads = FLAGS_bolt_memory_num_shared_leaf_pools;
-
-  folly::Random::DefaultGenerator rng;
-  rng.seed(1234);
-
-  const int32_t kNumOpsPerThread = 200;
-  std::vector<std::thread> threads;
-  threads.reserve(kNumThreads);
-  for (size_t i = 0; i < kNumThreads; ++i) {
-    threads.emplace_back([&, i]() {
-      auto& sharedPool = manager.deprecatedSharedLeafPool();
-      MemoryPoolTester tester(i, kMaxMemory, sharedPool);
-      for (int32_t iter = 0; iter < kNumOpsPerThread; ++iter) {
-        tester.run();
-      }
-    });
-  }
-
-  for (auto& th : threads) {
-    th.join();
-  }
-
-  for (auto pool : manager.testingSharedLeafPools()) {
-    EXPECT_EQ(pool->currentBytes(), 0);
-  }
-}
-
 TEST_P(MemoryPoolTest, concurrentPoolStructureAccess) {
   folly::Random::DefaultGenerator rng;
   rng.seed(1234);
@@ -2843,7 +2809,7 @@ TEST_P(MemoryPoolTest, memoryReclaimerSetCheck) {
   {
     auto root =
         manager->addRootPool("", kMaxMemory, memory::MemoryReclaimer::create());
-    // Can't set more tha once.
+    // Can't set more than once.
     BOLT_ASSERT_THROW(
         root->setReclaimer(memory::MemoryReclaimer::create()), "");
     BOLT_ASSERT_THROW(root->setReclaimer(nullptr), "");

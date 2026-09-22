@@ -28,27 +28,40 @@
 # for generated headers
 include_directories(.)
 
-add_library(bolt_file File.cpp FileInputStream.cpp FileSystems.cpp Utils.cpp)
+bolt_add_library(bolt_file File.cpp FileInputStream.cpp FileSystems.cpp Utils.cpp)
 if(KERNEL_SUPPORTS_IO_URING)
   message(STATUS "Add liburing dependency")
 
   find_package(liburing REQUIRED)
   target_link_libraries(
     bolt_file
-    PUBLIC bolt_exception Folly::folly liburing::liburing
-    PRIVATE bolt_buffer bolt_common_base fmt::fmt glog::glog
+    PUBLIC
+      bolt_exception
+      Folly::folly
+      liburing::liburing
+    PRIVATE
+      bolt_buffer
+      bolt_common_base
+      fmt::fmt
+      glog::glog
   )
 else()
   target_link_libraries(
     bolt_file
-    PUBLIC bolt_exception Folly::folly
-    PRIVATE bolt_buffer bolt_common_base fmt::fmt glog::glog
+    PUBLIC
+      bolt_exception
+      Folly::folly
+    PRIVATE
+      bolt_buffer
+      bolt_common_base
+      fmt::fmt
+      glog::glog
   )
 endif()
 
 if(${BOLT_BUILD_TESTING} OR ${BOLT_BUILD_TEST_UTILS})
   add_subdirectory(tests)
 endif()
-if(${BOLT_ENABLE_BENCHMARKS})
+if(${BOLT_BUILD_BENCHMARKS})
   add_subdirectory(benchmark)
 endif()

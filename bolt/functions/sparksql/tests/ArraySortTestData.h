@@ -35,6 +35,9 @@
 #include <vector>
 
 #include "bolt/type/Variant.h"
+#include "bolt/vector/tests/utils/VectorTestBase.h"
+
+using bytedance::bolt::test::emptyArray;
 namespace bytedance::bolt::functions::sparksql {
 
 namespace {
@@ -253,7 +256,7 @@ arrayInput() {
   using A = std::vector<std::optional<int32_t>>;
   return std::vector<std::optional<std::vector<std::optional<A>>>>{
       // Empty.
-      {{}},
+      emptyArray,
       // All nulls.
       {{std::nullopt, std::nullopt}},
       // Same prefix.
@@ -274,7 +277,7 @@ inline std::vector<std::optional<
 arrayAscNullSmallest() {
   using A = std::vector<std::optional<int32_t>>;
   return std::vector<std::optional<std::vector<std::optional<A>>>>{
-      {{}},
+      emptyArray,
       {{std::nullopt, std::nullopt}},
       {{A({1, 3}), A({1, 3, 5}), A({2, 1})}},
       {{std::nullopt, A({1, 3}), A({2, 1})}},
@@ -291,7 +294,7 @@ inline std::vector<std::optional<
 arrayAscNullLargest() {
   using A = std::vector<std::optional<int32_t>>;
   return std::vector<std::optional<std::vector<std::optional<A>>>>{
-      {{}},
+      bytedance::bolt::test::emptyArray,
       {{std::nullopt, std::nullopt}},
       {{A({1, 3}), A({1, 3, 5}), A({2, 1})}},
       {{A({1, 3}), A({2, 1}), std::nullopt}},

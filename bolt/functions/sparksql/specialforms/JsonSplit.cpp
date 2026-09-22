@@ -107,7 +107,7 @@ class JsonSplitExpr : public SpecialForm {
       VectorPtr& result);
 
   template <TypeKind kind>
-  __attribute__((flatten)) void jsonToArray(
+  void jsonToArray(
       const SelectivityVector& rows,
       const BaseVector& input,
       exec::EvalCtx& context,
@@ -544,7 +544,7 @@ typename std::enable_if<kind == TypeKind::ROW>::type parseElement(
 }
 
 template <TypeKind kind>
-__attribute__((flatten)) void jsonToArray_SimdJson(
+void jsonToArray_SimdJson(
     const SelectivityVector& rows,
     const BaseVector& input,
     exec::EvalCtx& context,
@@ -619,7 +619,7 @@ __attribute__((flatten)) void jsonToArray_SimdJson(
 }
 
 template <TypeKind kind>
-__attribute__((flatten)) void jsonToArray_Sonic(
+void jsonToArray_Sonic(
     const SelectivityVector& rows,
     const BaseVector& input,
     exec::EvalCtx& context,
@@ -673,7 +673,7 @@ __attribute__((flatten)) void jsonToArray_Sonic(
 }
 
 template <TypeKind kind>
-__attribute__((flatten)) void JsonSplitExpr::jsonToArray(
+void JsonSplitExpr::jsonToArray(
     const SelectivityVector& rows,
     const BaseVector& input,
     exec::EvalCtx& context,

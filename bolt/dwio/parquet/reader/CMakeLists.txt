@@ -25,7 +25,7 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(
+bolt_add_library(
   bolt_dwio_native_parquet_reader
   Decompression.cpp
   DictionaryFilter.cpp
@@ -38,6 +38,7 @@ add_library(
   ParquetData.cpp
   ParquetFooterCache.cpp
   ParquetReader.cpp
+  ParquetReaderCast.cpp
   ParquetReaderUtil.cpp
   ParquetTypeWithId.cpp
   RepeatedColumnReader.cpp
@@ -46,6 +47,7 @@ add_library(
   Statistics.cpp
   StringColumnReader.cpp
   StructColumnReader.cpp
+  VariantColumnReader.cpp
 )
 
 find_package(Arrow CONFIG REQUIRED)
@@ -55,6 +57,7 @@ target_link_libraries(
   bolt_type
   bolt_dwio_common
   bolt_type
+  bolt_dwio_parquet_encryption
   fmt::fmt
   arrow::arrow
   Snappy::snappy
@@ -64,9 +67,16 @@ target_link_libraries(
   Folly::folly
 )
 
-add_library(bolt_dwio_native_parquet_reader_cli STATIC ParquetReaderCli.cpp)
+if(${BOLT_BUILD_TESTING})
+  add_library(bolt_dwio_native_parquet_reader_cli OBJECT ParquetReaderCli.cpp)
 
-target_link_libraries(
-  bolt_dwio_native_parquet_reader_cli bolt_dwio_parquet_reader bolt_dwio_parquet_arrow_lib
-  bolt_dwio_native_parquet_reader bolt_dwio_common bolt_hdfs
-)
+  target_link_libraries(
+    bolt_dwio_native_parquet_reader_cli
+    bolt_dwio_parquet_reader
+    bolt_dwio_parquet_arrow_lib
+    bolt_dwio_native_parquet_reader
+    bolt_dwio_common
+    bolt_hdfs
+    GTest::gtest
+  )
+endif()

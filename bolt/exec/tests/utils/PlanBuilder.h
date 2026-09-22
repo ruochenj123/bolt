@@ -335,7 +335,7 @@ class PlanBuilder {
     std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
         assignments_;
     std::unordered_map<std::string, std::string> parameters_;
-    bool isFilterPushdownEnabled_;
+    bool isFilterPushdownEnabled_{true};
 
     // produce filters as a FilterNode instead of pushdown.
     bool filtersAsNode_{false};
@@ -1122,7 +1122,7 @@ class PlanBuilder {
     return planNode_;
   }
 
-  /// Return tha latest plan node wrapped in core::PlanFragment struct.
+  /// Return the latest plan node wrapped in core::PlanFragment struct.
   core::PlanFragment planFragment() const {
     return core::PlanFragment{planNode_};
   }

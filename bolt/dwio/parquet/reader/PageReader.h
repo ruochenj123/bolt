@@ -30,6 +30,9 @@
 
 #pragma once
 
+#include <folly/lang/Bits.h>
+#include <deque>
+
 #include "bolt/common/compression/Compression.h"
 #include "bolt/dwio/common/BitConcatenation.h"
 #include "bolt/dwio/common/DirectDecoder.h"
@@ -37,27 +40,58 @@
 #include "bolt/dwio/common/compression/Compression.h"
 #include "bolt/dwio/parquet/reader/BooleanDecoder.h"
 #include "bolt/dwio/parquet/reader/DeltaBpDecoder.h"
+#include "bolt/dwio/parquet/reader/DeltaByteArrayDecoder.h"
 #include "bolt/dwio/parquet/reader/ParquetTypeWithId.h"
 #include "bolt/dwio/parquet/reader/RleBpDataDecoder.h"
 #include "bolt/dwio/parquet/reader/StringDecoder.h"
 
+#include "bolt/dwio/parquet/encryption/EncryptionInternal.h"
+#include "bolt/dwio/parquet/encryption/InternalFileDecryptor.h"
+
 #include <arrow/util/rle_encoding.h>
 namespace bytedance::bolt::parquet {
+constexpr int16_t kNonPageOrdinal = static_cast<int16_t>(-1);
+constexpr uint32_t kDefaultMaxPageHeaderSize = 16 * 1024 * 1024;
+struct PageReaderTestPeer;
+
+struct CryptoContext {
+  CryptoContext(
+      bool startWithDictionaryPage,
+      int16_t rowGroupOrdinal,
+      int16_t columnOrdinal,
+      std::shared_ptr<Decryptor> meta,
+      std::shared_ptr<Decryptor> data)
+      : startDecryptWithDictionaryPage(startWithDictionaryPage),
+        rowGroupOrdinal(rowGroupOrdinal),
+        columnOrdinal(columnOrdinal),
+        metaDecryptor(std::move(meta)),
+        dataDecryptor(std::move(data)) {}
+  CryptoContext() {}
+  bool startDecryptWithDictionaryPage = false;
+  int16_t rowGroupOrdinal = -1;
+  int16_t columnOrdinal = -1;
+  std::shared_ptr<Decryptor> metaDecryptor;
+  std::shared_ptr<Decryptor> dataDecryptor;
+};
 
 /// Manages access to pages inside a ColumnChunk. Interprets page headers and
 /// encodings and presents the combination of pages and encoded values as a
 /// continuous stream accessible via readWithVisitor().
 class PageReader {
  public:
+  ~PageReader();
+
   PageReader(
       std::unique_ptr<dwio::common::SeekableInputStream> stream,
       memory::MemoryPool& pool,
       ParquetTypeWithIdPtr fileType,
       thrift::CompressionCodec::type codec,
       int64_t chunkSize,
-      dwio::common::RuntimeStatistics* statis)
+      dwio::common::RuntimeStatistics* statis,
+      std::unique_ptr<dwio::common::SeekableInputStream> repDefStream = nullptr)
       : pool_(pool),
         inputStream_(std::move(stream)),
+        repDefInputStream_(std::move(repDefStream)),
         type_(std::move(fileType)),
         maxRepeat_(type_->maxRepeat_),
         maxDefine_(type_->maxDefine_),
@@ -69,6 +103,7 @@ class PageReader {
         nullConcatenation_(pool_),
         statis_(statis) {
     type_->makeLevelInfo(leafInfo_);
+    pageOrdinal_ = 0;
   }
 
   // This PageReader constructor is for unit test only.
@@ -86,7 +121,9 @@ class PageReader {
         chunkSize_(chunkSize),
         definitionLevels_(&pool_),
         repetitionLevels_(&pool_),
-        nullConcatenation_(pool_) {}
+        nullConcatenation_(pool_) {
+    pageOrdinal_ = 0;
+  }
 
   /// Advances 'numRows' top level rows.
   void skip(int64_t numRows);
@@ -109,7 +146,16 @@ class PageReader {
       int32_t maxItems,
       int32_t* FOLLY_NULLABLE lengths,
       uint64_t* FOLLY_NULLABLE nulls,
-      int32_t nullsStartIndex) const;
+      int64_t nullsStartIndex) const;
+
+  bool getListLengthsAndStructNulls(
+      const arrow::LevelInfo& listInfo,
+      const arrow::LevelInfo& structInfo,
+      int32_t begin,
+      int32_t end,
+      arrow::ValidityBitmapInputOutput* listBits,
+      int32_t* FOLLY_NONNULL lengths,
+      arrow::ValidityBitmapInputOutput* structBits) const;
 
   /// Applies 'visitor' to values in the ColumnChunk of 'this'. The
   /// operation to perform and The operand rows are given by
@@ -146,15 +192,60 @@ class PageReader {
     return encoding_ == thrift::Encoding::DELTA_BINARY_PACKED;
   }
 
+  bool isDeltaByteArray() const {
+    return encoding_ == thrift::Encoding::DELTA_BYTE_ARRAY;
+  }
+
   /// Returns the range of repdefs for the top level rows covered by the last
   /// decoderepDefs().
   std::pair<int32_t, int32_t> repDefRange() const {
     return {repDefBegin_, repDefEnd_};
   }
 
+  int32_t repDefOutputSize(LevelMode mode, const arrow::LevelInfo& info) const;
+
   // Parses the PageHeader at 'inputStream_', and move the bufferStart_ and
   // bufferEnd_ to the corresponding positions.
   thrift::PageHeader readPageHeader();
+
+  CryptoContext& getCryptoContext() {
+    return cryptoCtx_;
+  }
+  void initDecryption() {
+    if (cryptoCtx_.dataDecryptor != nullptr) {
+      dataPageAad_ = encryption::createModuleAad(
+          cryptoCtx_.dataDecryptor->fileAad(),
+          encryption::kDataPage,
+          cryptoCtx_.rowGroupOrdinal,
+          cryptoCtx_.columnOrdinal,
+          kNonPageOrdinal);
+    }
+    if (cryptoCtx_.metaDecryptor != nullptr) {
+      dataPageHeaderAad_ = encryption::createModuleAad(
+          cryptoCtx_.metaDecryptor->fileAad(),
+          encryption::kDataPageHeader,
+          cryptoCtx_.rowGroupOrdinal,
+          cryptoCtx_.columnOrdinal,
+          kNonPageOrdinal);
+    }
+  }
+  void updateDecryption(
+      const std::shared_ptr<Decryptor>& decryptor,
+      int8_t moduleType,
+      std::string* pageAad) {
+    if (cryptoCtx_.startDecryptWithDictionaryPage) {
+      std::string aad = encryption::createModuleAad(
+          decryptor->fileAad(),
+          moduleType,
+          cryptoCtx_.rowGroupOrdinal,
+          cryptoCtx_.columnOrdinal,
+          kNonPageOrdinal);
+      decryptor->UpdateAad(aad);
+    } else {
+      encryption::quickUpdatePageAad(pageOrdinal_, pageAad);
+      decryptor->UpdateAad(*pageAad);
+    }
+  }
 
   void prepareDictionary(const thrift::PageHeader& pageHeader);
 
@@ -177,6 +268,10 @@ class PageReader {
 
   void setParquetRepDefMemoryLimit(int32_t memlimit) {
     repDefMemoryLimit_ = memlimit;
+  }
+
+  void setParquetRepDefStreamingWindowSize(int32_t size) {
+    repDefStreamingWindowSize_ = size == 0 ? 0 : std::max(size, 1);
   }
 
  private:
@@ -225,16 +320,29 @@ class PageReader {
       const thrift::PageHeader& pageHeader,
       int64_t row,
       const bool keepRepDefRawData);
+  bool tryPrepareDataPageV1RepDefOnly(
+      const thrift::PageHeader& pageHeader,
+      int32_t compressedLen,
+      const bool keepRepDefRawData);
+  bool tryDecompressDataPageV1RepDefPrefix(
+      const char* FOLLY_NONNULL compressedData,
+      uint32_t compressedSize,
+      uint32_t uncompressedSize,
+      BufferPtr& decompressedData,
+      const char* FOLLY_NONNULL& pageData);
   void prepareDataPageV2(
       const thrift::PageHeader& pageHeader,
       int64_t row,
       const bool keepRepDefRawData);
   void makeDecoder();
+  BufferPtr takeOwnedPageBuffer(const char* FOLLY_NULLABLE data, size_t size);
 
   // For a non-top level leaf, reads the defs and sets 'leafNulls_' and
   // 'numRowsInPage_' accordingly. This is used for non-top level leaves when
   // 'hasChunkRepDefs_' is false.
   void readPageDefLevels();
+
+  int32_t appendLeafNullsFromLevels(int32_t begin, int32_t end);
 
   // Returns a pointer to contiguous space for the next 'size' bytes
   // from current position. Copies data into 'copy' if the range
@@ -251,7 +359,7 @@ class PageReader {
 
   template <typename T>
   T readField(const char* FOLLY_NONNULL& ptr) {
-    T data = *reinterpret_cast<const T*>(ptr);
+    T data = folly::loadUnaligned<T>(ptr);
     ptr += sizeof(T);
     return data;
   }
@@ -345,6 +453,9 @@ class PageReader {
         nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor);
         auto dictVisitor = visitor.toStringDictionaryColumnVisitor();
         dictionaryIdDecoder_->readWithVisitor<true>(nulls, dictVisitor);
+      } else if (isDeltaByteArray()) {
+        nullsFromFastPath = false;
+        deltaByteArrDecoder_->readWithVisitor<true>(nulls, visitor);
       } else {
         nullsFromFastPath = false;
         stringDecoder_->readWithVisitor<true>(nulls, visitor);
@@ -353,6 +464,8 @@ class PageReader {
       if (isDictionary()) {
         auto dictVisitor = visitor.toStringDictionaryColumnVisitor();
         dictionaryIdDecoder_->readWithVisitor<false>(nullptr, dictVisitor);
+      } else if (isDeltaByteArray()) {
+        deltaByteArrDecoder_->readWithVisitor<false>(nulls, visitor);
       } else {
         stringDecoder_->readWithVisitor<false>(nulls, visitor);
       }
@@ -380,23 +493,60 @@ class PageReader {
   // Returns the number of passed rows/values gathered by
   // 'reader'. Only numRows() is set for a filter-only case, only
   // numValues() is set for a non-filtered case.
-  template <bool hasFilter>
-  static int32_t numRowsInReader(
-      const dwio::common::SelectiveColumnReader& reader) {
+  template <bool hasFilter, bool hasHook>
+  static int32_t numValuesRead(
+      const dwio::common::SelectiveColumnReader& reader,
+      int32_t numPageRowsRead) {
+    if (hasHook) {
+      return numPageRowsRead;
+    }
     if (hasFilter) {
       return reader.numRows();
-    } else {
-      return reader.numValues();
     }
+    return reader.numValues();
   }
 
   void preloadPageRepDefs(const bool keepRepDefRawData);
   void loadMoreRepDefs();
+  void decodeStreamingRepDefs(int32_t numTopLevelRows);
+  bool loadNextStreamingRepDefPage();
+  bool consumeStreamingRepDefScratch(
+      int32_t topLevelRowsNeeded,
+      int32_t& topLevelRowsSeen);
+  thrift::PageHeader readStreamingPageHeader();
+  const char* FOLLY_NONNULL readStreamingBytes(int32_t size, BufferPtr& copy);
+  void skipStreamingBytes(uint64_t size);
+  void initializeStreamingOutputs();
+  void resetStreamingOutputs();
+  void appendStreamingLevels(
+      const int16_t* FOLLY_NONNULL definitionLevels,
+      const int16_t* FOLLY_NONNULL repetitionLevels,
+      int32_t numLevels);
+  void finishStreamingOutputs();
+  bool usesStreamingRepDefs() const {
+    return repDefStreamingWindowSize_ > 0 && repDefInputStream_ != nullptr;
+  }
+  int32_t streamingOutputIndex(LevelMode mode, const arrow::LevelInfo& info)
+      const;
+  int32_t countLeavesInDefinitionLevels(
+      const uint8_t* FOLLY_NONNULL definitionLevels,
+      int32_t definitionLevelsSize,
+      int32_t numLevels) const;
+  void compactConsumedLeafNulls();
   void decodeRepDefsFromBuffer();
+  int32_t appendLeafNulls(
+      const int16_t* FOLLY_NONNULL definitionLevels,
+      int32_t numLevels);
+
+  struct StreamingRepDefState;
+  struct StreamingRepDefStateDeleter {
+    void operator()(StreamingRepDefState* state) const;
+  };
 
   memory::MemoryPool& pool_;
 
   std::unique_ptr<dwio::common::SeekableInputStream> inputStream_;
+  std::unique_ptr<dwio::common::SeekableInputStream> repDefInputStream_;
   ParquetTypeWithIdPtr type_;
   const int32_t maxRepeat_;
   const int32_t maxDefine_;
@@ -425,7 +575,8 @@ class PageReader {
   int32_t pageIndex_{-1};
 
   // Number of leaf values in each data page of column chunk.
-  std::vector<int32_t> numLeavesInPage_;
+  std::deque<int32_t> numLeavesInPage_;
+  int32_t numLeavesInPageBase_{0};
 
   // First position in '*levels_' for the range of last decodeRepDefs().
   int32_t repDefBegin_{0};
@@ -441,7 +592,9 @@ class PageReader {
   raw_vector<int16_t> repetitionLevels_;
 
   // Number of valid bits in 'leafNulls_'
-  int32_t leafNullsSize_{0};
+  int64_t leafNullsSize_{0};
+
+  bool leafNullsAllValidPrefix_{true};
 
   // Number of leaf nulls read.
   int64_t numLeafNullsConsumed_{0};
@@ -517,7 +670,7 @@ class PageReader {
   int32_t rowNumberBias_{0};
 
   // Manages concatenating null flags read from multiple pages. If a
-  // readWithVisitor is contined in one page, the visitor places the
+  // readWithVisitor is continued in one page, the visitor places the
   // nulls in the reader. If many pages are covered, some with and
   // some without nulls, we must make a a concatenated null flags to
   // return to the caller.
@@ -535,16 +688,32 @@ class PageReader {
   std::unique_ptr<StringDecoder> stringDecoder_;
   std::unique_ptr<BooleanDecoder> booleanDecoder_;
   std::unique_ptr<DeltaBpDecoder> deltaBpDecoder_;
+  std::unique_ptr<DeltaByteArrayDecoder> deltaByteArrDecoder_;
   bool decoderSet_{false};
   // Add decoders for other encodings here.
 
-  // preload undecoded RepDefs
+  // decryptor
+  void decryptPageData(int32_t& compressedLen);
+  CryptoContext cryptoCtx_;
+  std::string dataPageAad_;
+  std::string dataPageHeaderAad_;
+  BufferPtr decryptionBuffer_;
+  int32_t pageOrdinal_;
+
   std::list<raw_vector<char>> preloadedRepDefs_;
   int32_t repDefMemoryLimit_{16L << 20};
   int64_t totalRefDefBytes_{0};
   int32_t decodeRepDefPageCount_{10};
+  int32_t repDefStreamingWindowSize_{2 * 1024};
+  std::unique_ptr<StreamingRepDefState, StreamingRepDefStateDeleter>
+      streamingRepDef_;
 
   dwio::common::RuntimeStatistics* statis_{nullptr};
+  // Tracks output count for the current physical page. -1 means there is no
+  // active page being accounted.
+  int32_t currentPageNumValues_{-1};
+
+  friend struct PageReaderTestPeer;
 };
 
 FOLLY_ALWAYS_INLINE dwio::common::compression::CompressionOptions
@@ -569,6 +738,9 @@ void PageReader::readWithVisitor(Visitor& visitor) {
       !std::is_same_v<typename Visitor::FilterType, common::AlwaysTrue>;
   constexpr bool filterOnly =
       std::is_same_v<typename Visitor::Extract, dwio::common::DropValues>;
+  constexpr bool hasHook = Visitor::kHasHook;
+  static_assert(
+      !(hasFilter && hasHook), "hasFilter and hasHook cannot both be true");
   bool mayProduceNulls = !filterOnly && visitor.allowNulls();
   auto rows = visitor.rows();
   auto numRows = visitor.numRows();
@@ -576,17 +748,34 @@ void PageReader::readWithVisitor(Visitor& visitor) {
   startVisit(folly::Range<const vector_size_t*>(rows, numRows));
   rowsCopy_ = &visitor.rowsCopy();
   folly::Range<const vector_size_t*> pageRows;
+  int32_t numPageRowsRead = 0;
   const uint64_t* nulls = nullptr;
   bool isMultiPage = false;
   while (rowsForPage(reader, hasFilter, mayProduceNulls, pageRows, nulls)) {
     bool nullsFromFastPath = false;
-    int32_t numValuesBeforePage = numRowsInReader<hasFilter>(reader);
+    const int32_t numValuesBeforePage =
+        numValuesRead<hasFilter, hasHook>(reader, numPageRowsRead);
     visitor.setNumValuesBias(numValuesBeforePage);
     visitor.setRows(pageRows);
     {
       NanosecondTimer timer(
           FOLLY_LIKELY(statis_ != nullptr) ? &statis_->decodeTimeNs : nullptr);
       callDecoder(nulls, nullsFromFastPath, visitor);
+    }
+    const auto numValuesFromPage =
+        numValuesRead<hasFilter, hasHook>(reader, numPageRowsRead) -
+        numValuesBeforePage;
+    const auto processedPageValues =
+        hasHook ? static_cast<int32_t>(pageRows.size()) : numValuesFromPage;
+    if (currentPageNumValues_ >= 0) {
+      currentPageNumValues_ += processedPageValues;
+    }
+    if (encoding_ == thrift::Encoding::DELTA_BINARY_PACKED &&
+        deltaBpDecoder_->validValuesCount() == 0) {
+      BOLT_DCHECK(
+          deltaBpDecoder_->bufferStart() == pageData_ + encodedDataSize_,
+          "Once all data in the delta binary packed decoder has been read, "
+          "its buffer ptr should be moved to the end of the page.");
     }
     if (currentVisitorRow_ < numVisitorRows_ || isMultiPage) {
       if (mayProduceNulls) {
@@ -599,22 +788,20 @@ void PageReader::readWithVisitor(Visitor& visitor) {
           nullConcatenation_.reset(multiPageNulls_);
         }
         if (!nulls) {
-          nullConcatenation_.appendOnes(
-              numRowsInReader<hasFilter>(reader) - numValuesBeforePage);
+          nullConcatenation_.appendOnes(numValuesFromPage);
         } else if (reader.returnReaderNulls()) {
           // Nulls from decoding go directly to result.
           nullConcatenation_.append(
               reader.nullsInReadRange()->template as<uint64_t>(),
               0,
-              numRowsInReader<hasFilter>(reader) - numValuesBeforePage);
+              numValuesFromPage);
         } else {
           // Add the nulls produced from the decoder to the result.
           auto firstNullIndex = nullsFromFastPath ? 0 : numValuesBeforePage;
           nullConcatenation_.append(
               reader.mutableNulls(0),
               firstNullIndex,
-              firstNullIndex + numRowsInReader<hasFilter>(reader) -
-                  numValuesBeforePage);
+              firstNullIndex + numValuesFromPage);
         }
       }
       isMultiPage = true;
@@ -626,6 +813,14 @@ void PageReader::readWithVisitor(Visitor& visitor) {
     // visit.
     if (hasFilter && rowNumberBias_) {
       reader.offsetOutputRows(numValuesBeforePage, rowNumberBias_);
+    }
+    numPageRowsRead += pageRows.size();
+    if (currentPageNumValues_ >= 0 &&
+        firstUnvisited_ == rowOfPage_ + numRowsInPage_) {
+      if (currentPageNumValues_ == 0 && FOLLY_LIKELY(statis_ != nullptr)) {
+        ++statis_->filteredOutPages;
+      }
+      currentPageNumValues_ = -1;
     }
   }
   if (isMultiPage) {

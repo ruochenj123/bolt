@@ -25,49 +25,17 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-set(CMAKE_WINDOW_TEST_LINK_LIBRARIES
-    bolt_core
-    bolt_exec
-    bolt_exec_test_lib
-    bolt_functions_window_test_lib
-    bolt_vector_fuzzer
-    bolt_vector_test_lib
-    bolt_window
-    gflags::gflags
-    GTest::gtest
-    GTest::gtest_main
-)
-
-set(CMAKE_WINDOW_TEST_MAIN_FILES Main.cpp)
-
-add_executable(bolt_windows_rank_test ${CMAKE_WINDOW_TEST_MAIN_FILES} NtileTest.cpp RankTest.cpp)
-
-add_test(
-  NAME bolt_windows_rank_test
-  COMMAND bolt_windows_rank_test
-  WORKING_DIRECTORY .
-)
-
-target_link_libraries(bolt_windows_rank_test ${CMAKE_WINDOW_TEST_LINK_LIBRARIES})
+set(CMAKE_WINDOW_TEST_LINK_LIBRARIES bolt_gtest_main)
 
 add_executable(
-  bolt_windows_value_test ${CMAKE_WINDOW_TEST_MAIN_FILES} LeadLagTest.cpp NthValueTest.cpp
+  bolt_windows_test
+  NtileTest.cpp
+  RankTest.cpp
+  LeadLagTest.cpp
+  NthValueTest.cpp
+  AggregateWindowTest.cpp
 )
 
-add_test(
-  NAME bolt_windows_value_test
-  COMMAND bolt_windows_value_test
-  WORKING_DIRECTORY .
-)
+add_test(NAME bolt_windows_test COMMAND bolt_windows_test WORKING_DIRECTORY .)
 
-target_link_libraries(bolt_windows_value_test ${CMAKE_WINDOW_TEST_LINK_LIBRARIES})
-
-add_executable(bolt_windows_agg_test ${CMAKE_WINDOW_TEST_MAIN_FILES} AggregateWindowTest.cpp)
-
-add_test(
-  NAME bolt_windows_agg_test
-  COMMAND bolt_windows_agg_test
-  WORKING_DIRECTORY .
-)
-
-target_link_libraries(bolt_windows_agg_test ${CMAKE_WINDOW_TEST_LINK_LIBRARIES})
+target_link_libraries(bolt_windows_test ${CMAKE_WINDOW_TEST_LINK_LIBRARIES})

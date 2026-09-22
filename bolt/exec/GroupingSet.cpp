@@ -123,6 +123,10 @@ GroupingSet::GroupingSet(
   }
 
   for (auto& aggregate : aggregates_) {
+    if (!hasExternalMemoryAccumulators_ &&
+        aggregate.function->accumulatorUsesExternalMemory()) {
+      hasExternalMemoryAccumulators_ = true;
+    }
     if (aggregate.distinct) {
       BOLT_USER_CHECK(
           !isPartial_,
@@ -200,6 +204,7 @@ void GroupingSet::addInput(const RowVectorPtr& input, bool mayPushdown) {
         remainingInput_ = input;
         firstRemainingRow_ = numRows;
         remainingMayPushdown_ = mayPushdown;
+        mayPushdown = false;
         break;
       }
     }
@@ -246,7 +251,7 @@ void GroupingSet::addInputForActiveRows(
   }
   ensureInputFits(input);
 
-  TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::exec::GroupingSet::addInputForActiveRows", this);
 
   if (!bypassProbeHT_) { // probing time
@@ -471,7 +476,19 @@ void GroupingSet::initializeGlobalAggregation() {
   // Here we always make space for a row size since we only have one row and no
   // RowContainer.  The whole row is allocated to guarantee that alignment
   // requirements of all aggregate functions are satisfied.
-  int32_t rowSizeOffset = bits::nbytes(aggregates_.size());
+
+  // Allocate space for the null and initialized flags.
+  size_t numAggregates = aggregates_.size();
+  if (sortedAggregations_) {
+    numAggregates++;
+  }
+  for (const auto& aggregation : distinctAggregations_) {
+    if (aggregation != nullptr) {
+      numAggregates++;
+    }
+  }
+
+  int32_t rowSizeOffset = bits::nbytes(numAggregates);
   int32_t offset = rowSizeOffset + sizeof(int32_t);
   int32_t nullOffset = 0;
   int32_t alignment = 1;
@@ -504,6 +521,7 @@ void GroupingSet::initializeGlobalAggregation() {
     offset = bits::roundUp(offset, accumulator.alignment());
 
     sortedAggregations_->setAllocator(&stringAllocator_);
+    BOLT_DCHECK_LT(RowContainer::nullByte(nullOffset), rowSizeOffset);
     sortedAggregations_->setOffsets(
         offset,
         RowContainer::nullByte(nullOffset),
@@ -561,6 +579,7 @@ void GroupingSet::initializeGlobalAggregation() {
 void GroupingSet::addGlobalAggregationInput(
     const RowVectorPtr& input,
     bool mayPushdown) {
+  NanosecondTimer funcTimer(&stats_.aggFunctionTimeNs);
   initializeGlobalAggregation();
 
   auto numRows = input->size();
@@ -759,7 +778,7 @@ bool GroupingSet::getOutput(
     int32_t maxOutputBytes,
     RowContainerIterator& iterator,
     RowVectorPtr& result) {
-  TestValue::adjust("bytedance::bolt::exec::GroupingSet::getOutput", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::GroupingSet::getOutput", this);
   NanosecondTimer timer(&stats_.aggOutputTimeNs);
   if (isGlobal_) {
     return getGlobalAggregationOutput(iterator, result);
@@ -774,8 +793,23 @@ bool GroupingSet::getOutput(
   }
   BOLT_CHECK(!isDistinct());
 
+  // Keep this performance-sensitive scratch buffer on the stack. GCC and
+  // Clang support VLAs as an extension; suppress only the portability warning
+  // for this declaration to preserve the existing runtime behavior.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wvla-cxx-extension"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wvla"
+#endif
   // @lint-ignore CLANGTIDY
   char* groups[maxOutputRows];
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
   const int32_t numGroups = table_
       ? table_->rows()->listRows(
             &iterator, maxOutputRows, maxOutputBytes, groups)
@@ -1086,12 +1120,13 @@ void GroupingSet::spill() {
     BOLT_DCHECK(pool_.trackUsage());
     BOLT_CHECK_EQ(numDistinctSpilledFiles_, 0);
     BOLT_CHECK_GT(rows->probedFlagOffset(), 0);
+    const auto sortingKeys = SpillState::makeSortingKeys(
+        std::vector<CompareFlags>(rows->keyTypes().size()));
     spiller_ = std::make_unique<Spiller>(
         Spiller::Type::kAggregateInput,
         rows,
         makeSpillType(),
-        rows->keyTypes().size(),
-        std::vector<CompareFlags>(),
+        sortingKeys,
         spillConfig_);
     spiller_->setSpillConfig(spillConfig_);
     BOLT_CHECK_EQ(spiller_->state().maxPartitions(), 1);
@@ -1186,6 +1221,7 @@ bool GroupingSet::getOutputWithSpill(
           false,
           true,
           false,
+          false /*useListRowIndex*/,
           &pool_,
           table_->rows()->stringAllocatorShared());
 
@@ -2022,6 +2058,7 @@ void GroupingSet::abandonPartialAggregation() {
       false,
       true,
       false,
+      false /*useListRowIndex*/,
       &pool_,
       table_->rows()->stringAllocatorShared());
   initializeAggregates(aggregates_, *intermediateRows_, true);
@@ -2134,10 +2171,24 @@ void GroupingSet::toIntermediate(
 }
 
 std::optional<int64_t> GroupingSet::estimateOutputRowSize() const {
-  if (table_ == nullptr) {
+  if (table_ == nullptr || table_->numDistinct() == 0) {
     return std::nullopt;
   }
-  return table_->rows()->estimateRowSize();
+
+  const auto rowSizeFromContainer = table_->rows()->estimateRowSize();
+  if (!hasExternalMemoryAccumulators_) {
+    return rowSizeFromContainer;
+  }
+
+  // RowContainer::estimateRowSize() only accounts for RowContainer's row blocks
+  // and HashStringAllocator (e.g. strings). For aggregates which allocate state
+  // directly from MemoryPool (external memory), incorporate pool usage per
+  // group to avoid under-estimation and too large output batches.
+  const int64_t rowSizeFromPool = std::max<int64_t>(
+      1, static_cast<int64_t>(pool_.currentBytes() / table_->numDistinct()));
+  const int64_t rowSize =
+      std::max<int64_t>(rowSizeFromPool, rowSizeFromContainer.value_or(0));
+  return rowSize;
 }
 
 void GroupingSet::convertCompositeInput(

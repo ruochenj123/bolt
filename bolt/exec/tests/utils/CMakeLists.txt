@@ -25,25 +25,28 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_temp_path TempDirectoryPath.cpp TempFilePath.cpp)
+bolt_add_library(bolt_temp_path TempDirectoryPath.cpp TempFilePath.cpp)
 
 target_link_libraries(bolt_temp_path bolt_exception)
 
-add_library(
+bolt_add_library(
   bolt_exec_test_lib
   ArbitratorTestUtil.cpp
   AssertQueryBuilder.cpp
   Cursor.cpp
   HiveConnectorTestBase.cpp
   LocalExchangeSource.cpp
+  MemoryHogOperator.cpp
   OperatorTestBase.cpp
   PlanBuilder.cpp
   PortUtil.cpp
   QueryAssertions.cpp
   RowBasedSerde.cpp
   SumNonPODAggregate.cpp
-  TpchQueryBuilder.cpp
+  TpcdsPlanLoader.cpp
   TpcdsQueryBuilder.cpp
+  TpchQueryBuilder.cpp
+  TpcdsHybridQueryBuilder.cpp
   VectorTestUtil.cpp
 )
 
@@ -84,7 +87,11 @@ endif()
 if(${BOLT_ENABLE_CUDF})
   target_compile_definitions(bolt_exec_test_lib PRIVATE BOLT_HAS_CUDF=1)
   target_include_directories(bolt_exec_test_lib SYSTEM PRIVATE ${cudf_INCLUDE_DIRS})
-  target_link_libraries(bolt_exec_test_lib bolt_cudf_exec bolt_cudf_test_util)
+  target_link_libraries(
+    bolt_exec_test_lib
+    bolt_cudf_exec
+    bolt_cudf_test_util
+  )
 endif()
 
 # WHOLE_ARCHIVE consistency: bolt_process appears both plain and feature'd in this

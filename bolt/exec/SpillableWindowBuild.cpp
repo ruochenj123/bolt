@@ -586,8 +586,7 @@ SpillableWindowBuild<needSort>::nextPartition() {
     BOLT_CHECK_NOT_NULL(merges_[currentPartition_]);
     std::vector<std::deque<VectorPtr>> aggregateResults;
     for (const auto& func : windowFunctions_) {
-      aggregateResults.emplace_back(
-          std::move(func->getAggregateResultVector()));
+      aggregateResults.emplace_back(func->getAggregateResultVector());
       func->cleanUp();
     }
     if (rowBasedSpillSortMerger_) {
@@ -602,7 +601,8 @@ SpillableWindowBuild<needSort>::nextPartition() {
           spillers_[currentPartition_]->stats().spilledRows,
           outputType_,
           &inputChannels_,
-          pool_);
+          pool_,
+          enableJit_);
     } else {
       return std::make_shared<SpilledWindowPartition<RowFormat::kRowContainer>>(
           data_.get(),
@@ -614,14 +614,19 @@ SpillableWindowBuild<needSort>::nextPartition() {
           spillers_[currentPartition_]->stats().spilledRows,
           outputType_,
           &inputChannels_,
-          pool_);
+          pool_,
+          enableJit_);
     }
   } else if (rowBasedSpillSortMerger_) {
     return std::make_shared<WindowPartitionImpl<RowFormat::kSerializedRows>>(
-        data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+        data_.get(),
+        partition,
+        inversedInputChannels_,
+        sortKeyInfo_,
+        enableJit_);
   }
   return std::make_shared<WindowPartitionImpl<RowFormat::kRowContainer>>(
-      data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+      data_.get(), partition, inversedInputChannels_, sortKeyInfo_, enableJit_);
 }
 
 template <bool needSort>
@@ -633,10 +638,14 @@ SpillableWindowBuild<needSort>::createPartialPartition() {
   auto partition = folly::Range(inputRows_.data(), partitionSize);
   if (rowBasedSpillSortMerger_) {
     return std::make_unique<WindowPartitionImpl<RowFormat::kSerializedRows>>(
-        data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+        data_.get(),
+        partition,
+        inversedInputChannels_,
+        sortKeyInfo_,
+        enableJit_);
   }
   return std::make_unique<WindowPartitionImpl<RowFormat::kRowContainer>>(
-      data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+      data_.get(), partition, inversedInputChannels_, sortKeyInfo_, enableJit_);
 }
 
 template <bool needSort>

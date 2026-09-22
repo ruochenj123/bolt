@@ -32,7 +32,8 @@
 
 #include "bolt/exec/ContainerRowSerde.h"
 #include "bolt/exec/Operator.h"
-#include "bolt/exec/SortBuffer.h"
+#include "bolt/exec/RowContainer.h"
+#include "bolt/exec/SortBufferBase.h"
 #include "bolt/exec/Spiller.h"
 
 namespace bytedance::bolt::exec {
@@ -81,7 +82,7 @@ class OrderBy : public Operator {
 
   bool canReclaim() const override {
     // sortBuffer_ may be released
-    return Operator::canReclaim() && sortBuffer_;
+    return Operator::canReclaim() && sortBuffer_ && sortBuffer_->canReclaim();
   }
 
   void reclaim(uint64_t targetBytes, memory::MemoryReclaimer::Stats& stats)
@@ -96,8 +97,9 @@ class OrderBy : public Operator {
   void recordSpillReadStats();
   void recordSortStats();
 
-  std::unique_ptr<SortBuffer> sortBuffer_;
+  std::unique_ptr<SortBufferBase> sortBuffer_;
+  common::SpillStats recordedSpillStats_;
   bool finished_ = false;
-  uint32_t maxOutputRows_;
+  vector_size_t maxOutputRows_;
 };
 } // namespace bytedance::bolt::exec

@@ -27,6 +27,13 @@ class JsonToMapTest : public SparkFunctionBaseTest {
         expr, makeRowVector({makeFlatVector<StringView>({inputs[0]})}));
   }
 
+  void setJsonToMapEscapeControlChars(bool escapeControlChars) {
+    auto config = queryCtx_->queryConfig().rawConfigsCopy();
+    config[core::QueryConfig::kJsonToMapEscapeControlChars] =
+        std::to_string(escapeControlChars);
+    queryCtx_->testingOverrideConfigUnsafe(std::move(config));
+  }
+
   void testJsonToMap(
       const std::vector<StringView>& inputs,
       const std::vector<std::pair<StringView, std::optional<StringView>>>&
@@ -108,6 +115,21 @@ TEST_F(JsonToMapTest, basic) {
   }
 
   {
+    // Valid non-object JSON should return empty map, same as hiveudf.
+    // JSON null
+    testJsonToMap({"null"}, {});
+    // JSON number
+    testJsonToMap({"123"}, {});
+    // JSON boolean
+    testJsonToMap({"true"}, {});
+    testJsonToMap({"false"}, {});
+    // JSON string
+    testJsonToMap({R"("hello")"}, {});
+    // JSON array
+    testJsonToMap({R"([1,2,3])"}, {});
+  }
+
+  {
     // json parse failed, return null
     auto result = evaluateJsonToMap({R"({"a": [1, 223,      23], "a" 1})"});
     auto expectVector =
@@ -124,6 +146,80 @@ TEST_F(JsonToMapTest, basic) {
     auto expectVector = makeNullableMapVector<StringView, StringView>(
         {std::nullopt, {{{"a", "1"}, {"b", "2"}, {"c", "3"}}}});
     assertEqualVectors(expectVector, result);
+  }
+}
+
+TEST_F(JsonToMapTest, unescapedControlChars) {
+  // Strict JSON requires control chars (\x00-\x1f) inside strings to be
+  // escaped, but the reference Hive UDF (backed by com.jsoniter) accepts raw
+  // control chars and keeps them verbatim in the values. json_to_map must
+  // match that lenient behavior instead of returning SQL NULL.
+  setJsonToMapEscapeControlChars(true);
+  {
+    // Raw newlines embedded in several values; they must be preserved.
+    StringView json =
+        StringView("{\"a\":\"x\ny\",\"b\":\"plain\",\"c\":\"end\n\"}");
+    testJsonToMap(
+        {json},
+        {{"a", StringView("x\ny")},
+         {"b", "plain"},
+         {"c", StringView("end\n")}});
+  }
+
+  {
+    // Other raw control chars (tab, carriage return) are likewise preserved.
+    StringView json = StringView("{\"k\":\"a\tb\rc\"}");
+    testJsonToMap({json}, {{"k", StringView("a\tb\rc")}});
+  }
+
+  {
+    // Backspace/form-feed and a generic control char (no named escape) are all
+    // accepted and preserved verbatim.
+    StringView json = StringView("{\"k\":\"\b\f\x01\x1f\"}");
+    testJsonToMap({json}, {{"k", StringView("\b\f\x01\x1f")}});
+  }
+
+  {
+    // A raw control char in the key is also accepted.
+    StringView json = StringView("{\"key\nname\":\"v\"}");
+    testJsonToMap({json}, {{StringView("key\nname"), "v"}});
+  }
+}
+
+TEST_F(JsonToMapTest, unescapedControlCharsRetryConfig) {
+  const StringView json = StringView("{\"k\":\"a\nb\"}");
+  setJsonToMapEscapeControlChars(false);
+  auto result = evaluateJsonToMap({json});
+  auto expected = makeNullableMapVector<StringView, StringView>({std::nullopt});
+  assertEqualVectors(expected, result);
+
+  setJsonToMapEscapeControlChars(true);
+  testJsonToMap({json}, {{"k", StringView("a\nb")}});
+}
+
+TEST_F(JsonToMapTest, numericValuesPreserveOriginalText) {
+  // Numeric values must be returned as their original JSON token, matching the
+  // Hive reference UDF (com.jsoniter). They must NOT be round-tripped through a
+  // double (which loses precision and reformats) nor rejected when the value is
+  // out of double range.
+  {
+    // Large integer that does not fit in a double: must keep all digits.
+    testJsonToMap(
+        {R"({"v":6222000000000000000001125652734})"},
+        {{"v", "6222000000000000000001125652734"}});
+  }
+  {
+    // High-precision decimal: must not be rounded to the nearest double.
+    testJsonToMap(
+        {R"({"v":221.5222225222225222})"}, {{"v", "221.5222225222225222"}});
+  }
+  {
+    // Exponent form must be preserved, not expanded.
+    testJsonToMap({R"({"v":1e10})"}, {{"v", "1e10"}});
+  }
+  {
+    // Out-of-double-range exponent must not fail the whole parse.
+    testJsonToMap({R"({"v":1e400})"}, {{"v", "1e400"}});
   }
 }
 

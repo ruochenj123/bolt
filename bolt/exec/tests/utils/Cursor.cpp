@@ -31,8 +31,21 @@
 #include "bolt/exec/tests/utils/Cursor.h"
 #include "bolt/common/file/FileSystems.h"
 
+#include <folly/system/HardwareConcurrency.h>
+
+#include <algorithm>
 #include <filesystem>
+
 namespace bytedance::bolt::exec::test {
+
+namespace {
+constexpr unsigned kMaxTestExecutorThreads = 4;
+}
+
+unsigned testExecutorConcurrency() {
+  return std::min(
+      kMaxTestExecutorThreads, std::max(1u, folly::hardware_concurrency()));
+}
 
 bool waitForTaskDriversToFinish(exec::Task* task, uint64_t maxWaitMicros) {
   BOLT_USER_CHECK(!task->isRunning());
@@ -155,7 +168,11 @@ class TaskCursorBase : public TaskCursor {
       const CursorParameters& params,
       const std::shared_ptr<folly::Executor>& executor) {
     static std::atomic<int32_t> cursorId;
-    taskId_ = fmt::format("test_cursor_{}", ++cursorId);
+    if (params.taskId.has_value()) {
+      taskId_ = *params.taskId;
+    } else {
+      taskId_ = fmt::format("test_cursor_{}", ++cursorId);
+    }
 
     if (params.queryCtx) {
       queryCtx_ = params.queryCtx;
@@ -196,7 +213,7 @@ class TaskCursorBase : public TaskCursor {
         try {
           fileSystem->mkdir(taskSpillDirectory_);
         } catch (...) {
-          LOG(ERROR) << "Faield to create task spill directory "
+          LOG(ERROR) << "Failed to create task spill directory "
                      << taskSpillDirectory_ << " base director "
                      << params.spillDirectory << " exists["
                      << std::filesystem::exists(taskSpillDirectory_) << "]";
@@ -227,7 +244,7 @@ class MultiThreadedTaskCursor : public TaskCursorBase {
       : TaskCursorBase(
             params,
             std::make_shared<folly::CPUThreadPoolExecutor>(
-                std::thread::hardware_concurrency())),
+                testExecutorConcurrency())),
         maxDrivers_{params.maxDrivers},
         numConcurrentSplitGroups_{params.numConcurrentSplitGroups},
         numSplitGroups_{params.numSplitGroups} {

@@ -39,7 +39,8 @@ class PaimonSplitReader : public HiveSplitReaderBase {
       const std::vector<int>& sequenceNumberIndices,
       int valueKindIndex,
       const std::vector<int>& valueIndices,
-      const std::unordered_map<std::string, std::string>& tableParameters);
+      const std::unordered_map<std::string, std::string>& tableParameters,
+      const std::shared_ptr<io::IoStatistics> ioStats);
 
   virtual uint64_t next(int64_t size, VectorPtr& output) override;
 
@@ -119,6 +120,7 @@ class PaimonSplitReader : public HiveSplitReaderBase {
       std::vector<PaimonRowIteratorPtr>,
       PaimonRowIteratorCompare>
       heap;
+  const std::shared_ptr<io::IoStatistics> ioStats_;
 };
 
 } // namespace bytedance::bolt::connector::hive

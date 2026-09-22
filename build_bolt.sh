@@ -33,5 +33,5 @@ make release > buildlogs/full_build_$SLURM_JOB_ID.log 2>&1
 rc=$?
 tail -40 buildlogs/full_build_$SLURM_JOB_ID.log
 echo "=== exit=$rc; artifacts ==="
-find _build -name "bolt_tpch_benchmark" -o -name "bolt_tpcds_benchmark" 2>/dev/null
+find _build -name "bolt_tpch_benchmark" -o -name "bolt_tpcds_hybrid_benchmark" 2>/dev/null
 exit $rc

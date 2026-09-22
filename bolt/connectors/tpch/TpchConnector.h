@@ -32,6 +32,7 @@
 
 #include "bolt/common/config/Config.h"
 #include "bolt/connectors/Connector.h"
+#include "bolt/connectors/ConnectorNames.h"
 #include "bolt/connectors/tpch/TpchConnectorSplit.h"
 #include "bolt/tpch/gen/TpchGen.h"
 namespace bytedance::bolt::connector::tpch {
@@ -44,7 +45,7 @@ class TpchColumnHandle : public ColumnHandle {
  public:
   explicit TpchColumnHandle(const std::string& name) : name_(name) {}
 
-  const std::string& name() const {
+  const std::string& name() const override {
     return name_;
   }
 
@@ -67,6 +68,10 @@ class TpchTableHandle : public ConnectorTableHandle {
 
   ~TpchTableHandle() override {}
 
+  const std::string& name() const override {
+    return tableName_;
+  }
+
   std::string toString() const override;
 
   bolt::tpch::Table getTable() const {
@@ -79,6 +84,7 @@ class TpchTableHandle : public ConnectorTableHandle {
 
  private:
   const bolt::tpch::Table table_;
+  const std::string tableName_{toTableName(table_)};
   double scaleFactor_;
 };
 

@@ -393,13 +393,15 @@ int64_t OverAcquireMemoryTarget::borrow(int64_t size) {
     try {
       overTarget_->borrow(diff); // we don't have to check the returned value
     } catch (const BoltException& e) {
-      BOLT_FAIL(
-          "Over-acquire memory target borrow failed, granted {}, try borrowing {}, current {}, ratio {}, error {}",
+      LOG(ERROR) << fmt::format(
+          "Over-acquire memory target borrow failed, granted {}, try "
+          "borrowing {}, current {}, ratio {}, error {}",
           granted,
           expectedOverAcquired,
           overAcquired,
           ratio_,
           e.message());
+      throw;
     }
   }
   return granted;
@@ -521,7 +523,7 @@ TreeMemoryTargetPtr ConsumerTargetBridgeFactory::getSharedAccount(
     ConsumerTargetBridgePtr bridge =
         std::make_shared<ConsumerTargetBridge>(tmm);
 
-    // we need addConsumer manualy to avoid bridge being destroyed
+    // we need addConsumer manually to avoid bridge being destroyed
     MemoryConsumerPtr bridgeConsumer =
         std::dynamic_pointer_cast<MemoryConsumer>(bridge);
     BOLT_CHECK(bridgeConsumer != nullptr);

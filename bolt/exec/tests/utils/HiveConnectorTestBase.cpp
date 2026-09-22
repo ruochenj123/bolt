@@ -37,6 +37,8 @@
 #include "bolt/dwio/dwrf/writer/Writer.h"
 namespace bytedance::bolt::exec::test {
 
+using connector::hive::HiveConnectorSplitBuilder;
+
 HiveConnectorTestBase::HiveConnectorTestBase() {
   filesystems::registerLocalFileSystem();
 }
@@ -46,8 +48,7 @@ void HiveConnectorTestBase::SetUp() {
   bytedance::bolt::connector::hive::CheckHiveConnectorFactoryInit<
       bytedance::bolt::connector::hive::HiveConnectorFactory>();
   auto hiveConnector =
-      connector::getConnectorFactory(
-          connector::hive::HiveConnectorFactory::kHiveConnectorName)
+      connector::getConnectorFactory(connector::kHiveConnectorName)
           ->newConnector(
               kHiveConnectorId,
               std::make_shared<config::ConfigBase>(
@@ -68,8 +69,7 @@ void HiveConnectorTestBase::resetHiveConnector(
     const std::shared_ptr<const config::ConfigBase>& config) {
   connector::unregisterConnector(kHiveConnectorId);
   auto hiveConnector =
-      connector::getConnectorFactory(
-          connector::hive::HiveConnectorFactory::kHiveConnectorName)
+      connector::getConnectorFactory(connector::kHiveConnectorName)
           ->newConnector(kHiveConnectorId, config, ioExecutor_.get());
   connector::registerConnector(hiveConnector);
 }
@@ -135,20 +135,38 @@ std::vector<std::shared_ptr<connector::hive::HiveConnectorSplit>>
 HiveConnectorTestBase::makeHiveConnectorSplits(
     const std::string& filePath,
     uint32_t splitCount,
-    dwio::common::FileFormat format) {
+    dwio::common::FileFormat format,
+    const std::optional<
+        std::unordered_map<std::string, std::optional<std::string>>>&
+        partitionKeys,
+    const std::optional<std::unordered_map<std::string, std::string>>&
+        infoColumns) {
   auto file =
       filesystems::getFileSystem(filePath, nullptr)->openFileForRead(filePath);
-  const int64_t fileSize = file->size();
+  BOLT_CHECK_GT(splitCount, 0);
+  const uint64_t fileSize = file->size();
   // Take the upper bound.
-  const int splitSize = std::ceil((fileSize) / splitCount);
+  const uint64_t splitSize =
+      fileSize / splitCount + (fileSize % splitCount != 0);
   std::vector<std::shared_ptr<connector::hive::HiveConnectorSplit>> splits;
   // Add all the splits.
-  for (int i = 0; i < splitCount; i++) {
-    auto split = HiveConnectorSplitBuilder(filePath)
-                     .fileFormat(format)
-                     .start(i * splitSize)
-                     .length(splitSize)
-                     .build();
+  for (uint32_t i = 0; i < splitCount; i++) {
+    auto splitBuilder = HiveConnectorSplitBuilder(filePath)
+                            .connectorId(kHiveConnectorId)
+                            .fileFormat(format)
+                            .start(i * splitSize)
+                            .length(splitSize);
+    if (infoColumns.has_value()) {
+      for (const auto& infoColumn : infoColumns.value()) {
+        splitBuilder.infoColumn(infoColumn.first, infoColumn.second);
+      }
+    }
+    if (partitionKeys.has_value()) {
+      for (const auto& partitionKey : partitionKeys.value()) {
+        splitBuilder.partitionKey(partitionKey.first, partitionKey.second);
+      }
+    }
+    auto split = splitBuilder.build();
     splits.push_back(std::move(split));
   }
   return splits;
@@ -203,6 +221,8 @@ HiveConnectorTestBase::makeHiveConnectorSplit(
     uint64_t start,
     uint64_t length) {
   return HiveConnectorSplitBuilder(filePath)
+      .connectorId(kHiveConnectorId)
+      .fileFormat(dwio::common::FileFormat::DWRF)
       .start(start)
       .length(length)
       .build();
@@ -216,6 +236,8 @@ HiveConnectorTestBase::makeHiveConnectorSplit(
     uint64_t start,
     uint64_t length) {
   return HiveConnectorSplitBuilder(filePath)
+      .connectorId(kHiveConnectorId)
+      .fileFormat(dwio::common::FileFormat::DWRF)
       .infoColumn("$file_size", fmt::format("{}", fileSize))
       .infoColumn("$file_modified_time", fmt::format("{}", fileModifiedTime))
       .start(start)

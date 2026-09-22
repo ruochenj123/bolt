@@ -38,6 +38,7 @@
 #include "bolt/vector/LazyVector.h"
 #include "bolt/vector/SequenceVector.h"
 #include "bolt/vector/TypeAliases.h"
+#include "bolt/vector/VariantVector.h"
 #include "bolt/vector/VectorPool.h"
 #include "bolt/vector/VectorPrinter.h"
 #include "bolt/vector/VectorTypeUtils.h"
@@ -351,6 +352,9 @@ VectorPtr BaseVector::createInternal(
           std::move(keys),
           std::move(values));
     }
+    case TypeKind::VARIANT: {
+      return VariantVector::create(pool, type, size);
+    }
     case TypeKind::UNKNOWN: {
       BufferPtr nulls = allocateNulls(size, pool, bits::kNull);
       return std::make_shared<FlatVector<UnknownValue>>(
@@ -601,6 +605,7 @@ void BaseVector::ensureWritable(const SelectivityVector& rows) {
   }
 
   this->resize(newSize);
+  this->setMayChangeContentUnderSameAddress(true);
   this->resetDataDependentFlags(&rows);
 }
 
@@ -616,6 +621,7 @@ void BaseVector::ensureWritable(
     } else {
       result = BaseVector::create(type, rows.end(), pool);
     }
+    result->setMayChangeContentUnderSameAddress(true);
     return;
   }
   const auto& resultType = result->type();
@@ -655,6 +661,7 @@ void BaseVector::ensureWritable(
     copy->copy(result.get(), copyRows, nullptr, true);
   }
   result = std::move(copy);
+  result->setMayChangeContentUnderSameAddress(true);
 }
 
 template <TypeKind kind>
@@ -874,9 +881,8 @@ void BaseVector::flattenVector(VectorPtr& vector) {
       return;
     }
     case VectorEncoding::Simple::LAZY: {
-      auto& loadedVector =
-          vector->asUnchecked<LazyVector>()->loadedVectorShared();
-      BaseVector::flattenVector(loadedVector);
+      vector = vector->asUnchecked<LazyVector>()->loadedVectorShared();
+      BaseVector::flattenVector(vector);
       return;
     }
     default:
@@ -913,6 +919,7 @@ void BaseVector::reuseNulls() {
 
 void BaseVector::prepareForReuse() {
   reuseNulls();
+  mayChangeContentUnderSameAddress_ = false;
   this->resetDataDependentFlags(nullptr);
 }
 

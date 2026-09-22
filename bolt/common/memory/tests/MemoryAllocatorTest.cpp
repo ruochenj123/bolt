@@ -31,6 +31,7 @@
 #include "bolt/common/memory/MemoryAllocator.h"
 #include <thread>
 #include "bolt/common/base/tests/GTestUtils.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/memory/AllocationPool.h"
 #include "bolt/common/memory/MallocAllocator.h"
 #include "bolt/common/memory/MmapAllocator.h"
@@ -46,7 +47,6 @@
 #include <gtest/gtest.h>
 #include <fstream>
 
-DECLARE_bool(bolt_memory_leak_check_enabled);
 using namespace bytedance::bolt::common::testutil;
 namespace bytedance::bolt::memory {
 namespace {
@@ -64,7 +64,7 @@ static constexpr MachinePageCount kCapacityPages =
 class MemoryAllocatorTest : public testing::TestWithParam<int> {
  protected:
   static void SetUpTestCase() {
-    TestValue::enable();
+    BOLT_TEST_VALUE_ENABLE();
     FLAGS_bolt_memory_leak_check_enabled = true;
   }
 
@@ -1080,7 +1080,7 @@ TEST_P(MemoryAllocatorTest, allocContiguousFail) {
 
 TEST_P(MemoryAllocatorTest, allocContiguousGrow) {
   // We allocate almost all capacity worth of small allocations, then make a
-  // large continguous allocation with a small initial size.
+  // large contiguous allocation with a small initial size.
   auto largestClass = instance_->sizeClasses().back();
   constexpr int32_t kInitialLarge = 1024;
   constexpr int32_t kMinGrow = 1024;

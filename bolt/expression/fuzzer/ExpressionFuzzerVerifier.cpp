@@ -311,11 +311,11 @@ void ExpressionFuzzerVerifier::retryWithTry(
 void ExpressionFuzzerVerifier::go() {
   BOLT_CHECK(
       options_.steps > 0 || options_.durationSeconds > 0,
-      "Either --steps or --duration_sec needs to be greater than zero.")
+      "Either --bolt_fuzzer_steps or --bolt_fuzzer_duration_sec needs to be greater than zero.")
   BOLT_CHECK_GT(
       options_.maxExpressionTreesPerStep,
       0,
-      "--max_expression_trees_per_step needs to be greater than zero.")
+      "--bolt_fuzzer_max_expression_trees_per_step needs to be greater than zero.")
 
   auto startTime = std::chrono::system_clock::now();
   size_t i = 0;
@@ -330,7 +330,7 @@ void ExpressionFuzzerVerifier::go() {
               << " (seed: " << currentSeed_ << ")";
 
     // Generate multiple expression trees and input data vectors. They can
-    // re-use columns and share sub-expressions if the appropriate flag is set.
+    // reuse columns and share sub-expressions if the appropriate flag is set.
     int numExpressionTrees = boost::random::uniform_int_distribution<int>(
         1, options_.maxExpressionTreesPerStep)(rng_);
     auto [expressions, inputType, selectionStats] =

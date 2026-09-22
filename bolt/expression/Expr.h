@@ -34,6 +34,7 @@
 
 #include <folly/container/F14Map.h>
 
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/time/CpuWallTimer.h"
 #include "bolt/core/ExpressionEvaluator.h"
 #include "bolt/core/Expressions.h"
@@ -43,19 +44,6 @@
 #include "bolt/expression/VectorFunction.h"
 #include "bolt/type/Subfield.h"
 #include "bolt/vector/SimpleVector.h"
-
-/// GFlag used to enable saving input vector and expression SQL on disk in case
-/// of any (user or system) error during expression evaluation. The value
-/// specifies a path to a directory where the vectors will be saved. That
-/// directory must exist and be writable.
-DECLARE_string(bolt_save_input_on_expression_any_failure_path);
-
-/// GFlag used to enable saving input vector and expression SQL on disk in case
-/// of a system error during expression evaluation. The value specifies a path
-/// to a directory where the vectors will be saved. That directory must exist
-/// and be writable. This flag is ignored if
-/// bolt_save_input_on_expression_any_failure_path flag is set.
-DECLARE_string(bolt_save_input_on_expression_system_failure_path);
 
 #ifdef ENABLE_BOLT_EXPR_JIT
 namespace bytedance::bolt {
@@ -366,8 +354,8 @@ class Expr {
   /// Return the expression as SQL string.
   /// @param complexConstants An optional std::vector of VectorPtr to record
   /// complex constants (Array, Maps, Structs, ...) that aren't accurately
-  /// expressable as sql. If not given, they will be converted to
-  /// SQL-expressable simple constants.
+  /// expressible as sql. If not given, they will be converted to
+  /// SQL-expressible simple constants.
   virtual std::string toSql(
       std::vector<VectorPtr>* FOLLY_NULLABLE complexConstants = nullptr) const;
 
@@ -568,7 +556,7 @@ class Expr {
   // referenced fields.
   virtual void computeDistinctFields();
 
-  // True if this is a spcial form where the next argument will always be
+  // True if this is a special form where the next argument will always be
   // evaluated on a subset of the rows for which the previous one was evaluated.
   // This is true of AND and no other at this time.  This implies that lazies
   // can be loaded on first use and not before starting evaluating the form.
@@ -626,7 +614,7 @@ class Expr {
   // evaluateSharedSubexpr() is called to the cached shared results.
   std::map<std::vector<const BaseVector*>, SharedResults> sharedSubexprResults_;
 
-  // Pointers to the last base vector of cachable dictionary input. Used to
+  // Pointers to the last base vector of cacheable dictionary input. Used to
   // check if the current input's base vector is the same as the last. If it's
   // the same, then results can be cached.
   std::weak_ptr<BaseVector> baseOfDictionaryWeakPtr_;
@@ -634,11 +622,11 @@ class Expr {
 
   // This is a strong reference to the base vector and is only set if
   // `baseOfDictionaryRepeats_` > 1. This is to ensure that the vector held is
-  // not modified and re-used in-place.
+  // not modified and reused in-place.
   VectorPtr baseOfDictionary_;
 
   // Number of times currently held cacheable vector is seen for a non-first
-  // time. Is reset everytime 'baseOfDictionaryRawPtr_' is different from the
+  // time. Is reset every time 'baseOfDictionaryRawPtr_' is different from the
   // current input's base.
   int baseOfDictionaryRepeats_ = 0;
 

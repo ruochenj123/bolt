@@ -72,7 +72,7 @@ void UdfStrToLongArrFunctionTest::testStrToLongArr(
 TEST_F(UdfStrToLongArrFunctionTest, base) {
   testStrToLongArr(
       {"1,2,3", "a,b,c", "", std::nullopt, "ab,c,1"},
-      {{{1L, 2L, 3L}}, {{}}, {std::nullopt}, {std::nullopt}, {{1L}}});
+      {{{1L, 2L, 3L}}, emptyArray, {std::nullopt}, {std::nullopt}, {{1L}}});
 }
 
 TEST_F(UdfStrToLongArrFunctionTest, corner_case) {
@@ -80,7 +80,9 @@ TEST_F(UdfStrToLongArrFunctionTest, corner_case) {
       {"1111111111111111111111111111111111111111111111111111111111111",
        "3,-12,45,7,a4,8",
        "+9223372036854775807,9223372036854775807,-9223372036854775808,9223372036854775809,-9223372036854775809"},
-      {{{}}, {{3L, -12L, 45L, 7L, 8L}}, {{LONG_MAX, LONG_MAX, LONG_MIN}}});
+      {emptyArray,
+       {{3L, -12L, 45L, 7L, 8L}},
+       {{LONG_MAX, LONG_MAX, LONG_MIN}}});
 }
 
 } // namespace

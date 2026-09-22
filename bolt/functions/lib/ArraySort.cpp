@@ -80,16 +80,16 @@ BufferPtr sortElements(
           if (a == b) {
             return false;
           }
-          bool aNull = decodedElements->isNullAt(a);
-          bool bNull = decodedElements->isNullAt(b);
+          bool nullAtA = decodedElements->isNullAt(a);
+          bool nullAtB = decodedElements->isNullAt(b);
 
-          if (aNull && bNull) {
+          if (nullAtA && nullAtB) {
             return false;
           }
-          if (aNull) {
+          if (nullAtA) {
             return nullsFirst;
           }
-          if (bNull) {
+          if (nullAtB) {
             return !nullsFirst;
           }
 
@@ -133,9 +133,10 @@ inline void swapWithNull(
     vector_size_t index,
     vector_size_t nullIndex) {
   // Values are already present in vector stringBuffers. Don't create additional
-  // copy.
+  // copy. Moving StringViews within the same vector keeps StringViewStats
+  // valid because total bytes and max length do not change.
   if constexpr (std::is_same_v<T, StringView>) {
-    vector->setNoCopy(nullIndex, vector->valueAt(index));
+    vector->setNoCopyUnsafe(nullIndex, vector->valueAt(index));
   } else {
     vector->set(nullIndex, vector->valueAt(index));
   }

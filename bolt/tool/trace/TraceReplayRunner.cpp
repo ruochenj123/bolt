@@ -39,7 +39,7 @@
 #include "bolt/connectors/hive/HiveDataSink.h"
 #include "bolt/connectors/hive/TableHandle.h"
 #include "bolt/connectors/hive/storage_adapters/abfs/RegisterAbfsFileSystem.h"
-#include "bolt/connectors/hive/storage_adapters/gcs/RegisterGCSFileSystem.h"
+#include "bolt/connectors/hive/storage_adapters/gcs/RegisterGcsFileSystem.h"
 #include "bolt/connectors/hive/storage_adapters/hdfs/RegisterHdfsFileSystem.h"
 #include "bolt/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h"
 #include "bolt/core/PlanNode.h"
@@ -52,6 +52,7 @@
 #include "bolt/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
 #include "bolt/parse/TypeResolver.h"
+#include "bolt/serializers/ArrowSerializer.h"
 #include "bolt/serializers/CompactRowSerializer.h"
 #include "bolt/serializers/UnsafeRowSerializer.h"
 #include "bolt/tool/trace/AggregationReplayer.h"
@@ -69,58 +70,70 @@
 #endif
 
 DEFINE_string(
-    root_dir,
+    bolt_trace_replay_root_dir,
     "",
     "Root directory where the replayer is reading the traced data, it must be "
     "set");
 DEFINE_bool(
-    summary,
+    bolt_trace_replay_summary,
     false,
     "Show the summary of the tracing including number of tasks and task ids. "
     "It also print the query metadata including query configs, connectors "
     "properties, and query plan in JSON format.");
-DEFINE_bool(short_summary, false, "Only show number of tasks and task ids");
-DEFINE_string(query_id, "", "Specify the target query id which must be set");
+DEFINE_bool(
+    bolt_trace_replay_short_summary,
+    false,
+    "Only show number of tasks and task ids");
 DEFINE_string(
-    task_id,
+    bolt_trace_replay_query_id,
+    "",
+    "Specify the target query id which must be set");
+DEFINE_string(
+    bolt_trace_replay_task_id,
     "",
     "Specify the target task id, if empty, show the summary of all the traced "
     "query task.");
-DEFINE_string(node_id, "", "Specify the target node id.");
-DEFINE_string(driver_ids, "", "A comma-separated list of target driver ids");
+DEFINE_string(bolt_trace_replay_node_id, "", "Specify the target node id.");
 DEFINE_string(
-    table_writer_output_dir,
+    bolt_trace_replay_driver_ids,
+    "",
+    "A comma-separated list of target driver ids");
+DEFINE_string(
+    bolt_trace_replay_table_writer_output_dir,
     "",
     "Specify output directory of TableWriter.");
 DEFINE_double(
-    hive_connector_executor_hw_multiplier,
+    bolt_trace_replay_hive_connector_executor_hw_multiplier,
     2.0,
-    "Hardware multipler for hive connector.");
+    "Hardware multiplier for hive connector.");
 DEFINE_double(
-    driver_cpu_executor_hw_multiplier,
+    bolt_trace_replay_driver_cpu_executor_hw_multiplier,
     2.0,
-    "Hardware multipler for driver cpu executor.");
+    "Hardware multiplier for driver cpu executor.");
 DEFINE_int32(
-    shuffle_serialization_format,
+    bolt_trace_replay_shuffle_serialization_format,
     0,
     "Specify the shuffle serialization format, 0: presto columnar, 1: compact row, 2: spark unsafe row.");
 DEFINE_string(
-    memory_arbitrator_type,
+    bolt_trace_replay_memory_arbitrator_type,
     "shared",
     "Specify the memory arbitrator type.");
 DEFINE_uint64(
-    query_memory_capacity_mb,
+    bolt_trace_replay_query_memory_capacity_mb,
     0,
     "Specify the query memory capacity limit in GB. If it is zero, then there is no limit.");
-DEFINE_bool(copy_results, false, "Copy the replaying results.");
+DEFINE_bool(
+    bolt_trace_replay_copy_results,
+    false,
+    "Copy the replaying results.");
 DEFINE_string(
-    function_prefix,
+    bolt_trace_replay_function_prefix,
     "",
     "Prefix for the scalar and aggregate functions.");
 namespace bytedance::bolt::tool::trace {
 namespace {
 VectorSerde::Kind getVectorSerdeKind() {
-  switch (FLAGS_shuffle_serialization_format) {
+  switch (FLAGS_bolt_trace_replay_shuffle_serialization_format) {
     case 0:
       return VectorSerde::Kind::kPresto;
     case 1:
@@ -130,7 +143,8 @@ VectorSerde::Kind getVectorSerdeKind() {
     default:
       BOLT_UNSUPPORTED(
           "Unsupported shuffle serialization format: {}",
-          static_cast<int>(FLAGS_shuffle_serialization_format));
+          static_cast<int>(
+              FLAGS_bolt_trace_replay_shuffle_serialization_format));
   }
 }
 
@@ -236,7 +250,12 @@ void printSummary(
   summary << "\n++++++Task Summaries++++++\n";
   for (const auto& taskId : summaryTaskIds) {
     printTaskTraceSummary(
-        rootDir, queryId, taskId, FLAGS_node_id, pool, summary);
+        rootDir,
+        queryId,
+        taskId,
+        FLAGS_bolt_trace_replay_node_id,
+        pool,
+        summary);
   }
   LOG(INFO) << summary.str();
 }
@@ -245,23 +264,29 @@ void printSummary(
 TraceReplayRunner::TraceReplayRunner()
     : cpuExecutor_(std::make_unique<folly::CPUThreadPoolExecutor>(
           std::thread::hardware_concurrency() *
-              FLAGS_driver_cpu_executor_hw_multiplier,
+              FLAGS_bolt_trace_replay_driver_cpu_executor_hw_multiplier,
           std::make_shared<folly::NamedThreadFactory>(
               "TraceReplayCpuConnector"))),
       ioExecutor_(std::make_unique<folly::IOThreadPoolExecutor>(
           std::thread::hardware_concurrency() *
-              FLAGS_hive_connector_executor_hw_multiplier,
+              FLAGS_bolt_trace_replay_hive_connector_executor_hw_multiplier,
           std::make_shared<folly::NamedThreadFactory>(
               "TraceReplayIoConnector"))) {}
 
 void TraceReplayRunner::init() {
-  BOLT_USER_CHECK(!FLAGS_root_dir.empty(), "--root_dir must be provided");
-  BOLT_USER_CHECK(!FLAGS_query_id.empty(), "--query_id must be provided");
-  BOLT_USER_CHECK(!FLAGS_node_id.empty(), "--node_id must be provided");
+  BOLT_USER_CHECK(
+      !FLAGS_bolt_trace_replay_root_dir.empty(),
+      "--bolt_trace_replay_root_dir must be provided");
+  BOLT_USER_CHECK(
+      !FLAGS_bolt_trace_replay_query_id.empty(),
+      "--bolt_trace_replay_query_id must be provided");
+  BOLT_USER_CHECK(
+      !FLAGS_bolt_trace_replay_node_id.empty(),
+      "--bolt_trace_replay_node_id must be provided");
 
   if (!memory::MemoryManager::testInstance()) {
     memory::MemoryManager::Options options;
-    options.arbitratorKind = FLAGS_memory_arbitrator_type;
+    options.arbitratorKind = FLAGS_bolt_trace_replay_memory_arbitrator_type;
     memory::initializeMemoryManager({});
   }
   filesystems::registerLocalFileSystem();
@@ -272,10 +297,10 @@ void TraceReplayRunner::init() {
   filesystems::registerHdfsFileSystem();
 #endif
 #ifdef BOLT_ENABLE_GCS
-  filesystems::registerGCSFileSystem();
+  filesystems::registerGcsFileSystem();
 #endif
 #ifdef BOLT_ENABLE_ABFS
-  filesystems::abfs::registerAbfsFileSystem();
+  filesystems::registerAbfsFileSystem();
 #endif
 
   dwio::common::registerFileSinks();
@@ -304,6 +329,9 @@ void TraceReplayRunner::init() {
   if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kUnsafeRow)) {
     serializer::spark::UnsafeRowVectorSerde::registerNamedVectorSerde();
   }
+  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kArrow)) {
+    serializer::arrowserde::ArrowVectorSerde::registerNamedVectorSerde();
+  }
   connector::hive::HiveTableHandle::registerSerDe();
   connector::hive::LocationHandle::registerSerDe();
   connector::hive::HiveColumnHandle::registerSerDe();
@@ -312,8 +340,10 @@ void TraceReplayRunner::init() {
   connector::hive::registerHivePartitionFunctionSerDe();
   connector::hive::HiveBucketProperty::registerSerDe();
 
-  functions::prestosql::registerAllScalarFunctions(FLAGS_function_prefix);
-  aggregate::prestosql::registerAllAggregateFunctions(FLAGS_function_prefix);
+  functions::prestosql::registerAllScalarFunctions(
+      FLAGS_bolt_trace_replay_function_prefix);
+  aggregate::prestosql::registerAllAggregateFunctions(
+      FLAGS_bolt_trace_replay_function_prefix);
   parse::registerTypeResolver();
 
   if (!bytedance::bolt::connector::hasConnectorFactory("hive")) {
@@ -321,9 +351,11 @@ void TraceReplayRunner::init() {
         std::make_shared<connector::hive::HiveConnectorFactory>());
   }
 
-  fs_ = filesystems::getFileSystem(FLAGS_root_dir, nullptr);
+  fs_ = filesystems::getFileSystem(FLAGS_bolt_trace_replay_root_dir, nullptr);
   const auto taskTraceDir = exec::trace::getTaskTraceDirectory(
-      FLAGS_root_dir, FLAGS_query_id, FLAGS_task_id);
+      FLAGS_bolt_trace_replay_root_dir,
+      FLAGS_bolt_trace_replay_query_id,
+      FLAGS_bolt_trace_replay_task_id);
   taskTraceMetadataReader_ =
       std::make_unique<exec::trace::TaskTraceMetadataReader>(
           taskTraceDir, memory::MemoryManager::getInstance()->tracePool());
@@ -333,46 +365,50 @@ std::unique_ptr<tool::trace::OperatorReplayerBase>
 TraceReplayRunner::createReplayer() const {
   std::unique_ptr<tool::trace::OperatorReplayerBase> replayer;
   const auto taskTraceDir = exec::trace::getTaskTraceDirectory(
-      FLAGS_root_dir, FLAGS_query_id, FLAGS_task_id);
-  const auto traceNodeName = taskTraceMetadataReader_->nodeName(FLAGS_node_id);
-  const auto queryCapacityBytes = (1ULL * FLAGS_query_memory_capacity_mb) << 20;
+      FLAGS_bolt_trace_replay_root_dir,
+      FLAGS_bolt_trace_replay_query_id,
+      FLAGS_bolt_trace_replay_task_id);
+  const auto traceNodeName =
+      taskTraceMetadataReader_->nodeName(FLAGS_bolt_trace_replay_node_id);
+  const auto queryCapacityBytes =
+      (1ULL * FLAGS_bolt_trace_replay_query_memory_capacity_mb) << 20;
   if (traceNodeName == "TableWrite") {
     BOLT_USER_CHECK(
-        !FLAGS_table_writer_output_dir.empty(),
-        "--table_writer_output_dir is required");
+        !FLAGS_bolt_trace_replay_table_writer_output_dir.empty(),
+        "--bolt_trace_replay_table_writer_output_dir is required");
     replayer = std::make_unique<tool::trace::TableWriterReplayer>(
-        FLAGS_root_dir,
-        FLAGS_query_id,
-        FLAGS_task_id,
-        FLAGS_node_id,
+        FLAGS_bolt_trace_replay_root_dir,
+        FLAGS_bolt_trace_replay_query_id,
+        FLAGS_bolt_trace_replay_task_id,
+        FLAGS_bolt_trace_replay_node_id,
         traceNodeName,
-        FLAGS_driver_ids,
+        FLAGS_bolt_trace_replay_driver_ids,
         queryCapacityBytes,
         cpuExecutor_.get(),
-        FLAGS_table_writer_output_dir);
+        FLAGS_bolt_trace_replay_table_writer_output_dir);
   } else if (traceNodeName == "Aggregation") {
     replayer = std::make_unique<tool::trace::AggregationReplayer>(
-        FLAGS_root_dir,
-        FLAGS_query_id,
-        FLAGS_task_id,
-        FLAGS_node_id,
+        FLAGS_bolt_trace_replay_root_dir,
+        FLAGS_bolt_trace_replay_query_id,
+        FLAGS_bolt_trace_replay_task_id,
+        FLAGS_bolt_trace_replay_node_id,
         traceNodeName,
-        FLAGS_driver_ids,
+        FLAGS_bolt_trace_replay_driver_ids,
         queryCapacityBytes,
         cpuExecutor_.get());
   } else if (traceNodeName == "PartitionedOutput") {
     replayer = std::make_unique<tool::trace::PartitionedOutputReplayer>(
-        FLAGS_root_dir,
-        FLAGS_query_id,
-        FLAGS_task_id,
-        FLAGS_node_id,
+        FLAGS_bolt_trace_replay_root_dir,
+        FLAGS_bolt_trace_replay_query_id,
+        FLAGS_bolt_trace_replay_task_id,
+        FLAGS_bolt_trace_replay_node_id,
         traceNodeName,
-        FLAGS_driver_ids,
+        FLAGS_bolt_trace_replay_driver_ids,
         queryCapacityBytes,
         cpuExecutor_.get());
   } else if (traceNodeName == "TableScan") {
     const auto connectorId =
-        taskTraceMetadataReader_->connectorId(FLAGS_node_id);
+        taskTraceMetadataReader_->connectorId(FLAGS_bolt_trace_replay_node_id);
     if (const auto& collectors = connector::getAllConnectors();
         collectors.find(connectorId) == collectors.end()) {
       const auto hiveConnector =
@@ -384,32 +420,32 @@ TraceReplayRunner::createReplayer() const {
       connector::registerConnector(hiveConnector);
     }
     replayer = std::make_unique<tool::trace::TableScanReplayer>(
-        FLAGS_root_dir,
-        FLAGS_query_id,
-        FLAGS_task_id,
-        FLAGS_node_id,
+        FLAGS_bolt_trace_replay_root_dir,
+        FLAGS_bolt_trace_replay_query_id,
+        FLAGS_bolt_trace_replay_task_id,
+        FLAGS_bolt_trace_replay_node_id,
         traceNodeName,
-        FLAGS_driver_ids,
+        FLAGS_bolt_trace_replay_driver_ids,
         queryCapacityBytes,
         cpuExecutor_.get());
   } else if (traceNodeName == "Filter" || traceNodeName == "Project") {
     replayer = std::make_unique<tool::trace::FilterProjectReplayer>(
-        FLAGS_root_dir,
-        FLAGS_query_id,
-        FLAGS_task_id,
-        FLAGS_node_id,
+        FLAGS_bolt_trace_replay_root_dir,
+        FLAGS_bolt_trace_replay_query_id,
+        FLAGS_bolt_trace_replay_task_id,
+        FLAGS_bolt_trace_replay_node_id,
         traceNodeName,
-        FLAGS_driver_ids,
+        FLAGS_bolt_trace_replay_driver_ids,
         queryCapacityBytes,
         cpuExecutor_.get());
   } else if (traceNodeName == "HashJoin") {
     replayer = std::make_unique<tool::trace::HashJoinReplayer>(
-        FLAGS_root_dir,
-        FLAGS_query_id,
-        FLAGS_task_id,
-        FLAGS_node_id,
+        FLAGS_bolt_trace_replay_root_dir,
+        FLAGS_bolt_trace_replay_query_id,
+        FLAGS_bolt_trace_replay_task_id,
+        FLAGS_bolt_trace_replay_node_id,
         traceNodeName,
-        FLAGS_driver_ids,
+        FLAGS_bolt_trace_replay_driver_ids,
         queryCapacityBytes,
         cpuExecutor_.get());
   } else {
@@ -420,17 +456,20 @@ TraceReplayRunner::createReplayer() const {
 }
 
 void TraceReplayRunner::run() {
-  if (FLAGS_summary || FLAGS_short_summary) {
+  if (FLAGS_bolt_trace_replay_summary ||
+      FLAGS_bolt_trace_replay_short_summary) {
     auto pool = memory::memoryManager()->addLeafPool("replayer");
     printSummary(
-        FLAGS_root_dir,
-        FLAGS_query_id,
-        FLAGS_task_id,
-        FLAGS_short_summary,
+        FLAGS_bolt_trace_replay_root_dir,
+        FLAGS_bolt_trace_replay_query_id,
+        FLAGS_bolt_trace_replay_task_id,
+        FLAGS_bolt_trace_replay_short_summary,
         pool.get());
     return;
   }
-  BOLT_USER_CHECK(!FLAGS_task_id.empty(), "--task_id must be provided");
-  createReplayer()->run(FLAGS_copy_results);
+  BOLT_USER_CHECK(
+      !FLAGS_bolt_trace_replay_task_id.empty(),
+      "--bolt_trace_replay_task_id must be provided");
+  createReplayer()->run(FLAGS_bolt_trace_replay_copy_results);
 }
 } // namespace bytedance::bolt::tool::trace

@@ -31,12 +31,18 @@
 
 #pragma once
 
+#include <functional>
 #include <iostream>
 #include "bolt/shuffle/sparksql/Options.h"
 #include "bolt/shuffle/sparksql/Payload.h"
 #include "bolt/shuffle/sparksql/ShuffleMemoryPool.h"
 #include "bolt/shuffle/sparksql/Spill.h"
 #include "bolt/shuffle/sparksql/compression/Compression.h"
+
+namespace bytedance::bolt::memory {
+class MemoryPool;
+}
+
 namespace bytedance::bolt::shuffle::sparksql {
 
 struct Evict {
@@ -45,6 +51,8 @@ struct Evict {
 
 class PartitionWriter {
  public:
+  using StopCallback = std::function<arrow::Status(uint32_t)>;
+
   PartitionWriter(
       uint32_t numPartitions,
       PartitionWriterOptions options,
@@ -53,21 +61,33 @@ class PartitionWriter {
         options_(std::move(options)),
         pool_(pool) {
     payloadPool_ = std::make_unique<ShuffleMemoryPool>(pool);
-    codec_ = createArrowIpcCodec(
+    codec_ = createCodec(
         options_.compressionType,
-        getCodecBackend(options_.codecBackend),
-        options_.compressionLevel);
+        CodecOptions{
+            getCodecBackend(options_.codecBackend),
+            options_.compressionLevel,
+            options_.checksumEnabled});
   }
 
   static std::unique_ptr<PartitionWriter> create(
       PartitionWriterOptions options,
-      arrow::MemoryPool* pool);
+      arrow::MemoryPool* pool,
+      bytedance::bolt::memory::MemoryPool* retainedPayloadBoltPool = nullptr);
 
   virtual ~PartitionWriter() = default;
 
   virtual arrow::Status reclaimFixedSize(int64_t size, int64_t* actual) = 0;
 
   virtual arrow::Status stop(ShuffleWriterMetrics* metrics) = 0;
+
+  virtual arrow::Status stop(
+      ShuffleWriterMetrics* metrics,
+      const StopCallback& callback) {
+    for (auto partitionId = 0; partitionId < numPartitions_; ++partitionId) {
+      RETURN_NOT_OK(callback(partitionId));
+    }
+    return stop(metrics);
+  }
 
   /// Evict buffers for `partitionId` partition.
   virtual arrow::Status evict(
@@ -78,7 +98,11 @@ class PartitionWriter {
       bool hasComplexType) = 0;
 
   uint64_t cachedPayloadSize() {
-    return payloadPool_->bytes_allocated();
+    auto bytes = payloadPool_->bytes_allocated();
+    if (retainedPayloadPool_) {
+      bytes += retainedPayloadPool_->bytes_allocated();
+    }
+    return bytes;
   }
 
   // for V2
@@ -101,6 +125,18 @@ class PartitionWriter {
     return false;
   }
 
+  virtual arrow::Status writeFinal(
+      uint32_t partitionId,
+      std::unique_ptr<InMemoryPayload> inMemoryPayload,
+      bool hasComplexType) {
+    return evict(
+        partitionId,
+        std::move(inMemoryPayload),
+        Evict::kCacheNoMerge,
+        false,
+        hasComplexType);
+  }
+
   // for BoltRowBasedSortShuffleWriter
   virtual arrow::Status evict(
       std::vector<std::vector<uint8_t*>>& rows,
@@ -108,11 +144,28 @@ class PartitionWriter {
       const bool isCompositeVector) {
     return arrow::Status::OK();
   }
+
+  virtual arrow::Status writeFinal(
+      uint32_t partitionId,
+      std::vector<uint8_t*>& rows,
+      int64_t rawSize,
+      bool isCompositeVector) {
+    std::vector<std::vector<uint8_t*>> partitionRows(numPartitions_);
+    partitionRows[partitionId].swap(rows);
+    std::vector<int64_t> partitionBytes(numPartitions_, 0);
+    partitionBytes[partitionId] = rawSize;
+    return evict(partitionRows, partitionBytes, isCompositeVector);
+  }
   FLATTEN void setRowFormat(bool isRow) {
     isRowFormat_ = isRow;
   };
 
  protected:
+  arrow::MemoryPool* retainedPayloadPool() const {
+    return retainedPayloadPool_ ? retainedPayloadPool_.get()
+                                : payloadPool_.get();
+  }
+
   uint32_t numPartitions_;
   PartitionWriterOptions options_;
   arrow::MemoryPool* pool_;
@@ -121,7 +174,10 @@ class PartitionWriter {
   // The actual allocation is delegated to options_.memoryPool.
   std::unique_ptr<ShuffleMemoryPool> payloadPool_;
 
-  std::unique_ptr<arrow::util::Codec> codec_;
+  // Optional task-accounted pool for retained payloads.
+  std::unique_ptr<arrow::MemoryPool> retainedPayloadPool_;
+
+  std::unique_ptr<Codec> codec_;
 
   uint64_t compressTime_{0};
   uint64_t spillTime_{0};

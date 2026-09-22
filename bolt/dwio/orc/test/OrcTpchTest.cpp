@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#include <folly/init/Init.h>
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include <vector>
 
 #include "bolt/common/file/FileSystems.h"
@@ -30,6 +31,7 @@
 #include "bolt/functions/prestosql/registration/RegistrationFunctions.h"
 #include "bolt/functions/sparksql/Register.h"
 #include "bolt/parse/TypeResolver.h"
+
 using namespace bytedance::bolt;
 using namespace bytedance::bolt::exec;
 using namespace bytedance::bolt::exec::test;
@@ -47,9 +49,9 @@ class OrcTpchTest : public testing::Test {
 
     functions::prestosql::registerAllScalarFunctions();
     aggregate::prestosql::registerAllAggregateFunctions();
-#ifdef SPARK_COMPATIBLE
-    functions::sparksql::registerFunctions("");
-#endif
+    if (::bytedance::bolt::kSparkCompatible) {
+      functions::sparksql::registerFunctions("");
+    }
 
     parse::registerTypeResolver();
     filesystems::registerLocalFileSystem();
@@ -58,15 +60,13 @@ class OrcTpchTest : public testing::Test {
     bytedance::bolt::orc::registerOrcWriterFactory();
 
     auto hiveConnector =
-        connector::getConnectorFactory(
-            connector::hive::HiveConnectorFactory::kHiveConnectorName)
+        connector::getConnectorFactory(connector::kHiveConnectorName)
             ->newConnector(
                 kHiveConnectorId, std::make_shared<core::MemConfig>());
     connector::registerConnector(hiveConnector);
 
     auto tpchConnector =
-        connector::getConnectorFactory(
-            connector::tpch::TpchConnectorFactory::kTpchConnectorName)
+        connector::getConnectorFactory(connector::kTpchConnectorName)
             ->newConnector(
                 kBoltTpchConnectorId, std::make_shared<core::MemConfig>());
     connector::registerConnector(tpchConnector);
@@ -249,11 +249,4 @@ TEST_F(OrcTpchTest, Q21) {
 TEST_F(OrcTpchTest, Q22) {
   std::vector<uint32_t> sortingKeys{0};
   assertQuery(22, std::move(sortingKeys));
-}
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  // todo: use folly::Init init after upgrade folly lib
-  folly::init(&argc, &argv, false);
-  return RUN_ALL_TESTS();
 }

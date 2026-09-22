@@ -114,7 +114,8 @@ class LookupTable : public LookupTableBase {
 
 class MapSubscript {
  public:
-  explicit MapSubscript(bool allowCaching) : allowCaching_(allowCaching) {}
+  explicit MapSubscript(bool allowCaching)
+      : allowPersistentLookupCache_(allowCaching) {}
 
   VectorPtr applyMap(
       const SelectivityVector& rows,
@@ -122,7 +123,7 @@ class MapSubscript {
       exec::EvalCtx& context) const;
 
   bool cachingEnabled() const {
-    return allowCaching_;
+    return allowPersistentLookupCache_;
   }
 
   auto& lookupTable() const {
@@ -134,15 +135,28 @@ class MapSubscript {
   }
 
  private:
-  bool shouldTriggerCaching(const VectorPtr& mapArg) const {
-    if (!allowCaching_) {
+  bool supportsLookupTableForKeyType(const VectorPtr& mapArg) const {
+    const auto& keyType = mapArg->type()->childAt(0);
+    return keyType->isPrimitiveType() && !keyType->isBoolean();
+  }
+
+  void clearPersistentLookupCacheState() const {
+    lookupTable_.reset();
+    firstSeenMap_.reset();
+  }
+
+  void disablePersistentLookupCache() const {
+    allowPersistentLookupCache_ = false;
+    clearPersistentLookupCacheState();
+  }
+
+  bool shouldUsePersistentLookupCache(const VectorPtr& mapArg) const {
+    if (!allowPersistentLookupCache_) {
       return false;
     }
 
-    if (!mapArg->type()->childAt(0)->isPrimitiveType() &&
-        !!mapArg->type()->childAt(0)->isBoolean()) {
-      // Disable caching if the key type is not primitive or is boolean.
-      allowCaching_ = false;
+    if (!supportsLookupTableForKeyType(mapArg)) {
+      disablePersistentLookupCache();
       return false;
     }
 
@@ -156,19 +170,15 @@ class MapSubscript {
     }
 
     // Disable caching forever.
-    allowCaching_ = false;
-    lookupTable_.reset();
-    firstSeenMap_.reset();
+    disablePersistentLookupCache();
     return false;
   }
 
   // When true the function is allowed to cache a materialized version of the
-  // processed map.
-  mutable bool allowCaching_;
+  // processed map across multiple applyMap() calls.
+  mutable bool allowPersistentLookupCache_;
 
-  // This is used to check if the same base map is being passed over and over
-  // in the function. A shared_ptr is used to guarantee that if the map is
-  // seen again then it was not modified.
+  // Used to check if the same base map is being passed over and over.
   mutable VectorPtr firstSeenMap_;
 
   // Materialized cached version of firstSeenMap_ used to optimize the lookup.
@@ -187,16 +197,23 @@ class MapSubscript {
 /// - allowOutOfBound: if allowed, returns NULL for out of bound accesses; if
 ///   false, throws an exception.
 /// - indexStartsAtOne: whether indices start at zero or one.
+/// - nullOnNonConstantInvalidIndex: when true, any index < 1 (in 1-based mode)
+///   is treated as invalid. For constant indices this triggers an exception;
+///   for non-constant indices it returns NULL silently instead of throwing.
 template <
     bool allowNegativeIndices,
     bool nullOnNegativeIndices,
     bool allowOutOfBound,
     bool indexStartsAtOne,
-    bool isElementAt>
+    bool isElementAt,
+    bool nullOnNonConstantInvalidIndex = false>
 class SubscriptImpl : public exec::Subscript {
  public:
-  explicit SubscriptImpl(bool allowCaching)
-      : mapSubscript_(MapSubscript(allowCaching)) {}
+  explicit SubscriptImpl(
+      bool allowCaching,
+      bool constantIndexInvalidThrows = false)
+      : mapSubscript_(MapSubscript(allowCaching)),
+        constantIndexInvalidThrows_(constantIndexInvalidThrows) {}
 
   void apply(
       const SelectivityVector& rows,
@@ -309,19 +326,32 @@ class SubscriptImpl : public exec::Subscript {
           isZeroSubscriptError,
           zeroBasedArrayIndex);
       if (isZeroSubscriptError) {
-        context.setErrors(rows, zeroSubscriptError());
-        allFailed = true;
+        if constexpr (nullOnNonConstantInvalidIndex) {
+          if (constantIndexInvalidThrows_) {
+            std::rethrow_exception(zeroSubscriptError());
+          }
+          return BaseVector::createNullConstant(
+              baseArray->elements()->type(), rows.end(), context.pool());
+        } else {
+          context.setErrors(rows, zeroSubscriptError());
+          allFailed = true;
+        }
       }
 
       if (!allFailed) {
         rows.applyToSelected([&](auto row) {
           const auto elementIndex = getIndex(
               adjustedIndex, row, rawSizes, rawOffsets, arrayIndices, context);
-          rawIndices[row] = elementIndex;
           if (elementIndex == -1) {
             nullsBuilder.setNull(row);
+            rawIndices[row] = 0;
+          } else {
+            rawIndices[row] = elementIndex;
           }
         });
+      } else {
+        return BaseVector::createNullConstant(
+            baseArray->elements()->type(), rows.end(), context.pool());
       }
     } else {
       rows.applyToSelected([&](auto row) {
@@ -330,14 +360,22 @@ class SubscriptImpl : public exec::Subscript {
         const auto adjustedIndex = adjustIndex(
             originalIndex, isZeroSubscriptError, zeroBasedArrayIndex);
         if (isZeroSubscriptError) {
-          context.setBoltExceptionError(row, zeroSubscriptError());
+          if constexpr (nullOnNonConstantInvalidIndex) {
+            // Flink: non-constant invalid index returns NULL silently.
+            nullsBuilder.setNull(row);
+            rawIndices[row] = 0;
+          } else {
+            context.setBoltExceptionError(row, zeroSubscriptError());
+          }
           return;
         }
         const auto elementIndex = getIndex(
             adjustedIndex, row, rawSizes, rawOffsets, arrayIndices, context);
-        rawIndices[row] = elementIndex;
         if (elementIndex == -1) {
           nullsBuilder.setNull(row);
+          rawIndices[row] = 0;
+        } else {
+          rawIndices[row] = elementIndex;
         }
       });
     }
@@ -373,9 +411,19 @@ class SubscriptImpl : public exec::Subscript {
 
     // If array indices start at 1.
     if constexpr (indexStartsAtOne) {
-      if (UNLIKELY(index == 0)) {
-        isZeroSubscriptError = true;
-        return 0;
+      if constexpr (nullOnNonConstantInvalidIndex) {
+        // Flink: any index < 1 (including 0 and negative) is invalid.
+        // For constant indices this triggers an exception; for non-constant
+        // indices applyArrayTyped will return NULL instead.
+        if (UNLIKELY(index <= 0)) {
+          isZeroSubscriptError = true;
+          return 0;
+        }
+      } else {
+        if (UNLIKELY(index == 0)) {
+          isZeroSubscriptError = true;
+          return 0;
+        }
       }
 
       // If larger than zero, adjust it.
@@ -409,6 +457,9 @@ class SubscriptImpl : public exec::Subscript {
           index += arraySize;
         }
       } else {
+        if constexpr (nullOnNonConstantInvalidIndex) {
+          return -1;
+        }
         context.setBoltExceptionError(row, negativeSubscriptError());
         return -1;
       }
@@ -432,6 +483,7 @@ class SubscriptImpl : public exec::Subscript {
 
  private:
   MapSubscript mapSubscript_;
+  const bool constantIndexInvalidThrows_;
 };
 
 } // namespace bytedance::bolt::functions

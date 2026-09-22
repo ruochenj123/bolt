@@ -33,14 +33,14 @@
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/base/SuccinctPrinter.h"
 #include "bolt/common/base/tests/GTestUtils.h"
+#include "bolt/common/memory/MemoryPoolForGluten.h"
 #include "bolt/common/memory/sparksql/AllocationListener.h"
 #include "bolt/common/memory/sparksql/MemoryConsumer.h"
 #include "bolt/common/memory/sparksql/MemoryTarget.h"
+#include "bolt/common/memory/sparksql/NativeMemoryManagerFactory.h"
 #include "bolt/common/memory/sparksql/Spiller.h"
 #include "bolt/common/memory/sparksql/SpillerPhase.h"
 #include "bolt/common/memory/sparksql/TaskMemoryManager.h"
-
-#include "bolt/common/memory/sparksql/NativeMemoryManagerFactory.h"
 
 using namespace ::testing;
 using namespace bytedance::bolt::memory::sparksql;
@@ -98,6 +98,81 @@ TEST_F(NativeMemoryManagerTest, basic) {
 
   boltMemoryManager->shrink(memoryPool->memoryUsed());
   LOG(INFO) << "memoryUsed=" << memoryPool->memoryUsed();
+}
+
+TEST_F(NativeMemoryManagerTest, mustUseMemoryPoolForGluten) {
+  class NoopListener final : public AllocationListener {
+   public:
+    ~NoopListener() override {}
+
+    int64_t allocationChanged(int64_t size) override {
+      return size;
+    }
+
+    int64_t getUsedBytes() override {
+      return 0;
+    }
+  };
+
+  AllocationListenerPtr listener = std::make_shared<NoopListener>();
+  ArbitratorFactoryRegister afr(listener);
+  bolt::memory::MemoryManager::Options mmOptions;
+  mmOptions.alignment = bolt::memory::MemoryAllocator::kMaxAlignment;
+  mmOptions.trackDefaultUsage = true; // memory usage tracking
+  mmOptions.checkUsageLeak = true; // leak check
+  mmOptions.coreOnAllocationFailureEnabled = false;
+  mmOptions.allocatorCapacity = bolt::memory::kMaxMemory;
+  mmOptions.arbitratorKind = afr.getKind();
+  mmOptions.useMemoryPoolForGluten = true; /* This code only for gluten */
+  auto boltMemoryManager =
+      std::make_unique<bolt::memory::MemoryManager>(mmOptions);
+
+  auto boltAggregatePool = boltMemoryManager->addRootPool(
+      "TEST_ONLY_root",
+      bolt::memory::kMaxMemory, // the 3rd capacity
+      bytedance::bolt::memory::MemoryReclaimer::create());
+
+  auto boltLeafPool = boltAggregatePool->addLeafChild("TEST_ONLY_default_leaf");
+
+  EXPECT_TRUE(
+      std::dynamic_pointer_cast<MemoryPoolForGluten>(boltAggregatePool) !=
+      nullptr);
+  EXPECT_TRUE(
+      std::dynamic_pointer_cast<MemoryPoolForGluten>(boltLeafPool) != nullptr);
+}
+
+TEST_F(
+    NativeMemoryManagerTest,
+    arrowPoolAlignedAllocationDoesNotRequireRoundedSize) {
+  auto allocator = DefaultMemoryAllocatorGetter::defaultMemoryAllocator();
+  ArrowMemoryPool pool(allocator);
+  auto initialBytes = pool.bytes_allocated();
+
+  uint8_t* out = nullptr;
+  ASSERT_TRUE(pool.Allocate(13, 64, &out).ok());
+  ASSERT_NE(nullptr, out);
+  EXPECT_EQ(initialBytes + 13, pool.bytes_allocated());
+
+  pool.Free(out, 13, 64);
+  EXPECT_EQ(initialBytes, pool.bytes_allocated());
+}
+
+TEST_F(
+    NativeMemoryManagerTest,
+    arrowPoolAlignedReallocateKeepsAlignmentWhenShrinking) {
+  auto allocator = DefaultMemoryAllocatorGetter::defaultMemoryAllocator();
+  ArrowMemoryPool pool(allocator);
+
+  uint8_t* out = nullptr;
+  ASSERT_TRUE(pool.Allocate(128, 64, &out).ok());
+  ASSERT_NE(nullptr, out);
+  ASSERT_EQ(0, reinterpret_cast<uintptr_t>(out) % 64);
+
+  ASSERT_TRUE(pool.Reallocate(128, 13, 64, &out).ok());
+  ASSERT_NE(nullptr, out);
+  EXPECT_EQ(0, reinterpret_cast<uintptr_t>(out) % 64);
+
+  pool.Free(out, 13, 64);
 }
 
 } // namespace bytedance::bolt::memory::sparksql

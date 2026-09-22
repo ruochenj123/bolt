@@ -31,9 +31,11 @@
 #pragma once
 
 #include <folly/Executor.h>
+#include <folly/Range.h>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include "bolt/common/caching/AsyncDataCache.h"
 #include "bolt/common/caching/FileGroupStats.h"
@@ -168,7 +170,7 @@ class DirectBufferedInput : public BufferedInput {
       std::shared_ptr<IoStatistics> ioStats,
       folly::Executor* executor,
       const io::ReaderOptions& readerOptions,
-      connector::AsyncThreadCtx* asyncThreadCtx)
+      std::shared_ptr<connector::AsyncThreadCtx> asyncThreadCtx)
       : BufferedInput(
             std::move(readFile),
             readerOptions.getMemoryPool(),
@@ -194,15 +196,18 @@ class DirectBufferedInput : public BufferedInput {
       bolt::common::Region region,
       const StreamIdentifier* sid) override;
 
+  SeekableInputStreamPair enqueuePair(
+      bolt::common::Region region,
+      const StreamIdentifier* sid) override;
+
   bool supportSyncLoad() const override {
     return false;
   }
 
-  void updatePreloadingBytes(int64_t bytes) {
-    if (asyncThreadCtx_) {
-      std::lock_guard<std::mutex> lock(asyncThreadCtx_->getMutex());
-      asyncThreadCtx_->inPreloadingBytes() += bytes;
-    }
+  void preload();
+
+  bool preloaded() const {
+    return preloadData_.has_value();
   }
 
   void load(const LogType /*unused*/) override;
@@ -239,6 +244,12 @@ class DirectBufferedInput : public BufferedInput {
     return &pool_;
   }
 
+  /// Returns a contiguous byte range from preloaded whole-file data. The
+  /// returned range can be shorter than 'length' if it reaches an allocation
+  /// run boundary.
+  folly::Range<const char*> preloadedData(uint64_t offset, uint64_t length)
+      const;
+
   /// Returns the CoalescedLoad that contains the correlated loads for
   /// 'stream' or nullptr if none. Returns nullptr on all but first
   /// call for 'stream' since the load is to be triggered by the first
@@ -263,7 +274,7 @@ class DirectBufferedInput : public BufferedInput {
       std::shared_ptr<IoStatistics> ioStats,
       folly::Executor* executor,
       const io::ReaderOptions& readerOptions,
-      connector::AsyncThreadCtx* asyncThreadCtx)
+      std::shared_ptr<connector::AsyncThreadCtx> asyncThreadCtx)
       : BufferedInput(std::move(input), readerOptions.getMemoryPool()),
         fileNum_(fileNum),
         tracker_(std::move(tracker)),
@@ -298,15 +309,26 @@ class DirectBufferedInput : public BufferedInput {
     explicit AsyncLoadHolder(
         std::shared_ptr<cache::CoalescedLoad> load,
         int32_t prefetchMemoryPercent,
-        connector::AsyncThreadCtx* asyncThreadCtx)
+        std::shared_ptr<connector::AsyncThreadCtx> asyncThrCtx)
         : load(std::move(load)),
           prefetchMemoryPercent_(prefetchMemoryPercent),
-          asyncThreadCtx(asyncThreadCtx) {
+          asyncThreadCtx(std::move(asyncThrCtx)) {
       BOLT_CHECK(asyncThreadCtx);
       preloadBytesLimit_ = asyncThreadCtx->preloadBytesLimit();
     }
 
-    bool canPreload() const {
+    AsyncLoadHolder(const AsyncLoadHolder&) = delete;
+    AsyncLoadHolder& operator=(const AsyncLoadHolder&) = delete;
+
+    AsyncLoadHolder(AsyncLoadHolder&& other) noexcept
+        : load(std::move(other.load)),
+          prefetchMemoryPercent_(other.prefetchMemoryPercent_),
+          asyncThreadCtx(std::move(other.asyncThreadCtx)),
+          preloadBytesLimit_(other.preloadBytesLimit_) {
+      other.asyncThreadCtx = nullptr;
+    }
+
+    bool canPreload(connector::AsyncThreadCtx::Guard& guard) const {
       static int maxAttempt = 1000;
       static int sleepMs = 500;
       if (load->state() != DirectCoalescedLoad::State::kPlanned ||
@@ -322,13 +344,13 @@ class DirectBufferedInput : public BufferedInput {
         // there are in preloading with high memory usage, sleep to avoid OOM
         {
           std::lock_guard<std::mutex> lock(asyncThreadCtx->getMutex());
-          auto& inPreloadingBytes = asyncThreadCtx->inPreloadingBytes();
           // must preserve memory for other part of scan, i.e decompressed data
-          if ((inPreloadingBytes + load->preloadBytes() <
+          if ((asyncThreadCtx->inPreloadingBytes() + load->preloadBytes() <
                    preloadBytesLimit_ * prefetchMemoryPercent_ / 100.0 &&
-               inPreloadingBytes + load->preloadBytes() + memoryBytes <
+               asyncThreadCtx->inPreloadingBytes() + load->preloadBytes() +
+                       memoryBytes <
                    preloadBytesLimit_ / 2)) {
-            inPreloadingBytes += load->preloadBytes();
+            guard.updateInPreloadingBytesUnlocked(load->preloadBytes());
             return true;
           }
         }
@@ -358,7 +380,7 @@ class DirectBufferedInput : public BufferedInput {
 
     std::shared_ptr<cache::CoalescedLoad> load;
     int32_t prefetchMemoryPercent_{30};
-    connector::AsyncThreadCtx* asyncThreadCtx;
+    std::shared_ptr<connector::AsyncThreadCtx> asyncThreadCtx;
     uint64_t preloadBytesLimit_{0};
 
     ~AsyncLoadHolder() {
@@ -379,6 +401,14 @@ class DirectBufferedInput : public BufferedInput {
   folly::Executor* const executor_;
   const uint64_t fileSize_;
 
+  struct PreloadData {
+    explicit PreloadData(uint64_t size) : size(size) {}
+
+    memory::Allocation data;
+    std::string tinyData;
+    uint64_t size{0};
+  };
+
   // Regions that are candidates for loading.
   std::vector<LoadRequest> requests_;
 
@@ -392,7 +422,8 @@ class DirectBufferedInput : public BufferedInput {
   std::vector<std::shared_ptr<cache::CoalescedLoad>> coalescedLoads_;
 
   io::ReaderOptions options_;
-  connector::AsyncThreadCtx* asyncThreadCtx_ = nullptr;
+  std::shared_ptr<connector::AsyncThreadCtx> asyncThreadCtx_ = nullptr;
+  std::optional<PreloadData> preloadData_;
 };
 
 } // namespace bytedance::bolt::dwio::common

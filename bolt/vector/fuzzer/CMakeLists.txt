@@ -25,9 +25,13 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_vector_fuzzer GeneratorSpec.cpp Utils.cpp VectorFuzzer.cpp)
+bolt_add_library(bolt_vector_fuzzer GeneratorSpec.cpp Utils.cpp VectorFuzzer.cpp)
 
-target_link_libraries(bolt_vector_fuzzer bolt_type bolt_vector)
+target_link_libraries(
+  bolt_vector_fuzzer
+  bolt_type
+  bolt_vector
+)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   target_compile_options(bolt_vector_fuzzer PRIVATE -Wno-deprecated-declarations)
 endif()

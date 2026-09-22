@@ -30,7 +30,6 @@ add_executable(
   BloomFilterTest.cpp
   ColumnReaderTest.cpp
   ColumnWriterTest.cpp
-  EncodingTest.cpp
   FileDeserializeTest.cpp
   FileSerializeTest.cpp
   LevelConversionTest.cpp
@@ -44,20 +43,25 @@ add_executable(
 )
 
 add_test(bolt_dwio_parquet_arrow_test bolt_dwio_parquet_arrow_test)
-target_link_libraries(
-  bolt_dwio_parquet_arrow_test
-  bolt_dwio_parquet_arrow_lib
-  bolt_dwio_parquet_arrow_test_lib
-  GTest::gmock
-  arrow::arrow
-  arrow::libarrow_testing
-  glog::glog
-  gflags::gflags
-  GTest::gtest
-  GTest::gtest_main
-)
+target_link_libraries(bolt_dwio_parquet_arrow_test bolt_gtest_main)
 
-add_library(
+if(BOLT_BUILD_BENCHMARKS)
+  add_executable(
+    bolt_dwio_parquet_level_conversion_benchmark
+    LevelConversionBenchmark.cpp
+    ../LevelComparison.cpp
+    ../LevelComparisonAvx2.cpp
+    ../LevelConversion.cpp
+  )
+  target_link_libraries(
+    bolt_dwio_parquet_level_conversion_benchmark
+    PRIVATE
+      arrow::arrow
+      ${FOLLY_BENCHMARK}
+  )
+endif()
+
+bolt_add_library(
   bolt_dwio_parquet_arrow_test_lib
   BloomFilter.cpp
   BloomFilterReader.cpp
@@ -69,6 +73,8 @@ add_library(
 )
 
 target_link_libraries(
-  bolt_dwio_parquet_arrow_test_lib bolt_dwio_parquet_arrow_lib arrow::arrow GTest::gtest
-  GTest::gtest_main
+  bolt_dwio_parquet_arrow_test_lib
+  bolt_dwio_parquet_arrow_lib
+  arrow::arrow
+  GTest::gtest
 )

@@ -48,47 +48,38 @@ add_executable(
   StreamArenaTest.cpp
 )
 
-target_compile_features(bolt_memory_test PRIVATE cxx_std_20)
-
 if(NOT APPLE)
   find_package(jemalloc CONFIG REQUIRED)
 endif()
 
 target_link_libraries(
   bolt_memory_test
-  PRIVATE bolt_caching
-          bolt_common_base
-          bolt_exception
-          bolt_exec
-          bolt_exec_test_lib
-          bolt_memory
-          bolt_temp_path
-          bolt_test_util
-          bolt_vector_fuzzer
-          bolt_functions_aggregates
-          Folly::folly
-          fmt::fmt
-          gflags::gflags
-          glog::glog
-          GTest::gmock
-          GTest::gtest
-          GTest::gtest_main
-          re2::re2
-          $<$<NOT:$<PLATFORM_ID:Darwin>>:jemalloc::jemalloc>
-          pthread
-          dl
+  PRIVATE
+    GTest::gmock
+    bolt_gtest_main
+    $<$<NOT:$<PLATFORM_ID:Darwin>>:jemalloc::jemalloc>
+    pthread
+    dl
 )
 
-gtest_add_tests(bolt_memory_test "" AUTO)
+gtest_add_tests(
+  bolt_memory_test
+  ""
+  AUTO
+)
 
 add_executable(bolt_fragmentation_benchmark FragmentationBenchmark.cpp)
 
 target_link_libraries(
   bolt_fragmentation_benchmark
-  PRIVATE bolt_memory ${FOLLY_WITH_DEPENDENCIES} $<$<NOT:$<PLATFORM_ID:Darwin>>:jemalloc::jemalloc>
-          gflags::gflags glog::glog dl
+  PRIVATE
+    bolt_testutils
+    $<$<NOT:$<PLATFORM_ID:Darwin>>:jemalloc::jemalloc>
+    gflags::gflags
+    glog::glog
+    dl
 )
 
 add_executable(bolt_concurrent_allocation_benchmark ConcurrentAllocationBenchmark.cpp)
 
-target_link_libraries(bolt_concurrent_allocation_benchmark PRIVATE bolt_memory bolt_time)
+target_link_libraries(bolt_concurrent_allocation_benchmark PRIVATE bolt_testutils)

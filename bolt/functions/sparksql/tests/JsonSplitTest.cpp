@@ -17,6 +17,9 @@
 #include <chrono>
 #include <iostream>
 #include "bolt/functions/sparksql/tests/SparkFunctionBaseTest.h"
+
+using bytedance::bolt::test::emptyArray;
+
 namespace bytedance::bolt::functions::sparksql::test {
 namespace {
 
@@ -183,7 +186,7 @@ TEST_F(JsonSplitTest, testArray) {
   innerArrayType d{9, 10};
   outerArrayType row1{{a}, {b}};
   outerArrayType row2{{c}, {d}};
-  outerArrayType row3{{{}}};
+  outerArrayType row3{emptyArray};
   ArrayVectorPtr result =
       makeNullableNestedArrayVector<int64_t>({{row1}, {row2}, {row3}});
   JsonSplitWithType(values, ARRAY(BIGINT()), result);
@@ -255,8 +258,8 @@ TEST_F(JsonSplitTest, testObjectAsArray) {
     innerArrayType d{9, 10};
     outerArrayType row1{{a}, {b}};
     outerArrayType row2{{c}, {d}};
-    outerArrayType row3{{{}}, {{}}};
-    outerArrayType row4{{{}}};
+    outerArrayType row3{emptyArray, emptyArray};
+    outerArrayType row4{emptyArray};
     ArrayVectorPtr result = makeNullableNestedArrayVector<int64_t>(
         {{row1}, {row2}, {row3}, {row4}});
     JsonSplitWithType(values, ARRAY(BIGINT()), result);

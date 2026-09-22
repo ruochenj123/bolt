@@ -20,6 +20,7 @@
 #include <sstream>
 
 #include "bolt/common/base/Exceptions.h"
+#include "bolt/common/base/GlobalParameters.h"
 #include "bolt/common/base/SuccinctPrinter.h"
 #include "bolt/common/memory/MemoryUtils.h"
 #include "bolt/common/memory/sparksql/ExecutionMemoryPool.h"
@@ -31,6 +32,11 @@ ExecutionMemoryPoolPtr ExecutionMemoryPool::instance() {
       inited(),
       "ExecutionMemoryPool is not initialized, please call ExecutionMemoryPool::init() first");
   return instance_;
+}
+
+std::string ExecutionMemoryPool::debugString() {
+  return inited() ? instance()->toString()
+                  : "ExecutionMemoryPool(not initialized)";
 }
 
 // Call ExecutionMemoryPool::init does not mean that BoltMemoryManager is
@@ -90,6 +96,11 @@ int64_t ExecutionMemoryPool::poolSize() {
   return internalPoolSize();
 }
 
+int64_t ExecutionMemoryPool::configuredPoolSize() const {
+  MemoryMutexGuard guard(lock_);
+  return poolSize_.value_or(0);
+}
+
 int64_t ExecutionMemoryPool::memoryFree() {
   MemoryMutexGuard guard(lock_);
   return internalMemoryFree();
@@ -99,6 +110,52 @@ int64_t ExecutionMemoryPool::getMemoryUsageForTask(int64_t taskAttemptId) {
   MemoryMutexGuard guard(lock_);
   auto ans = memoryForTask_.find(taskAttemptId);
   return (ans == memoryForTask_.end()) ? 0L : ans->second;
+}
+
+ExecutionMemoryPool::ScopedDisableDynamicMemoryQuotaManager
+ExecutionMemoryPool::scopedDisableDynamicMemoryQuotaManagerForTask(
+    int64_t taskAttemptId) {
+  auto self = shared_from_this();
+  disableDynamicMemoryQuotaManagerForTask(taskAttemptId);
+  return folly::makeGuard(
+      std::function<void()>([self = std::move(self), taskAttemptId]() {
+        self->enableDynamicMemoryQuotaManagerForTask(taskAttemptId);
+      }));
+}
+
+std::optional<ExecutionMemoryPool::ScopedDisableDynamicMemoryQuotaManager>
+ExecutionMemoryPool::maybeScopedDisableDynamicMemoryQuotaManagerForTask(
+    const std::optional<int64_t>& taskAttemptId) {
+  if (!taskAttemptId.has_value() || !inited()) {
+    return std::nullopt;
+  }
+  return instance()->scopedDisableDynamicMemoryQuotaManagerForTask(
+      *taskAttemptId);
+}
+
+void ExecutionMemoryPool::disableDynamicMemoryQuotaManagerForTask(
+    int64_t taskAttemptId) {
+  MemoryMutexGuard guard(lock_);
+  ++dynamicMemoryQuotaManagerDisableCounts_[taskAttemptId];
+}
+
+void ExecutionMemoryPool::enableDynamicMemoryQuotaManagerForTask(
+    int64_t taskAttemptId) {
+  MemoryMutexGuard guard(lock_);
+  auto it = dynamicMemoryQuotaManagerDisableCounts_.find(taskAttemptId);
+  if (it == dynamicMemoryQuotaManagerDisableCounts_.end()) {
+    LOG(WARNING)
+        << "TID " << taskAttemptId
+        << " is not disabled by dynamic memory quota manager, cannot be enabled";
+    return;
+  }
+  BOLT_CHECK(
+      it->second > 0,
+      "Expect dynamic memory quota disable count is greater than 0 for task {}",
+      taskAttemptId);
+  if (--it->second == 0) {
+    dynamicMemoryQuotaManagerDisableCounts_.erase(it);
+  }
 }
 
 int64_t ExecutionMemoryPool::acquireMemory(
@@ -122,10 +179,19 @@ int64_t ExecutionMemoryPool::acquireMemory(
     int64_t maxPoolSize = internalPoolSize();
     int64_t maxMemoryPerTask = maxPoolSize / numActiveTasks;
     int64_t minMemoryPerTask = internalPoolSize() / (2 * numActiveTasks);
+    int64_t configureMaxMemoryPerTask = poolSize_.value_or(0) / numActiveTasks;
+    int64_t freeMemory = internalMemoryFree();
 
     int64_t maxToGrant =
         std::min(numBytes, std::max<int64_t>(0L, maxMemoryPerTask - curMem));
-    int64_t toGrant = std::min(maxToGrant, internalMemoryFree());
+    int64_t toGrant = std::min(maxToGrant, freeMemory);
+
+    if (isAsyncPreloadThread() && toGrant < numBytes) {
+      // if async threads unreserve non-enough memory, there may be a dead lock
+      // with the growing memory process of the main thread. so we directly
+      // return 0 to avoid calling unreserve(bytes).
+      return 0;
+    }
 
     if (toGrant < numBytes && curMem + toGrant < minMemoryPerTask) {
       LOG(INFO) << "TID " << taskAttemptId
@@ -146,19 +212,43 @@ int64_t ExecutionMemoryPool::acquireMemory(
                 << ")"
                 << ", internalMemoryUsed=" << internalMemoryUsed()
                 << ", internalMemoryFree=" << internalMemoryFree()
-                << ", ExecutionPool detail is: " << this;
+                << ", ExecutionPool detail is: " << toStringLocked();
+      // In Spark's implementation, there is no timeout, but in Gluten's
+      // practice, we found that some deadlock issues occurred, so we added a
+      // timeout here. deadlock scenario:
+      // 1. task A acquire RESOURCE_REGISTRIES.synchronized.
+      // 2. task A waiting for 1/2N to be satisfied.
+      // 3. task B wants to release memory, but RESOURCE_REGISTRIES is hold by
+      // task A.
       if (cv_.wait_for(guard, std::chrono::milliseconds(minMemoryMaxWaitMs_)) ==
           std::cv_status::timeout) {
         LOG(ERROR) << "TID " << taskAttemptId
-                   << " waiting for at least 1/2N to be free timeout after "
+                   << " waiting for minimum memory failed after "
                    << minMemoryMaxWaitMs_ << "ms";
-        memoryForTask_[taskAttemptId] += toGrant;
-        memIncreaseSize_ += toGrant;
-        return toGrant;
+        BOLT_CHECK(
+            minMemoryMaxWaitMs_ > 0,
+            "Expect minMemoryMaxWaitMs is greater than 0, but got {}",
+            minMemoryMaxWaitMs_);
+        return 0;
       }
     } else {
-      bool enable = option_.enable && !thisRunHasBorrowed;
-      if (enable) {
+      bool disabledByTask =
+          dynamicMemoryQuotaManagerDisableCounts_.find(taskAttemptId) !=
+          dynamicMemoryQuotaManagerDisableCounts_.end();
+      if (disabledByTask) {
+        maxToGrant = std::min(
+            numBytes,
+            std::max<int64_t>(0L, configureMaxMemoryPerTask - curMem));
+        toGrant = std::min(maxToGrant, freeMemory);
+        LOG(INFO) << "TID " << taskAttemptId
+                  << " dynamic memory quota manager is disabled by task"
+                  << ", configureMaxMemoryPerTask="
+                  << succinctBytes(configureMaxMemoryPerTask)
+                  << ", maxToGrant=" << succinctBytes(maxToGrant)
+                  << ", toGrant=" << succinctBytes(toGrant)
+                  << ", freeMemory=" << succinctBytes(freeMemory)
+                  << ", curMem=" << succinctBytes(curMem);
+      } else if (option_.enable && !thisRunHasBorrowed) {
         bool notEnough = toGrant < numBytes;
         bool reachThreshold = poolExtendSize_.has_value() &&
             memIncreaseSize_ >= option_.sampleSize;
@@ -169,6 +259,18 @@ int64_t ExecutionMemoryPool::acquireMemory(
           });
 
           if (triggerDynamicMemoryQuotaManager(notEnough, reachThreshold)) {
+            auto& watermark = borrowFromRssWatermarkBytes_[taskAttemptId];
+            auto newWatermark = std::min(configureMaxMemoryPerTask, curMem);
+            if (newWatermark > watermark) {
+              LOG(INFO) << "TID " << taskAttemptId
+                        << " borrow from RSS watermark updated to "
+                        << succinctBytes(newWatermark) << " from "
+                        << succinctBytes(watermark)
+                        << ", configureMaxMemoryPerTask="
+                        << succinctBytes(configureMaxMemoryPerTask)
+                        << ", curMem=" << succinctBytes(curMem);
+              watermark = newWatermark;
+            }
             continue;
           }
         }
@@ -205,6 +307,7 @@ int64_t ExecutionMemoryPool::releaseMemory(
     memoryForTask_[taskAttemptId] -= memoryToFree;
     if (memoryForTask_[taskAttemptId] == 0) {
       memoryForTask_.erase(taskAttemptId);
+      borrowFromRssWatermarkBytes_.erase(taskAttemptId);
     }
   }
   cv_.notify_all();
@@ -218,7 +321,22 @@ int64_t ExecutionMemoryPool::releaseAllMemoryForTask(int64_t taskAttemptId) {
 }
 
 int64_t ExecutionMemoryPool::numActiveTasks() const {
+  MemoryMutexGuard guard(lock_);
   return memoryForTask_.size();
+}
+
+std::vector<ExecutionMemoryPool::TaskExecutionMemoryUsage>
+ExecutionMemoryPool::snapshotTaskMemoryUsage() const {
+  MemoryMutexGuard guard(lock_);
+  std::vector<TaskExecutionMemoryUsage> result;
+  result.reserve(memoryForTask_.size());
+  for (const auto& pair : memoryForTask_) {
+    TaskExecutionMemoryUsage usage;
+    usage.taskAttemptId = pair.first;
+    usage.usedBytes = pair.second;
+    result.push_back(std::move(usage));
+  }
+  return result;
 }
 
 int64_t ExecutionMemoryPool::getOveragedMemoryForTask(int64_t taskAttemptId) {
@@ -281,27 +399,39 @@ std::optional<int64_t> ExecutionMemoryPool::getMinimumFreeMemoryForTask(
   int64_t available = 0;
   {
     MemoryMutexGuard guard(instance()->lock_);
-    // do not consider extened pool to avoid descrease pool size
+    // do not consider extended pool to avoid decrease pool size
     available = instance()->poolSize_.value_or(0) / instance()->maxTaskNumber();
   }
   auto usage = instance()->getMemoryUsageForTask(taskAttemptId);
   return std::max<int64_t>(0L, available - usage);
 }
 
+uint64_t ExecutionMemoryPool::borrowFromRssWatermarkBytes(
+    int64_t taskAttemptId) {
+  if (!inited()) {
+    return 0;
+  }
+  MemoryMutexGuard guard(instance()->lock_);
+  const auto it = instance()->borrowFromRssWatermarkBytes_.find(taskAttemptId);
+  return it == instance()->borrowFromRssWatermarkBytes_.end() ? 0 : it->second;
+}
+
+uint64_t ExecutionMemoryPool::getConfiguredMemoryPerTask() {
+  if (!inited()) {
+    return 0;
+  }
+
+  auto self = instance();
+  MemoryMutexGuard guard(self->lock_);
+  const auto activeTasks = self->memoryForTask_.size();
+  if (!self->poolExtendSize_.has_value() || activeTasks == 0) {
+    return 0;
+  }
+  return self->poolSize_.value_or(0) / activeTasks;
+}
+
 std::ostream& operator<<(std::ostream& os, const ExecutionMemoryPool& pool) {
-  os << "ExecutionMemoryPool(poolSize=" << pool.poolSize_.value_or(0)
-     << ", poolExtendSize=" << pool.poolExtendSize_.value_or(0)
-     << ", memIncreaseSize=" << pool.memIncreaseSize_ << " memoryForTask={";
-  for (const auto& pair : pool.memoryForTask_) {
-    os << "[taskAttemptId=" << pair.first << ", memoryUsed=" << pair.second
-       << "]";
-  }
-  if (pool.statistics_.extendCount > 0) {
-    os << ", DynamicMemoryQuotaManagerStatistics="
-       << pool.statistics_.toString();
-  }
-  os << ", DynamicMemoryQuotaManagerOption=" << pool.option_.toString();
-  return os << "}";
+  return os << pool.toString();
 }
 
 std::ostream& operator<<(std::ostream& os, const ExecutionMemoryPool* pool) {
@@ -313,8 +443,23 @@ std::ostream& operator<<(std::ostream& os, const ExecutionMemoryPool* pool) {
 }
 
 std::string ExecutionMemoryPool::toString() const {
+  MemoryMutexGuard guard(lock_);
+  return toStringLocked();
+}
+
+std::string ExecutionMemoryPool::toStringLocked() const {
   std::stringstream ss;
-  ss << this;
+  ss << "ExecutionMemoryPool(poolSize=" << poolSize_.value_or(0)
+     << ", poolExtendSize=" << poolExtendSize_.value_or(0)
+     << ", memIncreaseSize=" << memIncreaseSize_ << " memoryForTask={";
+  for (const auto& pair : memoryForTask_) {
+    ss << "[taskAttemptId=" << pair.first << ", memoryUsed=" << pair.second
+       << "]";
+  }
+  if (statistics_.extendCount > 0) {
+    ss << ", DynamicMemoryQuotaManagerStatistics=" << statistics_.toString();
+  }
+  ss << ", DynamicMemoryQuotaManagerOption=" << option_.toString() << "}";
   return ss.str();
 }
 
@@ -399,7 +544,7 @@ bool ExecutionMemoryPool::triggerDynamicMemoryQuotaManager(
                     << ", reachThreshold="
                     << (reachThreshold ? "true" : "false") << ", statistics is "
                     << statistics_.toString() << ", pool details is "
-                    << this->toString();
+                    << toStringLocked();
         }
       }
       return true;

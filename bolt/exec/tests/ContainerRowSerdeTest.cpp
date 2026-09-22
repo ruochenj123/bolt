@@ -34,11 +34,16 @@
 
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/common/memory/HashStringAllocator.h"
+#include "bolt/vector/VariantVector.h"
 #include "bolt/vector/fuzzer/VectorFuzzer.h"
 #include "bolt/vector/tests/utils/VectorTestBase.h"
 namespace bytedance::bolt::exec {
 
 namespace {
+
+void appendSerializedInt32(std::string& bytes, int32_t value) {
+  bytes.append(reinterpret_cast<const char*>(&value), sizeof(value));
+}
 
 class ContainerRowSerdeTest : public testing::Test,
                               public bolt::test::VectorTestBase {
@@ -49,11 +54,14 @@ class ContainerRowSerdeTest : public testing::Test,
 
   // Writes all rows together and returns a position at the start of this
   // combined write.
-  HashStringAllocator::Position serialize(const VectorPtr& data) {
+  HashStringAllocator::Position serialize(
+      const VectorPtr& data,
+      bool isKey = true) {
     ByteOutputStream out(&allocator_);
     auto position = allocator_.newWrite(out);
+    const ContainerRowSerdeOptions options{.isKey = isKey};
     for (auto i = 0; i < data->size(); ++i) {
-      ContainerRowSerde::serialize(*data, i, out);
+      ContainerRowSerde::serialize(*data, i, out, options);
     }
     allocator_.finishWrite(out, 0);
     return position;
@@ -61,15 +69,17 @@ class ContainerRowSerdeTest : public testing::Test,
 
   // Writes each row individually and returns positions for individual rows.
   std::vector<HashStringAllocator::Position> serializeWithPositions(
-      const VectorPtr& data) {
+      const VectorPtr& data,
+      bool isKey = true) {
     std::vector<HashStringAllocator::Position> positions;
     auto size = data->size();
     positions.reserve(size);
 
+    const ContainerRowSerdeOptions options{.isKey = isKey};
     for (auto i = 0; i < size; ++i) {
       ByteOutputStream out(&allocator_);
       auto position = allocator_.newWrite(out);
-      ContainerRowSerde::serialize(*data, i, out);
+      ContainerRowSerde::serialize(*data, i, out, options);
       allocator_.finishWrite(out, 0);
       positions.emplace_back(position);
     }
@@ -101,6 +111,23 @@ class ContainerRowSerdeTest : public testing::Test,
     test::assertEqualVectors(data, copy);
 
     allocator_.clear();
+  }
+
+  void assertNotEqualVectors(const VectorPtr& left, const VectorPtr& right) {
+    ASSERT_NE(left->size(), 0);
+    for (auto i = 0; i < left->size(); ++i) {
+      bool equal = true;
+      if (left->isNullAt(i) || right->isNullAt(i)) {
+        equal = left->isNullAt(i) && right->isNullAt(i);
+      } else {
+        // For simplicity, compare as strings for test purposes
+        equal = left->toString(i) == right->toString(i);
+      }
+      if (!equal) {
+        return; // Found inequality
+      }
+    }
+    FAIL() << "Vectors are unexpectedly equal";
   }
 
   // If the mode is NullAsIndeterminate with equalsOnly is false, and expected
@@ -193,10 +220,82 @@ class ContainerRowSerdeTest : public testing::Test,
   HashStringAllocator allocator_{pool()};
 };
 
+TEST_F(ContainerRowSerdeTest, variantCompare) {
+  auto data = VariantVector::create(pool(), VARIANT(), 2);
+  auto* values =
+      data->valueChildVector()->asUnchecked<FlatVector<StringView>>();
+  auto* metadata =
+      data->metadataChildVector()->asUnchecked<FlatVector<StringView>>();
+  const std::string longValue(48, 'v');
+  const std::string longMetadata(36, 'm');
+
+  values->set(0, StringView("short"));
+  metadata->set(0, StringView("meta"));
+  values->set(1, StringView(longValue));
+  metadata->set(1, StringView(longMetadata));
+
+  testCompare(data);
+  allocator_.clear();
+}
+
+TEST_F(ContainerRowSerdeTest, variantHashWithSegmentedInput) {
+  const std::string value(64, 'v');
+  const std::string metadata(40, 'm');
+
+  std::string serialized;
+  appendSerializedInt32(serialized, value.size());
+  serialized.append(value);
+  appendSerializedInt32(serialized, metadata.size());
+  serialized.append(metadata);
+
+  const auto split = sizeof(int32_t) + 10;
+  ASSERT_LT(split, serialized.size());
+
+  ByteInputStream stream({
+      ByteRange{
+          reinterpret_cast<uint8_t*>(serialized.data()),
+          static_cast<int32_t>(split),
+          0,
+      },
+      ByteRange{
+          reinterpret_cast<uint8_t*>(serialized.data() + split),
+          static_cast<int32_t>(serialized.size() - split),
+          0,
+      },
+  });
+
+  EXPECT_EQ(
+      std::hash<VariantValue>{}({StringView(value), StringView(metadata)}),
+      ContainerRowSerde::hash(stream, VARIANT().get()));
+}
+
 TEST_F(ContainerRowSerdeTest, bigint) {
   auto data = makeFlatVector<int64_t>({1, 2, 3, 4, 5});
 
   testRoundTrip(data);
+}
+
+TEST_F(ContainerRowSerdeTest, map) {
+  auto data = makeMapVector<int64_t, int64_t>({
+      {{2, 20}, {3, 30}, {1, 10}},
+      {{4, 40}},
+  });
+  testRoundTrip(data);
+
+  // isKey=false: preserve order
+  {
+    auto position = serialize(data, false);
+    auto deserialized = deserialize(position, data->type(), data->size());
+    test::assertEqualVectors(
+        data->mapKeys(), deserialized->as<MapVector>()->mapKeys());
+  }
+  // isKey=true: sorted order, thus different than input
+  {
+    auto position = serialize(data, true);
+    auto deserialized = deserialize(position, data->type(), data->size());
+    assertNotEqualVectors(
+        data->mapKeys(), deserialized->as<MapVector>()->mapKeys());
+  }
 }
 
 TEST_F(ContainerRowSerdeTest, string) {

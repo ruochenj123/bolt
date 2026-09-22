@@ -850,7 +850,7 @@ TEST_F(InPredicateTest, arrays) {
   auto data = makeRowVector({
       makeNullableArrayVector<int32_t>({
           {{1, 2, 3}},
-          {{}},
+          emptyArray,
           {{1, 3}},
           std::nullopt,
           {{2, 4, 5, 6}},

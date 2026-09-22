@@ -31,9 +31,7 @@
 #include "bolt/functions/prestosql/json/JsonExtractor.h"
 
 #include <string_view>
-#include "folly/Optional.h"
 #include "folly/String.h"
-#include "folly/json.h"
 
 #define SONIC_EXPONENT_ALWAYS_DOT 1
 #define SONIC_EXPONENT_UPPERCASE 1
@@ -59,13 +57,7 @@ static constexpr double EXPAND_FACTOR{1.5};
 
 namespace {
 
-using JsonVector = std::vector<const folly::dynamic*>;
 using SimdJsonVector = std::vector<simdjson::ondemand::value>;
-
-bool isScalarType(const folly::Optional<folly::dynamic>& json) {
-  return json.has_value() && !json->isObject() && !json->isArray() &&
-      !json->isNull();
-}
 // can't escape whole json, such as {\n "name": "xxx"} can't be parsed
 static void escapeControlCharInJsonStr(
     folly::StringPiece::const_iterator it,
@@ -146,10 +138,6 @@ class JsonExtractor {
     return *op;
   }
 
-  [[deprecated("Use simdExtract(const folly::StringPiece json)")]] folly::
-      Optional<folly::dynamic>
-      extract(const folly::dynamic& json);
-
   [[nodiscard]] size_t tokensSize() {
     return this->tokens_.size();
   }
@@ -162,6 +150,28 @@ class JsonExtractor {
       const bool useSonicJson) {
     if (!isJsonPathValid_ || json.size() == 0) {
       return folly::none;
+    }
+
+    // Because Sonic always escape; sonic is not DOM based; sonic does not throw
+    // Actually use sonic iff below is true
+    const bool actuallyUseSonic = !throwExceptionWhenEncounterBadJson &&
+        !useDOMParserInGetJsonObject && getJsonObjectEscapeEmoji &&
+        useSonicJson;
+    if (actuallyUseSonic) {
+      std::tuple<std::string, sonic_json::SonicError> result{};
+      result = sonic_json::GetByJsonPathOnDemand(json.toString(), this->path_);
+      const auto sonic_status = std::get<1>(result);
+      // Treat no-match and parse errors as no result. Sonic may return a
+      // partial result together with a parse error, but Spark's get_json_object
+      // returns NULL for malformed JSON.
+      if (sonic_json::kErrorNone != sonic_status) {
+        return folly::none;
+      }
+
+      const auto& answer = std::get<0>(result);
+      ans_.clear();
+      ans_.append(answer);
+      return std::string_view{ans_};
     }
 
     simdJsonPaddingJson(buffer_, json);
@@ -373,7 +383,7 @@ class JsonExtractor {
   std::string queryPointer_;
 
   // pre allocated to avoid frequent allocation.
-  // simd parser can expand its capicity if needed.
+  // simd parser can expand its capacity if needed.
   static constexpr size_t INIT_CAPACITY{1024};
 
   // Reuse parser to avoid internal buffer allocation.
@@ -395,107 +405,6 @@ class JsonExtractor {
 thread_local std::unordered_map<std::string, std::shared_ptr<JsonExtractor>>
     JsonExtractor::kExtractorCache;
 thread_local JsonPathTokenizer JsonExtractor::kTokenizer;
-
-[[deprecated("Use simdjson")]] void extractObject(
-    const folly::dynamic* jsonObj,
-    const std::string& key,
-    JsonVector& ret) {
-  auto val = jsonObj->get_ptr(key);
-  if (val) {
-    ret.push_back(val);
-  }
-}
-
-[[deprecated("Use simdjson")]] void extractArray(
-    const folly::dynamic* jsonArray,
-    const std::string& key,
-    JsonVector& ret) {
-  auto arrayLen = jsonArray->size();
-  if (key == "*") {
-    for (size_t i = 0; i < arrayLen; ++i) {
-      ret.push_back(jsonArray->get_ptr(i));
-    }
-  } else {
-    auto rv = folly::tryTo<int32_t>(key);
-    if (rv.hasValue()) {
-      auto idx = rv.value();
-      if (idx >= 0 && idx < arrayLen) {
-        ret.push_back(jsonArray->get_ptr(idx));
-      }
-    }
-  }
-}
-
-[[deprecated("Use simdjson")]] folly::Optional<folly::dynamic>
-JsonExtractor::extract(const folly::dynamic& json) {
-  JsonVector input;
-  // Temporary extraction result holder, swap with input after
-  // each iteration.
-  JsonVector result;
-  input.push_back(&json);
-
-  for (auto& token : tokens_) {
-    for (auto& jsonObj : input) {
-      if (jsonObj->isObject()) {
-        extractObject(jsonObj, token, result);
-      } else if (jsonObj->isArray()) {
-        extractArray(jsonObj, token, result);
-      }
-    }
-    if (result.empty()) {
-      return folly::none;
-    }
-    input.clear();
-    result.swap(input);
-  }
-
-  auto len = input.size();
-  if (0 == len) {
-    return folly::none;
-  } else if (1 == len) {
-    return *input.front();
-  } else {
-    folly::dynamic array = folly::dynamic::array;
-    for (auto obj : input) {
-      array.push_back(*obj);
-    }
-    return array;
-  }
-}
-
-folly::Optional<folly::dynamic> jsonExtract(
-    folly::StringPiece json,
-    folly::StringPiece path) {
-  try {
-    // If extractor fails to parse the path, this will throw a BoltUserError,
-    // and we want to let this exception bubble up to the client. We only catch
-    // json parsing failures (in which cases we return folly::none instead of
-    // throw).
-    auto& extractor = JsonExtractor::getInstance(path);
-    return extractor.extract(folly::parseJson(json));
-  } catch (const folly::json::parse_error&) {
-  } catch (const folly::ConversionError&) {
-    // Folly might throw a conversion error while parsing the input json. In
-    // this case, let it return null.
-  }
-  return folly::none;
-}
-
-folly::Optional<folly::dynamic> jsonExtract(
-    const std::string& json,
-    const std::string& path) {
-  return jsonExtract(folly::StringPiece(json), folly::StringPiece(path));
-}
-
-folly::Optional<folly::dynamic> jsonExtract(
-    const folly::dynamic& json,
-    folly::StringPiece path) {
-  try {
-    return JsonExtractor::getInstance(path).extract(json);
-  } catch (const folly::json::parse_error&) {
-  }
-  return folly::none;
-}
 
 folly::Optional<std::string_view> jsonExtractScalar(
     folly::StringPiece json,
@@ -521,32 +430,6 @@ folly::Optional<std::string_view> jsonExtractScalar(
     VLOG(100) << "simdjson error: " << e.what();
   }
 
-  return folly::none;
-}
-
-// [[deprecated]], for benchmark
-folly::Optional<std::string> follyJsonExtractScalar(
-    const std::string& json,
-    const std::string& path) {
-  folly::StringPiece jsonPiece{json};
-  folly::StringPiece pathPiece{path};
-
-  auto& extractor = JsonExtractor::getInstance(pathPiece);
-  try {
-    auto res = extractor.extract(folly::parseJson(jsonPiece));
-
-    if (isScalarType(res)) {
-      if (res->isBool()) {
-        return res->asBool() ? std::string{"true"} : std::string{"false"};
-      } else {
-        return res->asString();
-      }
-    }
-  } catch (const folly::json::parse_error&) {
-  } catch (const folly::ConversionError&) {
-    // Folly might throw a conversion error while parsing the input json. In
-    // this case, let it return null.
-  }
   return folly::none;
 }
 
@@ -582,7 +465,6 @@ folly::Optional<size_t> jsonExtractSize(
     return extractor.simdJsonSize<false>(json);
   } catch (simdjson::simdjson_error& e) {
     // e.error()
-    // Just follow previous behivor in jsonExtract()
     // simdjson might throw a conversion error while parsing the input json. In
     // this case, let it return null.
   }
@@ -609,7 +491,6 @@ folly::Optional<size_t> jsonArrayLength(folly::StringPiece json) {
     return extractor.simdJsonSize<true>(json);
   } catch (simdjson::simdjson_error& e) {
     // e.error()
-    // Just follow previous behivor in jsonExtract()
     // simdjson might throw a conversion error while parsing the input json. In
     // this case, let it return null.
   }
@@ -630,7 +511,6 @@ folly::Optional<bool> jsonArrayContains(folly::StringPiece json, const T& t) {
     return extractor.simdJsonArrayContains<T>(json);
   } catch (simdjson::simdjson_error& e) {
     // e.error()
-    // Just follow previous behivor in jsonExtract()
     // simdjson might throw a conversion error while parsing the input json. In
     // this case, let it return null.
   }
@@ -638,11 +518,37 @@ folly::Optional<bool> jsonArrayContains(folly::StringPiece json, const T& t) {
   return folly::none;
 }
 
+std::vector<folly::Optional<std::string>> jsonExtractTupleSonic(
+    folly::StringPiece json,
+    std::vector<folly::Optional<folly::StringPiece>> paths,
+    bool legacy) {
+  std::vector<std::string_view> paths_string_view{};
+  std::vector<size_t> non_null_index{};
+  for (int i = 0; i < paths.size(); i++) {
+    if (paths[i].has_value()) {
+      non_null_index.push_back(i);
+      paths_string_view.push_back(paths[i].value());
+    }
+  }
+  auto result =
+      sonic_json::JsonTupleWithCodeGen(json, paths_string_view, legacy);
+  std::vector<folly::Optional<std::string>> ret(paths.size(), folly::none);
+  for (int i = 0; i < paths_string_view.size(); i++) {
+    if (result[i].has_value()) {
+      ret[non_null_index[i]] = std::move(result[i].value());
+    }
+  }
+  return ret;
+}
+
 std::vector<folly::Optional<std::string>> jsonExtractTuple(
     folly::StringPiece json,
     std::vector<folly::Optional<folly::StringPiece>> paths,
     bool legacy,
     const bool useSonicLibrary) {
+  if (LIKELY(useSonicLibrary)) {
+    return jsonExtractTupleSonic(std::move(json), std::move(paths), legacy);
+  }
   std::vector<folly::Optional<std::string>> ret{paths.size(), folly::none};
   std::string json_str;
   simdJsonPaddingJson(json_str, json);

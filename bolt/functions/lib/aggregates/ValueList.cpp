@@ -79,12 +79,29 @@ void ValueList::appendNonNull(
   allocator->extendWrite(dataCurrent_, stream);
   // The stream may have a tail of a previous write.
   const auto initialSize = stream.size();
-  exec::ContainerRowSerde::serialize(values, index, stream);
+  // Set isKey to false to avoid unnecessary sorting.
+  static const exec::ContainerRowSerdeOptions kOptions{/*isKey=*/false};
+  exec::ContainerRowSerde::serialize(values, index, stream, kOptions);
   ++size_;
   bytes_ += stream.size() - initialSize;
 
   // Leave space up to half the size appended so far, at least 24 but no more
   // than 1024.
+  dataCurrent_ =
+      allocator->finishWrite(stream, std::clamp(bytes_ / 2, 24, 1024)).second;
+}
+
+void ValueList::appendStringView(
+    StringView value,
+    HashStringAllocator* allocator) {
+  prepareAppend(allocator);
+  ByteOutputStream stream(allocator);
+  allocator->extendWrite(dataCurrent_, stream);
+  const auto initialSize = stream.size();
+  stream.appendOne<int32_t>(value.size());
+  stream.appendStringView(value);
+  ++size_;
+  bytes_ += stream.size() - initialSize;
   dataCurrent_ =
       allocator->finishWrite(stream, std::clamp(bytes_ / 2, 24, 1024)).second;
 }
@@ -133,6 +150,35 @@ bool ValueListReader::next(BaseVector& output, vector_size_t outputIndex) {
     output.setNull(outputIndex, true);
   } else {
     exec::ContainerRowSerde::deserialize(*dataStream_, outputIndex, &output);
+  }
+
+  pos_++;
+  return pos_ < size_;
+}
+
+bool ValueListReader::nextStringView(
+    BaseVector& output,
+    vector_size_t outputIndex) {
+  if (pos_ == lastNullsStart_) {
+    nulls_ = lastNulls_;
+  } else if (pos_ % 64 == 0) {
+    nulls_ = nullsStream_->read<uint64_t>();
+  }
+
+  if (nulls_ & (1UL << (pos_ % 64))) {
+    output.setNull(outputIndex, true);
+  } else {
+    auto values = output.asUnchecked<FlatVector<StringView>>();
+    auto size = dataStream_->read<int32_t>();
+    if (StringView::isInline(size)) {
+      char start[StringView::kInlineSize];
+      dataStream_->readBytes(start, size);
+      values->setNoCopy(outputIndex, StringView(start, size));
+    } else {
+      auto rawBuffer = values->getRawStringBufferWithSpace(size);
+      dataStream_->readBytes(rawBuffer, size);
+      values->setNoCopy(outputIndex, StringView(rawBuffer, size));
+    }
   }
 
   pos_++;

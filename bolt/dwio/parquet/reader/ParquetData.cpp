@@ -44,11 +44,14 @@ std::unique_ptr<dwio::common::FormatData> ParquetParams::toFormatData(
       type,
       metaData_.row_groups,
       pool(),
+      fileDecryptor_,
       scanSpec.getRuntimeStatistics(),
       schemaHelper_,
+      enableMetadataFilter_,
       enableDictionaryFilter_,
       decodeRepDefPageCount_,
-      parquetRepDefMemoryLimit_);
+      parquetRepDefMemoryLimit_,
+      parquetRepDefStreamingWindowSize_);
 }
 
 void ParquetData::filterRowGroups(
@@ -63,26 +66,48 @@ void ParquetData::filterRowGroups(
     result.filterResult.resize(nwords);
   }
   auto metadataFiltersStartIndex = result.metadataFilterResults.size();
-  for (int i = 0; i < scanSpec.numMetadataFilters(); ++i) {
-    result.metadataFilterResults.emplace_back(
-        scanSpec.metadataFilterNodeAt(i), std::vector<uint64_t>(nwords));
+  const auto numScanSpecMetadataFilters =
+      enableMetadataFilter_ ? scanSpec.numMetadataFilters() : 0;
+  std::vector<int> metadataFilterIndices;
+  if (typeDependentMetadataFiltersEnabled_) {
+    for (int i = 0; i < numScanSpecMetadataFilters; ++i) {
+      result.metadataFilterResults.emplace_back(
+          scanSpec.metadataFilterNodeAt(i), std::vector<uint64_t>(nwords));
+    }
+  } else {
+    metadataFilterIndices.reserve(numScanSpecMetadataFilters);
+    for (int i = 0; i < numScanSpecMetadataFilters; ++i) {
+      auto* filter = scanSpec.metadataFilterAt(i);
+      if (!filter->isValueIndependent()) {
+        continue;
+      }
+      metadataFilterIndices.push_back(i);
+      result.metadataFilterResults.emplace_back(
+          scanSpec.metadataFilterNodeAt(i), std::vector<uint64_t>(nwords));
+    }
   }
+  const auto numMetadataFilters = typeDependentMetadataFiltersEnabled_
+      ? numScanSpecMetadataFilters
+      : metadataFilterIndices.size();
   auto isVarchar = type_->type()->isVarchar();
   auto lt = scanSpec.logicalTypeName();
-  if (isVarchar && (lt.empty() || lt != "STRING")) {
+  auto ct = scanSpec.convertedTypeName();
+  if (ct.empty() && isVarchar && (lt.empty() || lt != "STRING")) {
     VLOG(1)
         << "Skipping row group filter for VARCHAR column without logical type";
     return;
   }
-  if (scanSpec.filter() || scanSpec.numMetadataFilters() > 0) {
+  if (scanSpec.filter() || numMetadataFilters > 0) {
     for (auto i = 0; i < rowGroups_.size(); ++i) {
       if (scanSpec.filter() && !rowGroupMatches(i, scanSpec.filter(), input)) {
         bits::setBit(result.filterResult.data(), i);
         continue;
       }
-      for (int j = 0; j < scanSpec.numMetadataFilters(); ++j) {
-        auto* metadataFilter = scanSpec.metadataFilterAt(j);
-        if (!rowGroupMatches(i, metadataFilter, input)) {
+      for (int j = 0; j < numMetadataFilters; ++j) {
+        const auto filterIndex =
+            typeDependentMetadataFiltersEnabled_ ? j : metadataFilterIndices[j];
+        if (!rowGroupMatches(
+                i, scanSpec.metadataFilterAt(filterIndex), input)) {
           bits::setBit(
               result.metadataFilterResults[metadataFiltersStartIndex + j]
                   .second.data(),
@@ -109,13 +134,13 @@ std::unique_ptr<BlockSplitBloomFilter> ParquetData::loadBlockBloomFilter(
       columnMetaData.bloom_filter_offset > 0) {
     auto offset = columnMetaData.bloom_filter_offset;
     readSize = std::min(guessHeaderLen, fileLength - offset);
-    auto filter_stream =
+    auto filterStream =
         input.read(offset, readSize, dwio::common::LogType::HEADER);
     copy.resize(readSize);
     bufferStart = nullptr;
     bufferEnd = nullptr;
     dwio::common::readBytes(
-        readSize, filter_stream.get(), copy.data(), bufferStart, bufferEnd);
+        readSize, filterStream.get(), copy.data(), bufferStart, bufferEnd);
     auto thriftTransport = std::make_shared<thrift::ThriftBufferedTransport>(
         copy.data(), readSize);
     auto thriftProtocol =
@@ -126,18 +151,18 @@ std::unique_ptr<BlockSplitBloomFilter> ParquetData::loadBlockBloomFilter(
     if (filterHeader.numBytes > 0) {
       auto numBytes = filterHeader.numBytes;
       BOLT_CHECK_LE(numBytes, fileLength - offset);
-      auto bloomfilter = std::make_unique<BlockSplitBloomFilter>(numBytes);
-      auto bitmap_stream =
+      auto bloomFilter = std::make_unique<BlockSplitBloomFilter>(numBytes);
+      auto bitmapStream =
           input.read(offset, numBytes, dwio::common::LogType::HEADER);
       bufferStart = nullptr;
       bufferEnd = nullptr;
       dwio::common::readBytes(
           numBytes,
-          bitmap_stream.get(),
-          bloomfilter->getFilter().data(),
+          bitmapStream.get(),
+          bloomFilter->getFilter().data(),
           bufferStart,
           bufferEnd);
-      return bloomfilter;
+      return bloomFilter;
     }
   }
 
@@ -158,7 +183,7 @@ ParquetData::loadNGramBloomFilter(
   std::vector<std::pair<
       std::unique_ptr<struct NgramTokenExtractor>,
       std::unique_ptr<NGramBloomFilter>>>
-      token_bloom_filters;
+      tokenBloomFilters;
   auto fileLength = input.getReadFile()->size();
 
   auto& columnMetaData = rowGroups_[rowGroupId].columns[columnId].meta_data;
@@ -170,13 +195,13 @@ ParquetData::loadNGramBloomFilter(
       auto offset = columnMetaData.token_bloom_filter_offset[i];
       auto readSize = columnMetaData.token_bloom_filter_length[i];
       BOLT_CHECK_LE(readSize, fileLength - offset);
-      auto filter_stream =
+      auto filterStream =
           input.read(offset, readSize, dwio::common::LogType::HEADER);
       copy.resize(readSize);
       bufferStart = nullptr;
       bufferEnd = nullptr;
       dwio::common::readBytes(
-          readSize, filter_stream.get(), copy.data(), bufferStart, bufferEnd);
+          readSize, filterStream.get(), copy.data(), bufferStart, bufferEnd);
       auto thriftTransport = std::make_shared<thrift::ThriftBufferedTransport>(
           copy.data(), readSize);
       auto thriftProtocol =
@@ -190,18 +215,18 @@ ParquetData::loadNGramBloomFilter(
         auto extractor = std::make_unique<struct NgramTokenExtractor>(
             filterHeader.algorithm.NGRAM.nGram);
         BOLT_CHECK_EQ(headerSize + numBytes, readSize);
-        auto bloomfilter = std::make_unique<NGramBloomFilter>(
+        auto bloomFilter = std::make_unique<NGramBloomFilter>(
             numBytes,
             filterHeader.algorithm.NGRAM.hashes,
             filterHeader.algorithm.NGRAM.seed,
             copy.data() + headerSize);
-        token_bloom_filters.push_back(
-            std::make_pair(std::move(extractor), std::move(bloomfilter)));
+        tokenBloomFilters.push_back(
+            std::make_pair(std::move(extractor), std::move(bloomFilter)));
       }
     }
   }
 
-  return token_bloom_filters;
+  return tokenBloomFilters;
 }
 
 bool ParquetData::rowGroupMatches(
@@ -333,6 +358,7 @@ void ParquetData::enqueueRowGroup(
     dwio::common::BufferedInput& input) {
   auto& chunk = rowGroups_[index].columns[type_->column()];
   streams_.resize(rowGroups_.size());
+  repDefStreams_.resize(rowGroups_.size());
   BOLT_CHECK(
       chunk.__isset.meta_data,
       "ColumnMetaData does not exist for schema Id ",
@@ -352,7 +378,16 @@ void ParquetData::enqueueRowGroup(
       : metaData.total_compressed_size;
 
   auto id = dwio::common::StreamIdentifier(type_->column());
-  streams_[index] = input.enqueue({chunkReadOffset, readSize}, &id);
+  const auto region = common::Region{chunkReadOffset, readSize};
+  const bool useStreamingRepDefs = parquetRepDefStreamingWindowSize_ != 0 &&
+      maxRepeat_ > 0 && maxDefine_ > 0 && !chunk.__isset.crypto_metadata;
+  if (useStreamingRepDefs) {
+    auto [dataStream, repDefStream] = input.enqueuePair(region, &id);
+    streams_[index] = std::move(dataStream);
+    repDefStreams_[index] = std::move(repDefStream);
+  } else {
+    streams_[index] = input.enqueue(region, &id);
+  }
 }
 
 dwio::common::PositionProvider ParquetData::seekToRowGroup(int64_t index) {
@@ -360,35 +395,90 @@ dwio::common::PositionProvider ParquetData::seekToRowGroup(int64_t index) {
   BOLT_CHECK_LT(index, streams_.size());
   BOLT_CHECK(streams_[index], "Stream not enqueued for column");
   auto& metadata = rowGroups_[index].columns[type_->column()].meta_data;
+
+  auto& columnChunkMeta = rowGroups_[index].columns[type_->column()];
+
   reader_ = std::make_unique<PageReader>(
       std::move(streams_[index]),
       pool_,
       type_,
       metadata.codec,
       metadata.total_compressed_size,
-      statis_);
+      statis_,
+      std::move(repDefStreams_[index]));
   reader_->setDecodeRepDefPageCount(decodeRepDefPageCount_);
   reader_->setParquetRepDefMemoryLimit(parquetRepDefMemoryLimit_);
+  reader_->setParquetRepDefStreamingWindowSize(
+      parquetRepDefStreamingWindowSize_);
+
+  if (columnChunkMeta.__isset.crypto_metadata) {
+    std::shared_ptr<Decryptor> metaDecryptor;
+    std::shared_ptr<Decryptor> dataDecryptor;
+    auto& cryptoMetadata = columnChunkMeta.crypto_metadata;
+    if (cryptoMetadata.__isset.ENCRYPTION_WITH_FOOTER_KEY) {
+      metaDecryptor = fileDecryptor_->GetFooterDecryptorForColumnMeta();
+      dataDecryptor = fileDecryptor_->GetFooterDecryptorForColumnData();
+    } else {
+      auto toDotString = [&](const std::vector<std::string>& path) {
+        std::stringstream ss;
+        for (auto it = path.cbegin(); it != path.cend(); ++it) {
+          if (it != path.cbegin()) {
+            ss << ".";
+          }
+          ss << *it;
+        }
+        return ss.str();
+      };
+      const std::string& columnKeyMetadata =
+          cryptoMetadata.ENCRYPTION_WITH_COLUMN_KEY.key_metadata;
+      const std::string columnPath =
+          toDotString(cryptoMetadata.ENCRYPTION_WITH_COLUMN_KEY.path_in_schema);
+      metaDecryptor =
+          fileDecryptor_->GetColumnMetaDecryptor(columnPath, columnKeyMetadata);
+      dataDecryptor =
+          fileDecryptor_->GetColumnDataDecryptor(columnPath, columnKeyMetadata);
+    }
+    auto& ctx = reader_->getCryptoContext();
+    ctx.startDecryptWithDictionaryPage =
+        metadata.__isset.dictionary_page_offset;
+    ctx.rowGroupOrdinal = index;
+    ctx.columnOrdinal = type_->column();
+    ctx.metaDecryptor = std::move(metaDecryptor);
+    ctx.dataDecryptor = std::move(dataDecryptor);
+    reader_->initDecryption();
+  }
 
   return dwio::common::PositionProvider(empty);
 }
 
+void ParquetData::releaseRowGroupReader() {
+  reader_.reset();
+}
+
 std::pair<int64_t, int64_t> ParquetData::getRowGroupRegion(
     uint32_t index) const {
-  auto& rowGroup = rowGroups_[index];
-
+  const auto& rowGroup = rowGroups_[index];
   BOLT_CHECK_GT(rowGroup.columns.size(), 0);
-  auto fileOffset = rowGroup.__isset.file_offset ? rowGroup.file_offset
-      : rowGroup.columns[0].meta_data.__isset.dictionary_page_offset
-      ? rowGroup.columns[0].meta_data.dictionary_page_offset
-      : rowGroup.columns[0].meta_data.data_page_offset;
-  BOLT_CHECK_GT(fileOffset, 0);
 
-  auto length = rowGroup.__isset.total_compressed_size
-      ? rowGroup.total_compressed_size
-      : rowGroup.total_byte_size;
-
-  return {fileOffset, length};
+  int64_t begin = std::numeric_limits<int64_t>::max();
+  int64_t end = 0;
+  for (const auto& column : rowGroup.columns) {
+    BOLT_CHECK(column.__isset.meta_data);
+    const auto& metadata = column.meta_data;
+    const auto offset = metadata.__isset.dictionary_page_offset
+        ? metadata.dictionary_page_offset
+        : metadata.data_page_offset;
+    BOLT_CHECK_GE(offset, 0);
+    BOLT_CHECK_GE(metadata.total_compressed_size, 0);
+    BOLT_CHECK_LE(
+        offset,
+        std::numeric_limits<int64_t>::max() - metadata.total_compressed_size,
+        "Column chunk region overflows int64_t");
+    begin = std::min(begin, offset);
+    end = std::max(end, offset + metadata.total_compressed_size);
+  }
+  BOLT_CHECK_GT(end, begin);
+  return {begin, end - begin};
 }
 
 bool ParquetData::checkColumnFilter(

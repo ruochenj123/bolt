@@ -39,6 +39,7 @@
 #include "bolt/common/base/Doubles.h"
 #include "bolt/functions/Macros.h"
 #include "bolt/functions/lib/ToHex.h"
+#include "bolt/functions/prestosql/ArithmeticImpl.h"
 namespace bytedance::bolt::functions::sparksql {
 
 template <typename T>
@@ -201,6 +202,15 @@ struct FloorFunction {
       result = safeDoubleToInt64(std::floor(value));
     }
     return true;
+  }
+};
+
+template <typename T>
+struct RoundFunction {
+  template <typename TInput>
+  FOLLY_ALWAYS_INLINE void
+  call(TInput& result, const TInput& a, const int32_t b = 0) {
+    result = bytedance::bolt::functions::round<TInput, int32_t, true>(a, b);
   }
 };
 
@@ -399,7 +409,7 @@ struct WidthBucketFunction {
       double bound2,
       int64_t numBuckets) {
     // NULL would be returned if the input arguments don't follow conditions
-    // list belows:
+    // list below:
     // - `numBuckets` must be greater than zero and be less than Long.MaxValue.
     // - `value`, `bound1`, and `bound2` cannot be NaN.
     // - `bound1` bound cannot equal `bound2`.
@@ -557,6 +567,92 @@ struct RIntFunction {
 
   FOLLY_ALWAYS_INLINE void call(double& result, double input) {
     result = std::rint(input);
+  }
+};
+
+template <typename TExec>
+struct CheckedAddFunction {
+  BOLT_DEFINE_FUNCTION_TYPES(TExec);
+  template <typename T>
+  FOLLY_ALWAYS_INLINE Status call(T& result, const T& a, const T& b) {
+    if constexpr (std::is_integral_v<T>) {
+      T res;
+      bool overflow = __builtin_add_overflow(a, b, &res);
+      if (UNLIKELY(overflow)) {
+        if (threadSkipErrorDetails()) {
+          return Status::UserError();
+        }
+        return Status::UserError("Arithmetic overflow: {} + {}", a, b);
+      }
+      result = res;
+    } else {
+      result = a + b;
+    }
+    return Status::OK();
+  }
+};
+
+template <typename TExec>
+struct CheckedSubtractFunction {
+  BOLT_DEFINE_FUNCTION_TYPES(TExec);
+  template <typename T>
+  FOLLY_ALWAYS_INLINE Status call(T& result, const T& a, const T& b) {
+    if constexpr (std::is_integral_v<T>) {
+      bool overflow = __builtin_sub_overflow(a, b, &result);
+      if (UNLIKELY(overflow)) {
+        if (threadSkipErrorDetails()) {
+          return Status::UserError();
+        }
+        return Status::UserError("Arithmetic overflow: {} - {}", a, b);
+      }
+    } else {
+      result = a - b;
+    }
+    return Status::OK();
+  }
+};
+
+template <typename TExec>
+struct CheckedMultiplyFunction {
+  BOLT_DEFINE_FUNCTION_TYPES(TExec);
+  template <typename T>
+  FOLLY_ALWAYS_INLINE Status call(T& result, const T& a, const T& b) {
+    if constexpr (std::is_integral_v<T>) {
+      bool overflow = __builtin_mul_overflow(a, b, &result);
+      if (UNLIKELY(overflow)) {
+        if (threadSkipErrorDetails()) {
+          return Status::UserError();
+        }
+        return Status::UserError("Arithmetic overflow: {} * {}", a, b);
+      }
+    } else {
+      result = a * b;
+    }
+    return Status::OK();
+  }
+};
+
+template <typename TExec>
+struct CheckedDivideFunction {
+  BOLT_DEFINE_FUNCTION_TYPES(TExec);
+  template <typename T>
+  FOLLY_ALWAYS_INLINE Status call(T& result, const T& a, const T& b) {
+    if (b == 0) {
+      if (threadSkipErrorDetails()) {
+        return Status::UserError();
+      }
+      return Status::UserError("division by zero");
+    }
+    if constexpr (std::is_integral_v<T>) {
+      if (UNLIKELY(a == std::numeric_limits<T>::min() && b == -1)) {
+        if (threadSkipErrorDetails()) {
+          return Status::UserError();
+        }
+        return Status::UserError("Arithmetic overflow: {} / {}", a, b);
+      }
+    }
+    result = a / b;
+    return Status::OK();
   }
 };
 } // namespace bytedance::bolt::functions::sparksql

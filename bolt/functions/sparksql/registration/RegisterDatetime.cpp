@@ -28,10 +28,18 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include "bolt/functions/lib/RegistrationHelpers.h"
 #include "bolt/functions/prestosql/DateTimeFunctions.h"
 #include "bolt/functions/sparksql/DateTimeFunctions.h"
 namespace bytedance::bolt::functions::sparksql {
+namespace {
+template <typename T>
+using BuildJodaDateFormatFunction =
+    JodaDateFormatFunction<T, ::bytedance::bolt::kSparkCompatible>;
+} // namespace
+
 void registerDatetimeFunctions(const std::string& prefix) {
   // Register date functions.
   registerFunction<Date2PDateFunction, Varchar, Varchar>(
@@ -64,6 +72,11 @@ void registerDatetimeFunctions(const std::string& prefix) {
       UnixTimestampParseWithFormatFunction,
       int64_t,
       Varchar,
+      Varchar>({prefix + "unix_timestamp", prefix + "to_unix_timestamp"});
+  registerFunction<
+      UnixTimestampParseWithFormatFunction,
+      int64_t,
+      Date,
       Varchar>({prefix + "unix_timestamp", prefix + "to_unix_timestamp"});
 
   registerFunction<
@@ -151,11 +164,10 @@ void registerDatetimeFunctions(const std::string& prefix) {
       Timestamp,
       bool,
       Varchar>({prefix + "months_between"});
+  registerFunction<MonthsBetweenFunction, double, Timestamp, Timestamp, bool>(
+      {prefix + "months_between"});
 
-  registerFunction<DayOfWeekFunction, int32_t, Timestamp>(
-      {prefix + "dow", prefix + "dayofweek"});
-  registerFunction<DayOfWeekFunction, int32_t, Date>(
-      {prefix + "dow", prefix + "dayofweek"});
+  registerFunction<DayOfWeekFunction, int32_t, Date>({prefix + "dayofweek"});
 
   registerTimestampWithTimeZoneType();
   registerFunction<QuarterFunction, int32_t, Date>({prefix + "quarter"});
@@ -178,10 +190,10 @@ void registerDatetimeFunctions(const std::string& prefix) {
   registerFunction<MillisecondFunction, int32_t, Timestamp>(
       {prefix + "millisecond"});
 
-  registerFunction<JodaDateFormatFunction, Varchar, Timestamp, Varchar>(
+  registerFunction<BuildJodaDateFormatFunction, Varchar, Timestamp, Varchar>(
       {prefix + "date_format"});
   registerFunction<
-      JodaDateFormatFunction,
+      BuildJodaDateFormatFunction,
       Varchar,
       TimestampWithTimezone,
       Varchar>({prefix + "date_format"});
@@ -193,6 +205,7 @@ void registerDatetimeFunctions(const std::string& prefix) {
       {prefix + "make_ym_interval"});
   registerFunction<DateTruncFunction, Timestamp, Varchar, Timestamp>(
       {prefix + "date_trunc"});
+  registerFunction<TruncFunction, Date, Date, Varchar>({prefix + "trunc"});
 
   BOLT_REGISTER_VECTOR_FUNCTION(udf_make_timestamp, prefix + "make_timestamp");
 

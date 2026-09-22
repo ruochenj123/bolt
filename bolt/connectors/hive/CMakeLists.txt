@@ -25,19 +25,19 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_hive_config OBJECT HiveConfig.cpp)
+bolt_add_library(bolt_hive_config OBJECT HiveConfig.cpp)
 
 target_link_libraries(bolt_hive_config bolt_exception)
 
-add_library(
+bolt_add_library(
   bolt_hive_connector
   FileHandle.cpp
-  HiveConfig.cpp
   HiveConnector.cpp
   HiveConnectorSplit.cpp
   HiveConnectorUtil.cpp
   HiveDataSink.cpp
   HiveDataSource.cpp
+  HiveObjectFactory.cpp
   HivePartitionUtil.cpp
   HiveSplitReaderBase.cpp
   PaimonMetadataColumn.cpp
@@ -57,52 +57,62 @@ add_library(
 
 set(ENABLED_DWIO_FORMATS "")
 if(BOLT_ENABLE_ORC)
-  list(APPEND ENABLED_DWIO_FORMATS bolt_dwio_orc_reader bolt_dwio_orc_writer)
+  list(
+    APPEND ENABLED_DWIO_FORMATS
+    bolt_dwio_orc_reader
+    bolt_dwio_orc_writer
+  )
 endif()
 if(BOLT_ENABLE_PARQUET)
-  list(APPEND ENABLED_DWIO_FORMATS bolt_dwio_parquet_reader bolt_dwio_parquet_writer)
+  list(
+    APPEND ENABLED_DWIO_FORMATS
+    bolt_dwio_parquet_reader
+    bolt_dwio_parquet_writer
+  )
 endif()
 
 if(BOLT_ENABLE_TXT)
-  list(APPEND ENABLED_DWIO_FORMATS bolt_dwio_txt_reader bolt_dwio_txt_writer)
+  list(
+    APPEND ENABLED_DWIO_FORMATS
+    bolt_dwio_txt_reader
+    bolt_dwio_txt_writer
+  )
 endif()
 
 set(ENABLED_FILESYSTEMS "")
 
-if(BOLT_ENABLE_S3)
-  list(APPEND ENABLED_FILESYSTEMS "bolt_s3fs")
-endif()
-if(BOLT_ENABLE_GCS)
-  list(APPEND ENABLED_FILESYSTEMS "bolt_gcs")
-endif()
-if(BOLT_ENABLE_HDFS)
-  list(APPEND ENABLED_FILESYSTEMS "bolt_hdfs")
-endif()
-if(BOLT_ENABLE_ABFS)
-  list(APPEND ENABLED_FILESYSTEMS "bolt_abfs")
-endif()
+list(APPEND ENABLED_FILESYSTEMS "bolt_s3fs")
+list(APPEND ENABLED_FILESYSTEMS "bolt_gcs")
+list(APPEND ENABLED_FILESYSTEMS "bolt_hdfs")
+list(APPEND ENABLED_FILESYSTEMS "bolt_abfs")
 
 target_link_libraries(
   bolt_hive_connector
-  PUBLIC bolt_common_io
-         bolt_connector
-         bolt_dwio_catalog_fbhive
-         bolt_dwio_dwrf_reader
-         bolt_dwio_dwrf_writer
-         bolt_dwio_orc_reader
-         bolt_dwio_parquet_reader
-         bolt_dwio_parquet_writer
-         ${ENABLED_FILESYSTEMS}
-         ${ENABLED_DWIO_FORMATS}
-         bolt_dwio_paimon_deletion_vector_reader
-         bolt_file
-         bolt_hive_partition_function
-         arrow::arrow
+  PUBLIC
+    bolt_hive_config
+    bolt_common_io
+    bolt_connector
+    bolt_dwio_catalog_fbhive
+    bolt_dwio_dwrf_reader
+    bolt_dwio_dwrf_writer
+    bolt_dwio_orc_reader
+    bolt_dwio_parquet_reader
+    bolt_dwio_parquet_writer
+    ${ENABLED_FILESYSTEMS}
+    ${ENABLED_DWIO_FORMATS}
+    bolt_dwio_paimon_deletion_vector_reader
+    bolt_file
+    bolt_hive_partition_function
+    arrow::arrow
 )
 
-add_library(bolt_hive_partition_function HivePartitionFunction.cpp)
+bolt_add_library(bolt_hive_partition_function HivePartitionFunction.cpp)
 
-target_link_libraries(bolt_hive_partition_function bolt_core bolt_exec)
+target_link_libraries(
+  bolt_hive_partition_function
+  bolt_core
+  bolt_exec
+)
 
 add_subdirectory(storage_adapters)
 
@@ -110,7 +120,7 @@ if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
 
-if(${BOLT_ENABLE_BENCHMARKS})
+if(${BOLT_BUILD_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
 

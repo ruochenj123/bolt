@@ -28,6 +28,8 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include <gtest/gtest.h>
 #include <array>
 #include <cctype>
@@ -1413,8 +1415,10 @@ void StringFunctionsTest::testReplaceFlatVector(
   }
 }
 
-#ifndef SPARK_COMPATIBLE
 TEST_F(StringFunctionsTest, replace) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   replace_input_test_t testsThreeArgs = {
       {{"aaa", "a", "aa"}, {"aaaaaa"}},
       {{"123tech123", "123", "tech"}, {"techtechtech"}},
@@ -1456,6 +1460,9 @@ TEST_F(StringFunctionsTest, replace) {
 }
 
 TEST_F(StringFunctionsTest, replaceWithReusableInputButNoInplace) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   auto c0 = ({
     auto values = makeFlatVector<std::string>({"foo"});
     auto indices = allocateIndices(100, execCtx_.pool());
@@ -1478,7 +1485,6 @@ TEST_F(StringFunctionsTest, replaceWithReusableInputButNoInplace) {
     EXPECT_TRUE(result->isNullAt(i));
   }
 }
-#endif
 
 TEST_F(StringFunctionsTest, controlExprEncodingPropagation) {
   std::vector<std::string> dataASCII({"ali", "ali", "ali"});
@@ -1972,8 +1978,10 @@ TEST_F(StringFunctionsTest, concatInSwitchExpr) {
   test::assertEqualVectors(expected, result);
 }
 
-#ifndef SPARK_COMPATIBLE
 TEST_F(StringFunctionsTest, parseUrl) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   auto parse_url = [&](std::optional<std::string> url,
                        std::optional<std::string> part,
                        std::optional<std::string> key = std::nullopt) {
@@ -2022,7 +2030,6 @@ TEST_F(StringFunctionsTest, parseUrl) {
       "facebook.com");
   EXPECT_EQ(parse_url("about:blank", "HOST"), std::nullopt);
 }
-#endif
 
 TEST_F(StringFunctionsTest, varbinaryLength) {
   auto vector = makeFlatVector<std::string>(
@@ -2073,7 +2080,7 @@ TEST_F(StringFunctionsTest, printfTest) {
       std::optional<double>(),
       std::optional<double>());
   testPrintf(
-      "All Type Test: false, A, 15000, 1.234000e+01, +27183.2401, 2300.41, 32, corret, 0x1.002p8",
+      "All Type Test: false, A, 15000, 1.234000e+01, +27183.2401, 2300.41, 32, correct, 0x1.002p8",
       "printf('All Type Test: %b, %c, %d, %e, %+10.4f, %g, %h, %s, %a', c0, c1, c2, c3, c4, c5, c6, c7, c8)",
       false,
       65,
@@ -2082,10 +2089,10 @@ TEST_F(StringFunctionsTest, printfTest) {
       27183.240051,
       2300.41,
       50,
-      "corret",
+      "correct",
       256.125);
   testPrintf(
-      "全类型unicode测试： false， A， 15000， 1.234000e+01， +27183.2401， 2300.41， 32， corret， 0x1.002p8",
+      "全类型unicode测试： false， A， 15000， 1.234000e+01， +27183.2401， 2300.41， 32， correct， 0x1.002p8",
       "printf('全类型unicode测试： %b， %c， %d， %e， %+10.4f， %g， %h， %s， %a', c0, c1, c2, c3, c4, c5, c6, c7, c8)",
       false,
       65,
@@ -2094,7 +2101,7 @@ TEST_F(StringFunctionsTest, printfTest) {
       27183.240051,
       2300.41,
       50,
-      "corret",
+      "correct",
       256.125);
   testPrintfOptional(
       "Color red, String Null: null, number1 123456, number2 00089, Integer Null: null, hex 0xff, float  3.14 Double Null: null",

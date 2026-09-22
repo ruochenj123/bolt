@@ -154,7 +154,12 @@ template <typename TFilter, typename ExtractValues, bool isDense>
 class StringDictionaryColumnVisitor;
 
 // Template parameter for controlling filtering and action on a set of rows.
-template <typename T, typename TFilter, typename ExtractValues, bool isDense>
+template <
+    typename T,
+    typename TFilter,
+    typename ExtractValues,
+    bool isDense,
+    bool hasBulkPath = true>
 class ColumnVisitor {
  public:
   using FilterType = TFilter;
@@ -162,7 +167,11 @@ class ColumnVisitor {
   using HookType = typename Extract::HookType;
   using DataType = T;
   static constexpr bool dense = isDense;
-  static constexpr bool kHasBulkPath = true;
+  static constexpr bool kHasBulkPath = hasBulkPath;
+  static constexpr bool kHasFilter =
+      !std::is_same_v<TFilter, bolt::common::AlwaysTrue>;
+  static constexpr bool kHasHook =
+      !std::is_same_v<HookType, dwio::common::NoHook>;
   ColumnVisitor(
       TFilter& filter,
       SelectiveColumnReader* reader,
@@ -428,6 +437,10 @@ class ColumnVisitor {
     numValuesBias_ = bias;
   }
 
+  int32_t numValuesBias() const {
+    return numValuesBias_;
+  }
+
   void setNumValues(int32_t size) {
     reader_->setNumValues(numValuesBias_ + size);
     if constexpr (!std::is_same_v<TFilter, bolt::common::AlwaysTrue>) {
@@ -496,9 +509,14 @@ class ColumnVisitor {
   ExtractValues values_;
 };
 
-template <typename T, typename TFilter, typename ExtractValues, bool isDense>
+template <
+    typename T,
+    typename TFilter,
+    typename ExtractValues,
+    bool isDense,
+    bool hasBulkPath>
 FOLLY_ALWAYS_INLINE void
-ColumnVisitor<T, TFilter, ExtractValues, isDense>::filterFailed() {
+ColumnVisitor<T, TFilter, ExtractValues, isDense, hasBulkPath>::filterFailed() {
   const auto preceding = filter_.getPrecedingPositionsToFail();
   const auto succeeding = filter_.getSucceedingPositionsToFail();
   if (preceding) {
@@ -509,19 +527,37 @@ ColumnVisitor<T, TFilter, ExtractValues, isDense>::filterFailed() {
   }
 }
 
-template <typename T, typename TFilter, typename ExtractValues, bool isDense>
-inline void ColumnVisitor<T, TFilter, ExtractValues, isDense>::addResult(
+template <
+    typename T,
+    typename TFilter,
+    typename ExtractValues,
+    bool isDense,
+    bool hasBulkPath>
+inline void
+ColumnVisitor<T, TFilter, ExtractValues, isDense, hasBulkPath>::addResult(
     T value) {
-  values_.addValue(rowIndex_, value);
+  values_.addValue(rowIndex_ + numValuesBias_, value);
 }
 
-template <typename T, typename TFilter, typename ExtractValues, bool isDense>
-inline void ColumnVisitor<T, TFilter, ExtractValues, isDense>::addNull() {
-  values_.template addNull<T>(rowIndex_);
+template <
+    typename T,
+    typename TFilter,
+    typename ExtractValues,
+    bool isDense,
+    bool hasBulkPath>
+inline void
+ColumnVisitor<T, TFilter, ExtractValues, isDense, hasBulkPath>::addNull() {
+  values_.template addNull<T>(rowIndex_ + numValuesBias_);
 }
 
-template <typename T, typename TFilter, typename ExtractValues, bool isDense>
-inline void ColumnVisitor<T, TFilter, ExtractValues, isDense>::addOutputRow(
+template <
+    typename T,
+    typename TFilter,
+    typename ExtractValues,
+    bool isDense,
+    bool hasBulkPath>
+inline void
+ColumnVisitor<T, TFilter, ExtractValues, isDense, hasBulkPath>::addOutputRow(
     vector_size_t row) {
   reader_->addOutputRow(row);
 }
@@ -702,7 +738,15 @@ inline xsimd::batch<int64_t> cvtU32toI64(
     xsimd::batch<int32_t, xsimd::sse2> values) {
   return _mm256_cvtepu32_epi64(values);
 }
-#elif XSIMD_WITH_SSE2 || XSIMD_WITH_NEON
+#elif (XSIMD_WITH_SVE && SVE_BITS == 256)
+inline xsimd::batch<int64_t> cvtU32toI64(simd::Batch128<int32_t> values) {
+  int64_t element_1 = static_cast<uint32_t>(values.data[0]);
+  int64_t element_2 = static_cast<uint32_t>(values.data[1]);
+  int64_t element_3 = static_cast<uint32_t>(values.data[2]);
+  int64_t element_4 = static_cast<uint32_t>(values.data[3]);
+  return xsimd::batch<int64_t>(element_1, element_2, element_3, element_4);
+}
+#elif XSIMD_WITH_SSE2 || XSIMD_WITH_NEON || (XSIMD_WITH_SVE && SVE_BITS == 128)
 inline xsimd::batch<int64_t> cvtU32toI64(simd::Batch64<int32_t> values) {
   int64_t lo = static_cast<uint32_t>(values.data[0]);
   int64_t hi = static_cast<uint32_t>(values.data[1]);
@@ -821,7 +865,10 @@ class DictionaryColumnVisitor
         translateByDict(input, numInput, values);
         super::values_.hook().addValues(
             scatter ? scatterRows + super::rowIndex_
-                    : bolt::iota(super::numRows_, super::innerNonNullRows()) +
+                    : bolt::iota(
+                          super::numRows_,
+                          super::innerNonNullRows(),
+                          super::numValuesBias_) +
                     super::rowIndex_,
             values,
             numInput,
@@ -878,10 +925,19 @@ class DictionaryColumnVisitor
           dictMask,
           reinterpret_cast<const int32_t*>(filterCache() - 3),
           indices);
+#ifdef SVE_BITS
+      auto unknowns = simd::toBitMask(
+          simd::reinterpretBatch<uint32_t>((cache & (kUnknown << 24)) << 1) !=
+          xsimd::batch<uint32_t>(0));
+      auto passed = simd::toBitMask(
+          (cache & xsimd::batch<int32_t>(kSuccess << 24)) !=
+          xsimd::batch<int32_t>(0));
+#else
       auto unknowns = simd::toBitMask(xsimd::batch_bool<int32_t>(
           simd::reinterpretBatch<uint32_t>((cache & (kUnknown << 24)) << 1)));
       auto passed = simd::toBitMask(
           xsimd::batch_bool<int32_t>(simd::reinterpretBatch<uint32_t>(cache)));
+#endif
       if (UNLIKELY(unknowns)) {
         uint16_t bits = unknowns;
         // Ranges only over inputs that are in dictionary, the not in dictionary
@@ -1094,6 +1150,12 @@ class DictionaryColumnVisitor
     return state_.dictionary.numValues;
   }
 
+  static constexpr bool hasFilter() {
+    // Dictionary values cannot be null.
+    return !std::is_same_v<TFilter, bolt::common::AlwaysTrue> &&
+        !std::is_same_v<TFilter, bolt::common::IsNotNull>;
+  }
+
   uint8_t* filterCache() const {
     return state_.filterCache;
   }
@@ -1102,19 +1164,40 @@ class DictionaryColumnVisitor
   const uint8_t width_;
 };
 
-template <typename T, typename TFilter, typename ExtractValues, bool isDense>
+template <
+    typename T,
+    typename TFilter,
+    typename ExtractValues,
+    bool isDense,
+    bool hasBulkPath>
 DictionaryColumnVisitor<T, TFilter, ExtractValues, isDense>
-ColumnVisitor<T, TFilter, ExtractValues, isDense>::toDictionaryColumnVisitor() {
+ColumnVisitor<T, TFilter, ExtractValues, isDense, hasBulkPath>::
+    toDictionaryColumnVisitor() {
+  if constexpr (!kHasBulkPath) {
+    // Only DWRF integer dictionary is using this, which should not disable bulk
+    // path at decoder level.
+    BOLT_UNREACHABLE();
+  }
   auto result = DictionaryColumnVisitor<T, TFilter, ExtractValues, isDense>(
       filter_, reader_, RowSet(rows_ + rowIndex_, numRows_), values_);
-  result.numValuesBias_ = numValuesBias_;
+  result.setNumValuesBias(numValuesBias_);
   return result;
 }
 
-template <typename T, typename TFilter, typename ExtractValues, bool isDense>
+template <
+    typename T,
+    typename TFilter,
+    typename ExtractValues,
+    bool isDense,
+    bool hasBulkPath>
 StringDictionaryColumnVisitor<TFilter, ExtractValues, isDense>
-ColumnVisitor<T, TFilter, ExtractValues, isDense>::
+ColumnVisitor<T, TFilter, ExtractValues, isDense, hasBulkPath>::
     toStringDictionaryColumnVisitor() {
+  if constexpr (!kHasBulkPath) {
+    // Only DWRF string dictionary is using this, which should not disable bulk
+    // path at decoder level.
+    BOLT_UNREACHABLE();
+  }
   auto result = StringDictionaryColumnVisitor<TFilter, ExtractValues, isDense>(
       filter_, reader_, RowSet(rows_ + rowIndex_, numRows_), values_);
   result.setNumValuesBias(numValuesBias_);
@@ -1148,8 +1231,13 @@ class StringDictionaryColumnVisitor
     }
     vector_size_t previous =
         isDense && TFilter::deterministic ? 0 : super::currentRow();
-    if constexpr (std::is_same_v<TFilter, bolt::common::AlwaysTrue>) {
-      super::filterPassed(index);
+    if constexpr (!DictSuper::hasFilter()) {
+      if constexpr (super::kHasHook) {
+        super::values_.addValue(
+            super::rowIndex_ + super::numValuesBias_, valueInDictionary(index));
+      } else {
+        super::filterPassed(index);
+      }
     } else {
       // check the dictionary cache
       if (TFilter::deterministic &&
@@ -1161,7 +1249,7 @@ class StringDictionaryColumnVisitor
         super::filterFailed();
       } else {
         if (bolt::common::applyFilter(
-                super::filter_, valueInDictionary(value, inStrideDict))) {
+                super::filter_, valueInDictionary(index))) {
           super::filterPassed(index);
           if constexpr (TFilter::deterministic) {
             DictSuper::filterCache()[index] = FilterResult::kSuccess;
@@ -1204,25 +1292,31 @@ class StringDictionaryColumnVisitor
       int32_t& numValues) {
     DCHECK(input == values + numValues);
     setByInDict(values + numValues, numInput);
-    if (!hasFilter) {
+    if constexpr (!DictSuper::hasFilter()) {
       if (hasHook) {
         for (auto i = 0; i < numInput; ++i) {
-          auto value = input[i];
           super::values_.addValue(
               scatterRows ? scatterRows[super::rowIndex_ + i]
-                          : super::rowIndex_ + i,
-              value);
+                          : super::rowIndex_ + super::numValuesBias_ + i,
+              valueInDictionary(input[i]));
         }
       }
-      DCHECK_EQ(input, values + numValues);
-      if (scatter) {
+      if constexpr (std::is_same_v<TFilter, bolt::common::IsNotNull>) {
+        auto* begin = (scatter ? scatterRows : super::rows_) + super::rowIndex_;
+        std::copy(begin, begin + numInput, filterHits + numValues);
+        numValues += numInput;
+      } else if (scatter) {
         dwio::common::scatterDense(
             input, scatterRows + super::rowIndex_, numInput, values);
+        numValues = scatterRows[super::rowIndex_ + numInput - 1] + 1;
+      } else {
+        DCHECK_EQ(input, values + numValues);
+        numValues += numInput;
       }
-      numValues = scatter ? scatterRows[super::rowIndex_ + numInput - 1] + 1
-                          : numValues + numInput;
       super::rowIndex_ += numInput;
       return;
+    } else {
+      static_assert(hasFilter);
     }
     constexpr bool filterOnly =
         std::is_same_v<typename super::Extract, DropValues>;
@@ -1241,25 +1335,25 @@ class StringDictionaryColumnVisitor
       } else {
         cache = simd::gather<int32_t, int32_t, 1>(base, indices);
       }
+#ifdef SVE_BITS
+      auto unknowns = simd::toBitMask(
+          simd::reinterpretBatch<uint32_t>((cache & (kUnknown << 24)) << 1) !=
+          xsimd::batch<uint32_t>(0));
+      auto passed = simd::toBitMask(
+          (cache & xsimd::batch<int32_t>(kSuccess << 24)) !=
+          xsimd::batch<int32_t>(0));
+#else
       auto unknowns = simd::toBitMask(xsimd::batch_bool<int32_t>(
           simd::reinterpretBatch<uint32_t>((cache & (kUnknown << 24)) << 1)));
       auto passed = simd::toBitMask(
           xsimd::batch_bool<int32_t>(simd::reinterpretBatch<uint32_t>(cache)));
+#endif
       if (UNLIKELY(unknowns)) {
         uint16_t bits = unknowns;
         while (bits) {
           int index = bits::getAndClearLastSetBit(bits);
           int32_t value = input[i + index];
-          bool result;
-          if (value >= DictSuper::dictionarySize()) {
-            result = applyFilter(
-                super::filter_,
-                valueInDictionary(value - DictSuper::dictionarySize(), true));
-          } else {
-            result =
-                applyFilter(super::filter_, valueInDictionary(value, false));
-          }
-          if (result) {
+          if (applyFilter(super::filter_, valueInDictionary(value))) {
             DictSuper::filterCache()[value] = FilterResult::kSuccess;
             passed |= 1 << index;
           } else {
@@ -1339,65 +1433,15 @@ class StringDictionaryColumnVisitor
     }
   }
 
-  folly::StringPiece valueInDictionary(int64_t index, bool inStrideDict) {
-    if (inStrideDict) {
-      return folly::StringPiece(reinterpret_cast<const StringView*>(
-          DictSuper::state_.dictionary2.values)[index]);
+  folly::StringPiece valueInDictionary(int64_t index) {
+    auto stripeDictSize = DictSuper::state_.dictionary.numValues;
+    if (index < stripeDictSize) {
+      return reinterpret_cast<const StringView*>(
+          DictSuper::state_.dictionary.values)[index];
     }
-    return folly::StringPiece(reinterpret_cast<const StringView*>(
-        DictSuper::state_.dictionary.values)[index]);
+    return reinterpret_cast<const StringView*>(
+        DictSuper::state_.dictionary2.values)[index - stripeDictSize];
   }
-};
-
-class ExtractStringDictionaryToGenericHook {
- public:
-  static constexpr bool kSkipNulls = true;
-  using HookType = ValueHook;
-
-  ExtractStringDictionaryToGenericHook(
-      ValueHook* hook,
-      RowSet rows,
-      RawScanState state)
-
-      : hook_(hook), rows_(rows), state_(state) {}
-
-  bool acceptsNulls() {
-    return hook_->acceptsNulls();
-  }
-
-  template <typename T>
-  void addNull(vector_size_t rowIndex) {
-    hook_->addNull(rowIndex);
-  }
-
-  void addValue(vector_size_t rowIndex, int32_t value) {
-    // We take the string from the stripe or stride dictionary
-    // according to the index. Stride dictionary indices are offset up
-    // by the stripe dict size.
-    if (value < dictionarySize()) {
-      auto view = folly::StringPiece(
-          reinterpret_cast<const StringView*>(state_.dictionary.values)[value]);
-      hook_->addValue(rowIndex, &view);
-    } else {
-      BOLT_DCHECK(state_.inDictionary);
-      auto view = folly::StringPiece(reinterpret_cast<const StringView*>(
-          state_.dictionary2.values)[value - dictionarySize()]);
-      hook_->addValue(rowIndex, &view);
-    }
-  }
-
-  ValueHook& hook() {
-    return *hook_;
-  }
-
- private:
-  int32_t dictionarySize() const {
-    return state_.dictionary.numValues;
-  }
-
-  ValueHook* const hook_;
-  RowSet const rows_;
-  RawScanState state_;
 };
 
 template <typename T, typename TFilter, typename ExtractValues, bool isDense>

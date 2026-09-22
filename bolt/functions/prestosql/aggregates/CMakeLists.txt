@@ -25,29 +25,50 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-set(APAGG_TYPES "int8_t" "int16_t" "int32_t" "int64_t" "float" "double")
+set(
+  APAGG_TYPES
+  "int8_t"
+  "int16_t"
+  "int32_t"
+  "int64_t"
+  "float"
+  "double"
+)
 specialize_template(APAGG_GENERATED_FILES ApproxPercentileAggregate.cpp.in ${APAGG_TYPES})
 
-set(MIN_MAX_BY_TYPES
-    "bool"
-    "int8_t"
-    "int16_t"
-    "int32_t"
-    "int64_t"
-    "float"
-    "double"
-    "StringView"
-    "Timestamp"
-    "ComplexType"
+set(
+  MIN_MAX_BY_VALUE_TYPES
+  "bool"
+  "int8_t"
+  "int16_t"
+  "int32_t"
+  "int64_t"
+  "int128_t"
+  "float"
+  "double"
+  "StringView"
+  "Timestamp"
+  "ComplexType"
 )
-specialize_template(MAX_BY_NARG_GENERATED_FILES MaxByAggregatesNArg.cpp.in ${MIN_MAX_BY_TYPES})
-specialize_template(MIN_BY_NARG_GENERATED_FILES MinByAggregatesNArg.cpp.in ${MIN_MAX_BY_TYPES})
+set(MIN_MAX_BY_NARG_VALUE_TYPES ${MIN_MAX_BY_VALUE_TYPES})
+list(REMOVE_ITEM MIN_MAX_BY_NARG_VALUE_TYPES "int128_t")
+specialize_template(
+  MAX_BY_NARG_GENERATED_FILES MaxByAggregatesNArg.cpp.in ${MIN_MAX_BY_NARG_VALUE_TYPES}
+)
+specialize_template(
+  MIN_BY_NARG_GENERATED_FILES MinByAggregatesNArg.cpp.in ${MIN_MAX_BY_NARG_VALUE_TYPES}
+)
 
-add_library(
+specialize_template(
+  MIN_MAX_BY_FACTORY_GENERATED_FILES MinMaxByAggregate.cpp.in ${MIN_MAX_BY_VALUE_TYPES}
+)
+
+bolt_add_library(
   bolt_aggregates
   ${APAGG_GENERATED_FILES}
   ${MAX_BY_NARG_GENERATED_FILES}
   ${MIN_BY_NARG_GENERATED_FILES}
+  ${MIN_MAX_BY_FACTORY_GENERATED_FILES}
   ApproxDistinctAggregate.cpp
   ApproxMostFrequentAggregate.cpp
   ApproxPercentileAggregate.cpp
@@ -79,7 +100,9 @@ add_library(
   MapUnionSumAggregate.cpp
   MaxSizeForStatsAggregate.cpp
   MinMaxAggregates.cpp
+  MaxByAggregateRegistration.cpp
   MinMaxByAggregates.cpp
+  MinByAggregateRegistration.cpp
   MultiMapAggAggregate.cpp
   PrestoHasher.cpp
   ReduceAgg.cpp
@@ -106,6 +129,6 @@ if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
 
-if(${BOLT_ENABLE_BENCHMARKS})
+if(${BOLT_BUILD_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()

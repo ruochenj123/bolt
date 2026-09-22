@@ -13,16 +13,14 @@
 # limitations under the License.
 
 from conan import ConanFile
-from conan.errors import ConanInvalidConfiguration
-from conan.tools.build import check_min_cppstd
 from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
-from conan.tools.files import apply_conandata_patches, copy, export_conandata_patches, get, replace_in_file, rm, rmdir
-from conan.tools import files, scm
-from conan.tools.env import Environment, VirtualBuildEnv, VirtualRunEnv
-from conan.tools.microsoft import is_msvc, is_msvc_static_runtime, msvc_runtime_flag
-from conan.tools.scm import Version
+from conan.tools.files import apply_conandata_patches, copy, export_conandata_patches
+from conan.tools import scm
+from conan.tools.env import VirtualBuildEnv, VirtualRunEnv
+from conan.tools.microsoft import is_msvc
 
 import os
+
 
 class RyuConan(ConanFile):
     name = "ryu"
@@ -31,7 +29,7 @@ class RyuConan(ConanFile):
 
     def source(self):
         git = scm.Git(self, folder="..")
-        git.clone('https://github.com/ulfjack/ryu.git', target='src')
+        git.clone("https://github.com/ulfjack/ryu.git", target="src")
         git = scm.Git(self, folder=self.source_folder)
         # no release tag, use master
         commit = "1264a94"
@@ -62,7 +60,12 @@ class RyuConan(ConanFile):
         deps.generate()
 
     def package(self):
-        copy(self, "LICENSE*", self.source_folder, os.path.join(self.package_folder, "licenses"))
+        copy(
+            self,
+            "LICENSE*",
+            self.source_folder,
+            os.path.join(self.package_folder, "licenses"),
+        )
         cmake = CMake(self)
         cmake.install()
 
@@ -75,5 +78,7 @@ class RyuConan(ConanFile):
         self.cpp_info.components["libryu"].libs = ["ryu"]
 
         if not is_msvc:
-            self.cpp_info.components["generic_128"].set_property("pkg_config_name", "generic_128")
+            self.cpp_info.components["generic_128"].set_property(
+                "pkg_config_name", "generic_128"
+            )
             self.cpp_info.components["generic_128"].libs = ["generic_128"]

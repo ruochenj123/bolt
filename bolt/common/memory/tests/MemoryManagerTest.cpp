@@ -35,12 +35,10 @@
 #include <gmock/gmock-matchers.h>
 #include "bolt/common/base/BoltException.h"
 #include "bolt/common/base/tests/GTestUtils.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/memory/MallocAllocator.h"
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/SharedArbitrator.h"
-
-DECLARE_int32(bolt_memory_num_shared_leaf_pools);
-DECLARE_bool(bolt_enable_memory_usage_track_in_default_memory_pool);
 
 using namespace ::testing;
 namespace bytedance::bolt::memory {
@@ -48,9 +46,10 @@ namespace bytedance::bolt::memory {
 namespace {
 constexpr folly::StringPiece kSysRootName{"__sys_root__"};
 
-MemoryManager& toMemoryManager(MemoryManager& manager) {
-  return *static_cast<MemoryManager*>(&manager);
+MemoryPool& systemRootPool(MemoryManager& manager) {
+  return *manager.spillPool()->parent();
 }
+
 } // namespace
 
 class MemoryManagerTest : public testing::Test {
@@ -63,25 +62,25 @@ class MemoryManagerTest : public testing::Test {
 };
 
 TEST_F(MemoryManagerTest, ctor) {
-  const auto kSharedPoolCount = FLAGS_bolt_memory_num_shared_leaf_pools;
   {
     MemoryManager manager{};
     ASSERT_EQ(manager.numPools(), 3);
     ASSERT_EQ(manager.capacity(), kMaxMemory);
     ASSERT_EQ(0, manager.getTotalBytes());
+    ASSERT_EQ(&manager.deprecatedSysRootPool(), &systemRootPool(manager));
     ASSERT_EQ(manager.alignment(), MemoryAllocator::kMaxAlignment);
-    ASSERT_EQ(manager.deprecatedSysRootPool().alignment(), manager.alignment());
-    ASSERT_EQ(manager.deprecatedSysRootPool().capacity(), kMaxMemory);
-    ASSERT_EQ(manager.deprecatedSysRootPool().maxCapacity(), kMaxMemory);
+    ASSERT_EQ(systemRootPool(manager).alignment(), manager.alignment());
+    ASSERT_EQ(systemRootPool(manager).capacity(), kMaxMemory);
+    ASSERT_EQ(systemRootPool(manager).maxCapacity(), kMaxMemory);
     ASSERT_EQ(manager.arbitrator()->kind(), "NOOP");
-    auto sysPool = manager.deprecatedSysRootPool().shared_from_this();
+    auto sysPool = systemRootPool(manager).shared_from_this();
     ASSERT_NE(sysPool->reclaimer(), nullptr);
     try {
       BOLT_FAIL("Trigger Error");
     } catch (const bolt::BoltRuntimeError&) {
       BOLT_ASSERT_THROW(
           sysPool->reclaimer()->abort(
-              &manager.deprecatedSysRootPool(), std::current_exception()),
+              &systemRootPool(manager), std::current_exception()),
           "SysMemoryReclaimer::abort is not supported");
     }
     ASSERT_EQ(sysPool->reclaimer()->priority(), 0);
@@ -101,7 +100,7 @@ TEST_F(MemoryManagerTest, ctor) {
     MemoryManager manager{options};
     ASSERT_EQ(kCapacity, manager.capacity());
     ASSERT_EQ(manager.numPools(), 3);
-    ASSERT_EQ(manager.deprecatedSysRootPool().alignment(), manager.alignment());
+    ASSERT_EQ(systemRootPool(manager).alignment(), manager.alignment());
   }
   {
     const auto kCapacity = 8L * 1024 * 1024;
@@ -112,10 +111,9 @@ TEST_F(MemoryManagerTest, ctor) {
     MemoryManager manager{options};
 
     ASSERT_EQ(manager.alignment(), MemoryAllocator::kMinAlignment);
-    ASSERT_EQ(manager.deprecatedSysRootPool().alignment(), manager.alignment());
+    ASSERT_EQ(systemRootPool(manager).alignment(), manager.alignment());
     // TODO: replace with root pool memory tracker quota check.
-    ASSERT_EQ(
-        kSharedPoolCount + 3, manager.deprecatedSysRootPool().getChildCount());
+    ASSERT_EQ(3, systemRootPool(manager).getChildCount());
     ASSERT_EQ(kCapacity, manager.capacity());
     ASSERT_EQ(0, manager.getTotalBytes());
   }
@@ -141,6 +139,55 @@ TEST_F(MemoryManagerTest, ctor) {
         "freeCapacity 4.00GB freeReservedCapacity 0B] "
         "CONFIG[kind=SHARED;capacity=4.00GB;arbitrationStateCheckCb=(unset);]]]");
   }
+}
+
+TEST_F(MemoryManagerTest, managedPoolState) {
+  MemoryManager manager;
+
+  std::vector<MemoryPool*> pools;
+  manager.visitSystemRootChildren([&](MemoryPool* pool) {
+    pools.push_back(pool);
+    return true;
+  });
+  EXPECT_THAT(
+      pools,
+      UnorderedElementsAre(
+          manager.spillPool(), manager.cachePool(), manager.tracePool()));
+
+  const auto systemPoolState = manager.inspectManagedPoolState();
+  EXPECT_EQ(
+      systemPoolState.kind,
+      MemoryManager::ManagedPoolState::Kind::kOnlySystemPools);
+  EXPECT_EQ(systemPoolState.poolCount, 3);
+  EXPECT_TRUE(systemPoolState.diagnostic.empty());
+
+  auto outstandingPool = manager.addLeafPool("outstanding");
+  const auto outstandingPoolState = manager.inspectManagedPoolState();
+  EXPECT_EQ(
+      outstandingPoolState.kind,
+      MemoryManager::ManagedPoolState::Kind::kHasOutstandingPools);
+  EXPECT_EQ(outstandingPoolState.poolCount, 4);
+  EXPECT_TRUE(outstandingPoolState.diagnostic.empty());
+
+  pools.clear();
+  manager.visitSystemRootChildren([&](MemoryPool* pool) {
+    pools.push_back(pool);
+    return true;
+  });
+  EXPECT_THAT(
+      pools,
+      UnorderedElementsAre(
+          manager.spillPool(),
+          manager.cachePool(),
+          manager.tracePool(),
+          outstandingPool.get()));
+
+  size_t numVisitedPools = 0;
+  manager.visitSystemRootChildren([&](MemoryPool*) {
+    ++numVisitedPools;
+    return false;
+  });
+  EXPECT_EQ(numVisitedPools, 1);
 }
 
 namespace {
@@ -300,108 +347,6 @@ TEST_F(MemoryManagerTest, addPoolWithArbitrator) {
   ASSERT_EQ(aggregationPool->capacity(), initialPoolCapacity);
 }
 
-// TODO: remove this test when remove deprecatedDefaultMemoryManager.
-TEST_F(MemoryManagerTest, defaultMemoryManager) {
-  auto& managerA = toMemoryManager(deprecatedDefaultMemoryManager());
-  auto& managerB = toMemoryManager(deprecatedDefaultMemoryManager());
-  const auto kSharedPoolCount = FLAGS_bolt_memory_num_shared_leaf_pools + 3;
-  ASSERT_EQ(managerA.numPools(), 3);
-  ASSERT_EQ(managerA.deprecatedSysRootPool().getChildCount(), kSharedPoolCount);
-  ASSERT_EQ(managerB.numPools(), 3);
-  ASSERT_EQ(managerB.deprecatedSysRootPool().getChildCount(), kSharedPoolCount);
-
-  auto child1 = managerA.addLeafPool("child_1");
-  ASSERT_EQ(child1->parent()->name(), managerA.deprecatedSysRootPool().name());
-  auto child2 = managerB.addLeafPool("child_2");
-  ASSERT_EQ(child2->parent()->name(), managerA.deprecatedSysRootPool().name());
-  EXPECT_EQ(
-      kSharedPoolCount + 2, managerA.deprecatedSysRootPool().getChildCount());
-  EXPECT_EQ(
-      kSharedPoolCount + 2, managerB.deprecatedSysRootPool().getChildCount());
-  ASSERT_EQ(managerA.numPools(), 5);
-  ASSERT_EQ(managerB.numPools(), 5);
-  auto pool = managerB.addRootPool();
-  ASSERT_EQ(managerA.numPools(), 6);
-  ASSERT_EQ(managerB.numPools(), 6);
-  ASSERT_EQ(
-      managerA.toString(),
-      "Memory Manager[capacity UNLIMITED alignment 64B usedBytes 0B number of pools 6\nList of root pools:\n\t__sys_root__\n\tdefault_root_0\n\trefcount 2\nMemory Allocator[MALLOC capacity UNLIMITED allocated bytes 0 allocated pages 0 mapped pages 0]\nARBIRTATOR[NOOP CAPACITY[UNLIMITED]]]");
-  ASSERT_EQ(
-      managerB.toString(),
-      "Memory Manager[capacity UNLIMITED alignment 64B usedBytes 0B number of pools 6\nList of root pools:\n\t__sys_root__\n\tdefault_root_0\n\trefcount 2\nMemory Allocator[MALLOC capacity UNLIMITED allocated bytes 0 allocated pages 0 mapped pages 0]\nARBIRTATOR[NOOP CAPACITY[UNLIMITED]]]");
-  child1.reset();
-  EXPECT_EQ(
-      kSharedPoolCount + 1, managerA.deprecatedSysRootPool().getChildCount());
-  child2.reset();
-  EXPECT_EQ(kSharedPoolCount, managerB.deprecatedSysRootPool().getChildCount());
-  ASSERT_EQ(managerA.numPools(), 4);
-  ASSERT_EQ(managerB.numPools(), 4);
-  pool.reset();
-  ASSERT_EQ(managerA.numPools(), 3);
-  ASSERT_EQ(managerB.numPools(), 3);
-  ASSERT_EQ(
-      managerA.toString(),
-      "Memory Manager[capacity UNLIMITED alignment 64B usedBytes 0B number of pools 3\nList of root pools:\n\t__sys_root__\nMemory Allocator[MALLOC capacity UNLIMITED allocated bytes 0 allocated pages 0 mapped pages 0]\nARBIRTATOR[NOOP CAPACITY[UNLIMITED]]]");
-  ASSERT_EQ(
-      managerB.toString(),
-      "Memory Manager[capacity UNLIMITED alignment 64B usedBytes 0B number of pools 3\nList of root pools:\n\t__sys_root__\nMemory Allocator[MALLOC capacity UNLIMITED allocated bytes 0 allocated pages 0 mapped pages 0]\nARBIRTATOR[NOOP CAPACITY[UNLIMITED]]]");
-  const std::string detailedManagerStr = managerA.toString(true);
-  ASSERT_THAT(
-      detailedManagerStr,
-      testing::HasSubstr(
-          "Memory Manager[capacity UNLIMITED alignment 64B usedBytes 0B number of pools 3\nList of root pools:\n__sys_root__ usage 0B reserved 0B peak 0B\n"));
-  ASSERT_THAT(
-      detailedManagerStr,
-      testing::HasSubstr("__sys_spilling__ usage 0B reserved 0B peak 0B\n"));
-  ASSERT_THAT(
-      detailedManagerStr,
-      testing::HasSubstr("__sys_tracing__ usage 0B reserved 0B peak 0B\n"));
-  for (int i = 0; i < 32; ++i) {
-    ASSERT_THAT(
-        managerA.toString(true),
-        testing::HasSubstr(fmt::format(
-            "__sys_shared_leaf__{} usage 0B reserved 0B peak 0B\n", i)));
-  }
-}
-
-// TODO: remove this test when remove deprecatedAddDefaultLeafMemoryPool.
-TEST(MemoryHeaderTest, addDefaultLeafMemoryPool) {
-  auto& manager = toMemoryManager(deprecatedDefaultMemoryManager());
-  const auto kSharedPoolCount = FLAGS_bolt_memory_num_shared_leaf_pools + 3;
-  ASSERT_EQ(manager.deprecatedSysRootPool().getChildCount(), kSharedPoolCount);
-  {
-    auto poolA = deprecatedAddDefaultLeafMemoryPool();
-    ASSERT_EQ(poolA->kind(), MemoryPool::Kind::kLeaf);
-    auto poolB = deprecatedAddDefaultLeafMemoryPool();
-    ASSERT_EQ(poolB->kind(), MemoryPool::Kind::kLeaf);
-    EXPECT_EQ(
-        kSharedPoolCount + 2, manager.deprecatedSysRootPool().getChildCount());
-    {
-      auto poolC = deprecatedAddDefaultLeafMemoryPool();
-      ASSERT_EQ(poolC->kind(), MemoryPool::Kind::kLeaf);
-      EXPECT_EQ(
-          kSharedPoolCount + 3,
-          manager.deprecatedSysRootPool().getChildCount());
-      {
-        auto poolD = deprecatedAddDefaultLeafMemoryPool();
-        ASSERT_EQ(poolD->kind(), MemoryPool::Kind::kLeaf);
-        EXPECT_EQ(
-            kSharedPoolCount + 4,
-            manager.deprecatedSysRootPool().getChildCount());
-      }
-      EXPECT_EQ(
-          kSharedPoolCount + 3,
-          manager.deprecatedSysRootPool().getChildCount());
-    }
-    EXPECT_EQ(
-        kSharedPoolCount + 2, manager.deprecatedSysRootPool().getChildCount());
-  }
-  EXPECT_EQ(kSharedPoolCount, manager.deprecatedSysRootPool().getChildCount());
-
-  auto namedPool = deprecatedAddDefaultLeafMemoryPool("namedPool");
-  ASSERT_EQ(namedPool->name(), "namedPool");
-}
-
 TEST_F(MemoryManagerTest, defaultMemoryUsageTracking) {
   for (bool trackDefaultMemoryUsage : {false, true}) {
     MemoryManager::Options options;
@@ -436,7 +381,7 @@ TEST_F(MemoryManagerTest, memoryPoolManagement) {
     if (i % 2) {
       ASSERT_EQ(pool->kind(), MemoryPool::Kind::kLeaf);
       userLeafPools.push_back(pool);
-      ASSERT_EQ(pool->parent()->name(), manager.deprecatedSysRootPool().name());
+      ASSERT_EQ(pool->parent()->name(), systemRootPool(manager).name());
     } else {
       ASSERT_EQ(pool->kind(), MemoryPool::Kind::kAggregate);
       ASSERT_EQ(pool->parent(), nullptr);
@@ -474,21 +419,21 @@ TEST_F(MemoryManagerTest, globalMemoryManager) {
   ASSERT_NE(manager, globalManager);
   ASSERT_EQ(manager, memoryManager());
   auto* managerII = memoryManager();
-  const auto kSharedPoolCount = FLAGS_bolt_memory_num_shared_leaf_pools + 3;
+  constexpr int32_t kSystemPoolCount = 3;
   {
-    auto& rootI = manager->deprecatedSysRootPool();
+    auto& rootI = systemRootPool(*manager);
     const std::string childIName("some_child");
     auto childI = rootI.addLeafChild(childIName);
-    ASSERT_EQ(rootI.getChildCount(), kSharedPoolCount + 1);
+    ASSERT_EQ(rootI.getChildCount(), kSystemPoolCount + 1);
 
-    auto& rootII = managerII->deprecatedSysRootPool();
-    ASSERT_EQ(kSharedPoolCount + 1, rootII.getChildCount());
+    auto& rootII = systemRootPool(*managerII);
+    ASSERT_EQ(kSystemPoolCount + 1, rootII.getChildCount());
     std::vector<MemoryPool*> pools{};
     rootII.visitChildren([&pools](MemoryPool* child) {
       pools.emplace_back(child);
       return true;
     });
-    ASSERT_EQ(pools.size(), kSharedPoolCount + 1);
+    ASSERT_EQ(pools.size(), kSystemPoolCount + 1);
     int matchedCount = 0;
     for (const auto* pool : pools) {
       if (pool->name() == childIName) {
@@ -499,15 +444,15 @@ TEST_F(MemoryManagerTest, globalMemoryManager) {
 
     auto childII = manager->addLeafPool("another_child");
     ASSERT_EQ(childII->kind(), MemoryPool::Kind::kLeaf);
-    ASSERT_EQ(rootI.getChildCount(), kSharedPoolCount + 2);
+    ASSERT_EQ(rootI.getChildCount(), kSystemPoolCount + 2);
     ASSERT_EQ(childII->parent()->name(), kSysRootName.str());
     childII.reset();
-    ASSERT_EQ(rootI.getChildCount(), kSharedPoolCount + 1);
-    ASSERT_EQ(rootII.getChildCount(), kSharedPoolCount + 1);
+    ASSERT_EQ(rootI.getChildCount(), kSystemPoolCount + 1);
+    ASSERT_EQ(rootII.getChildCount(), kSystemPoolCount + 1);
     auto userRootChild = manager->addRootPool("rootChild");
     ASSERT_EQ(userRootChild->kind(), MemoryPool::Kind::kAggregate);
-    ASSERT_EQ(rootI.getChildCount(), kSharedPoolCount + 1);
-    ASSERT_EQ(rootII.getChildCount(), kSharedPoolCount + 1);
+    ASSERT_EQ(rootI.getChildCount(), kSystemPoolCount + 1);
+    ASSERT_EQ(rootII.getChildCount(), kSystemPoolCount + 1);
     ASSERT_EQ(manager->numPools(), 2 + 3);
   }
   ASSERT_EQ(manager->numPools(), 3);
@@ -545,7 +490,7 @@ TEST_F(MemoryManagerTest, alignmentOptionCheck) {
         manager.alignment(),
         std::max(testData.alignment, MemoryAllocator::kMinAlignment));
     ASSERT_EQ(
-        manager.deprecatedSysRootPool().alignment(),
+        systemRootPool(manager).alignment(),
         std::max(testData.alignment, MemoryAllocator::kMinAlignment));
     auto leafPool = manager.addLeafPool("leafPool");
     ASSERT_EQ(

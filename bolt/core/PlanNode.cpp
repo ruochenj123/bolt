@@ -28,6 +28,8 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include <folly/container/F14Set.h>
 
 #include "bolt/common/encode/Base64.h"
@@ -435,12 +437,13 @@ folly::dynamic AggregationNode::Aggregate::serialize() const {
 AggregationNode::Aggregate AggregationNode::Aggregate::deserialize(
     const folly::dynamic& obj,
     void* context) {
-  auto call = ISerializable::deserialize<CallTypedExpr>(obj["call"]);
+  auto call = ISerializable::deserialize<CallTypedExpr>(obj["call"], context);
   auto rawInputTypes =
       ISerializable::deserialize<std::vector<Type>>(obj["rawInputTypes"]);
   FieldAccessTypedExprPtr mask;
   if (obj.count("mask")) {
-    mask = ISerializable::deserialize<FieldAccessTypedExpr>(obj["mask"]);
+    mask =
+        ISerializable::deserialize<FieldAccessTypedExpr>(obj["mask"], context);
   }
   auto sortingKeys = deserializeFields(obj["sortingKeys"], context);
   auto sortingOrders = deserializeSortingOrders(obj["sortingOrders"]);
@@ -691,7 +694,8 @@ PlanNodePtr GroupIdNode::create(const folly::dynamic& obj, void* context) {
   for (const auto& info : obj["groupingKeyInfos"]) {
     groupingKeyInfos.push_back(
         {info["output"].asString(),
-         ISerializable::deserialize<FieldAccessTypedExpr>(info["input"])});
+         ISerializable::deserialize<FieldAccessTypedExpr>(
+             info["input"], context)});
   }
 
   auto groupingSets =
@@ -1131,7 +1135,7 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
 
   TypedExprPtr filter;
   if (obj.count("filter")) {
-    filter = ISerializable::deserialize<ITypedExpr>(obj["filter"]);
+    filter = ISerializable::deserialize<ITypedExpr>(obj["filter"], context);
   }
 
   auto outputType = deserializeRowType(obj["outputType"]);
@@ -1203,7 +1207,7 @@ PlanNodePtr MergeJoinNode::create(const folly::dynamic& obj, void* context) {
 
   TypedExprPtr filter;
   if (obj.count("filter")) {
-    filter = ISerializable::deserialize<ITypedExpr>(obj["filter"]);
+    filter = ISerializable::deserialize<ITypedExpr>(obj["filter"], context);
   }
 
   auto outputType = deserializeRowType(obj["outputType"]);
@@ -1780,11 +1784,9 @@ RowTypePtr getRowNumberOutputType(
   std::vector<TypePtr> types = inputType->children();
 
   names.push_back(rowNumberColumnName);
-#ifdef SPARK_COMPATIBLE
-  types.push_back(INTEGER());
-#else
-  types.push_back(BIGINT());
-#endif
+  types.push_back(
+      ::bytedance::bolt::kSparkCompatible ? TypePtr{INTEGER()}
+                                          : TypePtr{BIGINT()});
 
   return ROW(std::move(names), std::move(types));
 }
@@ -2607,7 +2609,7 @@ folly::dynamic FilterNode::serialize() const {
 PlanNodePtr FilterNode::create(const folly::dynamic& obj, void* context) {
   auto source = deserializeSingleSource(obj, context);
 
-  auto filter = ISerializable::deserialize<ITypedExpr>(obj["filter"]);
+  auto filter = ISerializable::deserialize<ITypedExpr>(obj["filter"], context);
   return std::make_shared<FilterNode>(
       deserializePlanNodeId(obj), filter, std::move(source));
 }

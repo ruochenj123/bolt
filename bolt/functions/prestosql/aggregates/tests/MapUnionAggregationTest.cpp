@@ -34,6 +34,7 @@
 using namespace bytedance::bolt::exec;
 using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::functions::aggregate::test;
+using bytedance::bolt::test::emptyArray;
 namespace bytedance::bolt::aggregate::test {
 
 namespace {
@@ -267,7 +268,7 @@ TEST_F(MapUnionTest, nulls) {
       makeNullableMapVector<int64_t, int64_t>({
           {{{1, 10}, {2, 20}, {3, 33}, {4, 44}, {5, 55}}},
           std::nullopt,
-          {{}},
+          emptyArray,
       }),
   });
 
@@ -357,7 +358,7 @@ TEST_F(MapUnionTest, unknownKeysAndValues) {
       /*config*/ {},
       /*testWithTableScan*/ false);
 
-  // map_union over non-emtpy map(unknown, T) is not allowed.
+  // map_union over non-empty map(unknown, T) is not allowed.
   data = makeRowVector({
       makeFlatVector<int32_t>({1, 2, 1}),
       // 3 map rows: {null, 100}, {null, 200}, {null, 300}.

@@ -192,7 +192,7 @@ void verifyPrefetch(
 }
 
 // This relies on schema and data inside of our fm_small and fm_large orc files,
-// and is not composeable with other schema/datas
+// and is not composeable with other schema/data
 void verifyFlatMapReading(
     DwrfRowReader* rowReader,
     const int32_t seeks[],
@@ -2452,7 +2452,7 @@ createWriterReader(
 
 } // namespace
 
-TEST_F(TestReader, appendRowNumberColumn) {
+TEST_F(TestReader, setRowNumberColumnInfo) {
   std::vector<std::vector<int32_t>> integerValues{
       {0, 1, 2, 3, 4},
       {5, 6, 7},
@@ -2468,7 +2468,10 @@ TEST_F(TestReader, appendRowNumberColumn) {
   spec->addAllChildFields(*schema);
   RowReaderOptions rowReaderOpts;
   rowReaderOpts.setScanSpec(spec);
-  rowReaderOpts.setAppendRowNumberColumn(true);
+  RowNumberColumnInfo rowNumberColumnInfo;
+  rowNumberColumnInfo.insertPosition = 1;
+  rowNumberColumnInfo.name = "";
+  rowReaderOpts.setRowNumberColumnInfo(rowNumberColumnInfo);
   {
     SCOPED_TRACE("Selective no filter");
     auto rowReader = reader->createRowReader(rowReaderOpts);
@@ -2494,7 +2497,10 @@ TEST_F(TestReader, reuseRowNumberColumn) {
   spec->addAllChildFields(*schema);
   RowReaderOptions rowReaderOpts;
   rowReaderOpts.setScanSpec(spec);
-  rowReaderOpts.setAppendRowNumberColumn(true);
+  RowNumberColumnInfo rowNumberColumnInfo;
+  rowNumberColumnInfo.insertPosition = 1;
+  rowNumberColumnInfo.name = "";
+  rowReaderOpts.setRowNumberColumnInfo(rowNumberColumnInfo);
   {
     SCOPED_TRACE("Reuse passed in");
     auto rowReader = reader->createRowReader(rowReaderOpts);

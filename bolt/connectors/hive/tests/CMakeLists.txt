@@ -31,6 +31,7 @@ add_executable(
   HiveConfigTest.cpp
   HiveConnectorSerDeTest.cpp
   HiveConnectorTest.cpp
+  HiveRowIndexTest.cpp
   HiveDataSinkTest.cpp
   HivePartitionFunctionTest.cpp
   HivePartitionUtilTest.cpp
@@ -39,15 +40,4 @@ add_executable(
 )
 add_test(bolt_hive_connector_test bolt_hive_connector_test)
 
-target_link_libraries(
-  bolt_hive_connector_test
-  bolt_hive_connector
-  bolt_hive_partition_function
-  bolt_dwio_common_exception
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  bolt_exec
-  bolt_exec_test_lib
-  GTest::gtest
-  GTest::gtest_main
-)
+target_link_libraries(bolt_hive_connector_test bolt_gtest_main)

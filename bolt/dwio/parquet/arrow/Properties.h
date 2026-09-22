@@ -32,6 +32,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -47,14 +49,22 @@
 #include "bolt/dwio/parquet/arrow/Schema.h"
 #include "bolt/dwio/parquet/arrow/Types.h"
 #include "bolt/dwio/parquet/arrow/util/Compression.h"
+#include "bolt/dwio/parquet/writer/WriterMetrics.h"
+#include "bolt/version/version.h"
 
-// Define the parquet created by version.
+// Define the parquet created_by value. Keep this compatible with parquet-mr's
+// VersionParser because Java readers use it to validate binary statistics.
 
 #ifdef CREATED_BY_VERSION
 #undef CREATED_BY_VERSION
 #endif
 
-#define CREATED_BY_VERSION "parquet-cpp-bolt"
+#ifndef BOLT_PARQUET_CREATED_BY_VERSION
+#define BOLT_PARQUET_CREATED_BY_VERSION "1.0.0"
+#endif
+
+#define CREATED_BY_VERSION \
+  "parquet-cpp-bolt version " BOLT_PARQUET_CREATED_BY_VERSION
 namespace bytedance::bolt::parquet::arrow {
 
 using bytedance::bolt::parquet::arrow::util::CodecOptions;
@@ -231,6 +241,12 @@ class PARQUET_EXPORT ReaderProperties {
 ReaderProperties PARQUET_EXPORT default_reader_properties();
 
 static constexpr int64_t kDefaultDataPageSize = 1024 * 1024;
+// Keep enough headroom for encoded level counts while minimizing changes to
+// existing page layouts. Page count fields are signed int32 in the Parquet
+// format, and RLE run headers encode the count shifted left by one bit.
+static constexpr int64_t kMaxRowsPerPage =
+    std::numeric_limits<int32_t>::max() / 2;
+static constexpr int64_t kDefaultMaxRowsPerPage = kMaxRowsPerPage;
 static constexpr bool DEFAULT_IS_DICTIONARY_ENABLED = true;
 static constexpr int64_t DEFAULT_DICTIONARY_PAGE_SIZE_LIMIT =
     kDefaultDataPageSize;
@@ -239,7 +255,10 @@ static constexpr int64_t DEFAULT_MAX_ROW_GROUP_LENGTH = 1024 * 1024;
 static constexpr bool DEFAULT_ARE_STATISTICS_ENABLED = true;
 static constexpr int64_t DEFAULT_MAX_STATISTICS_SIZE = 4096;
 static constexpr Encoding::type DEFAULT_ENCODING = Encoding::UNKNOWN;
-static const char DEFAULT_CREATED_BY[] = CREATED_BY_VERSION;
+static const std::string CREATED_BY_BUILD =
+    std::string(" (build ") + ::bytedance::bolt::BuildInfo::shortHash + ")";
+static const std::string DEFAULT_CREATED_BY =
+    std::string(CREATED_BY_VERSION) + CREATED_BY_BUILD;
 static constexpr Compression::type DEFAULT_COMPRESSION_TYPE =
     Compression::UNCOMPRESSED;
 static constexpr bool DEFAULT_IS_PAGE_INDEX_ENABLED = false;
@@ -367,6 +386,7 @@ class PARQUET_EXPORT WriterProperties {
         : pool_(::arrow::default_memory_pool()),
           write_batch_size_(DEFAULT_WRITE_BATCH_SIZE),
           max_row_group_length_(DEFAULT_MAX_ROW_GROUP_LENGTH),
+          max_rows_per_page_(kDefaultMaxRowsPerPage),
           version_(ParquetVersion::PARQUET_2_6),
           data_page_version_(ParquetDataPageVersion::V1),
           created_by_(DEFAULT_CREATED_BY),
@@ -446,6 +466,10 @@ class PARQUET_EXPORT WriterProperties {
     /// Specify the write batch size while writing batches of Arrow values into
     /// Parquet. Default 1024.
     Builder* write_batch_size(int64_t write_batch_size) {
+      if (write_batch_size <= 0) {
+        throw ParquetException(
+            "Write batch size must be positive: ", write_batch_size);
+      }
       write_batch_size_ = write_batch_size;
       return this;
     }
@@ -477,6 +501,20 @@ class PARQUET_EXPORT WriterProperties {
         const std::shared_ptr<schema::ColumnPath>& path,
         int64_t pg_size) {
       return this->data_pagesize(path->ToDotString(), pg_size);
+    }
+
+    /// Specify the maximum number of rows per data page.
+    /// Default INT32_MAX / 2 rows.
+    Builder* max_rows_per_page(int64_t max_rows) {
+      if (max_rows <= 0 || max_rows > kMaxRowsPerPage) {
+        throw ParquetException(
+            "Maximum rows per data page must be in range [1, ",
+            kMaxRowsPerPage,
+            "]: ",
+            max_rows);
+      }
+      max_rows_per_page_ = max_rows;
+      return this;
     }
 
     /// Specify the data page version.
@@ -815,6 +853,12 @@ class PARQUET_EXPORT WriterProperties {
       return this;
     }
 
+    Builder* writer_metrics(
+        std::shared_ptr<WriterMetricsCollector> writerMetrics) {
+      writerMetrics_ = std::move(writerMetrics);
+      return this;
+    }
+
     /// \brief Build the WriterProperties with the builder parameters.
     /// \return The WriterProperties defined by the builder.
     std::shared_ptr<WriterProperties> build() {
@@ -848,6 +892,7 @@ class PARQUET_EXPORT WriterProperties {
           pool_,
           write_batch_size_,
           max_row_group_length_,
+          max_rows_per_page_,
           parquet_block_size_,
           version_,
           created_by_,
@@ -857,13 +902,15 @@ class PARQUET_EXPORT WriterProperties {
           column_properties,
           data_page_version_,
           store_decimal_as_integer_,
-          std::move(sorting_columns_)));
+          std::move(sorting_columns_),
+          std::move(writerMetrics_)));
     }
 
    private:
     MemoryPool* pool_;
     int64_t write_batch_size_;
     int64_t max_row_group_length_;
+    int64_t max_rows_per_page_;
     int64_t parquet_block_size_{-1};
     ParquetVersion::type version_;
     ParquetDataPageVersion data_page_version_;
@@ -887,6 +934,7 @@ class PARQUET_EXPORT WriterProperties {
     std::unordered_map<std::string, bool> page_index_enabled_;
     std::unordered_map<std::string, int64_t> dictionary_pagesize_limit_;
     std::unordered_map<std::string, int64_t> pagesize_;
+    std::shared_ptr<WriterMetricsCollector> writerMetrics_;
   };
 
   inline MemoryPool* memory_pool() const {
@@ -899,6 +947,10 @@ class PARQUET_EXPORT WriterProperties {
 
   inline int64_t max_row_group_length() const {
     return max_row_group_length_;
+  }
+
+  inline int64_t max_rows_per_page() const {
+    return max_rows_per_page_;
   }
 
   inline int64_t parquet_block_size() const {
@@ -1025,6 +1077,10 @@ class PARQUET_EXPORT WriterProperties {
     return file_encryption_properties_.get();
   }
 
+  const std::shared_ptr<WriterMetricsCollector>& writer_metrics() const {
+    return writerMetrics_;
+  }
+
   std::shared_ptr<ColumnEncryptionProperties> column_encryption_properties(
       const std::string& path) const {
     if (file_encryption_properties_) {
@@ -1039,6 +1095,7 @@ class PARQUET_EXPORT WriterProperties {
       MemoryPool* pool,
       int64_t write_batch_size,
       int64_t max_row_group_length,
+      int64_t max_rows_per_page,
       int64_t parquet_block_size,
       ParquetVersion::type version,
       const std::string& created_by,
@@ -1049,10 +1106,12 @@ class PARQUET_EXPORT WriterProperties {
           column_properties,
       ParquetDataPageVersion data_page_version,
       bool store_short_decimal_as_integer,
-      std::vector<SortingColumn> sorting_columns)
+      std::vector<SortingColumn> sorting_columns,
+      std::shared_ptr<WriterMetricsCollector> writerMetrics)
       : pool_(pool),
         write_batch_size_(write_batch_size),
         max_row_group_length_(max_row_group_length),
+        max_rows_per_page_(max_rows_per_page),
         parquet_block_size_(parquet_block_size),
         parquet_data_page_version_(data_page_version),
         parquet_version_(version),
@@ -1062,12 +1121,14 @@ class PARQUET_EXPORT WriterProperties {
         file_encryption_properties_(file_encryption_properties),
         sorting_columns_(std::move(sorting_columns)),
         default_column_properties_(default_column_properties),
-        column_properties_(column_properties) {}
+        column_properties_(column_properties),
+        writerMetrics_(std::move(writerMetrics)) {}
 
   MemoryPool* pool_;
   int64_t dictionary_pagesize_limit_;
   int64_t write_batch_size_;
   int64_t max_row_group_length_;
+  int64_t max_rows_per_page_;
   int64_t pagesize_;
   int64_t parquet_block_size_;
   ParquetDataPageVersion parquet_data_page_version_;
@@ -1082,6 +1143,7 @@ class PARQUET_EXPORT WriterProperties {
 
   ColumnProperties default_column_properties_;
   std::unordered_map<std::string, ColumnProperties> column_properties_;
+  std::shared_ptr<WriterMetricsCollector> writerMetrics_;
 };
 
 PARQUET_EXPORT const std::shared_ptr<WriterProperties>&
@@ -1443,6 +1505,17 @@ struct ArrowWriteContext {
         this->data_buffer->Resize(num_values * sizeof(T), false));
     *out = reinterpret_cast<T*>(this->data_buffer->mutable_data());
     return ::arrow::Status::OK();
+  }
+
+  int64_t scratch_allocated_bytes() const {
+    int64_t total_bytes = 0;
+    if (data_buffer != nullptr) {
+      total_bytes += data_buffer->capacity();
+    }
+    if (def_levels_buffer != nullptr) {
+      total_bytes += def_levels_buffer->capacity();
+    }
+    return total_bytes;
   }
 
   MemoryPool* memory_pool;

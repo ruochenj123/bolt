@@ -14,8 +14,6 @@
 # limitations under the License.
 #
 
-CUR_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
-
 set -exu
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -24,7 +22,6 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-
 if [ $# -lt 1 ]; then
   GCC_VERSION=12.5.0
   echo "by default GCC_VERSION=12.5.0"
@@ -32,7 +29,9 @@ else
   GCC_VERSION=$1
 fi
 
-GCC_URL=https://github.com/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${GCC_VERSION}.tar.gz
+# GCC_URL=https://github.com/gcc-mirror/gcc/archive/refs/tags/releases/gcc-${GCC_VERSION}.tar.gz
+GCC_URL=https://mirrors.aliyun.com/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.gz
+# shellcheck source=/dev/null
 . /etc/os-release
 
 if [[ "$ID" = "centos" || "$ID" = "fedora" ]]; then
@@ -42,12 +41,12 @@ if [[ "$ID" = "debian" || "$ID" = "ubuntu" ]]; then
   apt update && apt install -y gcc g++ make bzip2 autoconf automake
 fi
 
-rm -rf /tmp/gcc-${GCC_VERSION}*
-wget  https://mirrors.aliyun.com/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.gz -P /tmp
-tar -xzvf /tmp/gcc-${GCC_VERSION}.tar.gz -C /tmp && cd $(realpath /tmp/gcc-${GCC_VERSION})
+rm -rf /tmp/gcc-"${GCC_VERSION}"*
+wget "$GCC_URL" -P /tmp
+tar -xzvf /tmp/gcc-"${GCC_VERSION}".tar.gz -C /tmp && cd "$(realpath /tmp/gcc-"${GCC_VERSION}")"
 ./contrib/download_prerequisites
 ./configure --prefix=/usr/ --enable-checking=release --enable-languages=c,c++ --disable-multilib
-make -j $(nproc) && make install-strip
+make -j "$(nproc)" && make install-strip
 ldconfig
-rm -rf  /tmp/gcc*
+rm -rf /tmp/gcc*
 gcc --version

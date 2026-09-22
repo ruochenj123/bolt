@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <vector/ComplexVector.h>
 #include "bolt/exec/tests/utils/OperatorTestBase.h"
 #include "bolt/shuffle/sparksql/Options.h"
 
@@ -64,6 +65,11 @@ struct ShuffleTestParam {
   int64_t memoryLimit = 1024 * 1024 * 1024; // 1GB
   int32_t batchSize = 32;
   int32_t numBatches = 4;
+  int32_t shuffleBufferSize = kDefaultShuffleWriterBufferSize;
+  bool verifyOutput = true;
+  // On-wire row format for the RowBased writer (shuffleMode == 3); ignored by
+  // the other modes. Threaded into both writer and reader options.
+  row::RowFormat rowFormat = bytedance::bolt::row::RowFormat::DENSE;
 
   std::string toString() const;
 
@@ -94,10 +100,15 @@ class ShuffleTestBase : public bytedance::bolt::exec::test::OperatorTestBase {
   // writer with custom input data and then shuffle reader and verify output
   void executeTestWithCustomInput(
       const ShuffleTestParam& param,
-      ShuffleInputData& inputData);
+      ShuffleInputData& inputData,
+      ShuffleRunResult* resultOut = nullptr);
 
   // execute test with param, generating input data internally
   void executeTest(const ShuffleTestParam& param);
+
+  std::shared_ptr<CompositeRowVector> createCompositeRowVectorWithPid(
+      const RowTypePtr& rowTypeWithoutPid,
+      vector_size_t rowCount);
 
  private:
   ShuffleInputData makeInputData(const ShuffleTestParam& param);
@@ -118,8 +129,7 @@ class ShuffleTestBase : public bytedance::bolt::exec::test::OperatorTestBase {
   ShuffleRunResult runShuffle(
       const std::vector<std::vector<RowVectorPtr>>& inputsPerMapper,
       const RowTypePtr& outputType,
-      const ShuffleTestParam& param,
-      const ShuffleInputData& inputData);
+      const ShuffleTestParam& param);
 };
 
 } // namespace bytedance::bolt::shuffle::sparksql::test

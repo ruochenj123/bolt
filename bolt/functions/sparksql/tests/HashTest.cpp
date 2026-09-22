@@ -200,7 +200,7 @@ TEST_F(HashTest, Array) {
 
   using array_type = std::optional<std::vector<std::optional<int64_t>>>;
   array_type array1 = {{1, 2}};
-  array_type array2 = {{}};
+  array_type array2 = emptyArray;
   array_type array3 = {{1, 100, 2}};
 
   // -1181176833, -1181176833, 1246926396

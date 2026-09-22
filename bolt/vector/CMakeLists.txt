@@ -25,7 +25,7 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(
+bolt_add_library(
   bolt_vector
   BaseVector.cpp
   ComplexVector.cpp
@@ -37,6 +37,7 @@ add_library(
   SequenceVector.cpp
   SimpleVector.cpp
   VariantToVector.cpp
+  VariantVector.cpp
   VectorEncoding.cpp
   VectorPool.cpp
   VectorPrinter.cpp
@@ -64,6 +65,6 @@ elseif(${BOLT_BUILD_TEST_UTILS})
   add_subdirectory(tests/utils)
 endif()
 
-if(${BOLT_ENABLE_BENCHMARKS})
+if(${BOLT_BUILD_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()

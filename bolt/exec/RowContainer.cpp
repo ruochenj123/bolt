@@ -48,7 +48,7 @@
 #ifdef ENABLE_BOLT_JIT
 #include "bolt/jit/RowContainer/RowContainerCodeGenerator.h"
 #include "bolt/jit/RowContainer/RowEqVectorsCodeGenerator.h"
-#include "bolt/jit/ThrustJIT.h"
+#include "bolt/jit/ThrustJITv2.h"
 #endif
 
 #include <bit>
@@ -205,6 +205,7 @@ RowContainer::RowContainer(
     bool isJoinBuild,
     bool hasProbedFlag,
     bool hasNormalizedKeys,
+    bool useListRowIndex,
     memory::MemoryPool* pool,
     std::shared_ptr<HashStringAllocator> stringAllocator)
     : keyTypes_(keyTypes),
@@ -212,10 +213,12 @@ RowContainer::RowContainer(
       isJoinBuild_(isJoinBuild),
       accumulators_(accumulators),
       hasNormalizedKeys_(hasNormalizedKeys),
+      useListRowIndex_(useListRowIndex),
       rows_(pool),
       stringAllocator_(
           stringAllocator ? stringAllocator
-                          : std::make_shared<HashStringAllocator>(pool)) {
+                          : std::make_shared<HashStringAllocator>(pool)),
+      rowPointers_(StlAllocator<char*>(stringAllocator_.get())) {
   // Compute the layout of the payload row.  The row has keys, null flags,
   // accumulators, dependent fields. All fields are fixed width. If variable
   // width data is referenced, this is done with StringView(for VARCHAR) and
@@ -355,6 +358,9 @@ char* RowContainer::newRow() {
         normalizedKeySize_;
     if (normalizedKeySize_) {
       ++numRowsWithNormalizedKey_;
+    }
+    if (useListRowIndex_) {
+      rowPointers_.push_back(row);
     }
   }
   return initializeRow(row, false /* reuse */);
@@ -534,22 +540,25 @@ void RowContainer::store(
     char* row,
     int32_t column) {
   auto numKeys = keyTypes_.size();
-  if (column < numKeys && !nullableKeys_) {
+  bool isKey = column < numKeys;
+  if (isKey && !nullableKeys_) {
     BOLT_DYNAMIC_TYPE_DISPATCH(
         storeNoNulls,
         typeKinds_[column],
         decoded,
         index,
+        isKey,
         row,
         offsets_[column]);
   } else {
-    BOLT_DCHECK(column < keyTypes_.size() || accumulators_.empty());
+    BOLT_DCHECK(isKey || accumulators_.empty());
     auto rowColumn = rowColumns_[column];
     BOLT_DYNAMIC_TYPE_DISPATCH_ALL(
         storeWithNulls,
         typeKinds_[column],
         decoded,
         index,
+        isKey,
         row,
         rowColumn.offset(),
         rowColumn.nullByte(),
@@ -843,6 +852,7 @@ void RowContainer::extractString(
 void RowContainer::storeComplexType(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool isKey,
     char* row,
     int32_t offset,
     int32_t nullByte,
@@ -856,7 +866,9 @@ void RowContainer::storeComplexType(
   // RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
   ByteOutputStream stream(stringAllocator_.get(), false, false);
   auto position = stringAllocator_->newWrite(stream);
-  ContainerRowSerde::serialize(*decoded.base(), decoded.index(index), stream);
+  ContainerRowSerdeOptions options{.isKey = isKey};
+  ContainerRowSerde::serialize(
+      *decoded.base(), decoded.index(index), stream, options);
   stringAllocator_->finishWrite(stream, 0);
 
   valueAt<std::string_view>(row, offset) = std::string_view(
@@ -1043,10 +1055,12 @@ void RowContainer::hash(
 }
 
 void RowContainer::clear() {
+#ifndef NDEBUG
   LOG(INFO) << "RowContainer::clear, rows: " << numRows()
             << ", numFreeRows_: " << numFreeRows_
             << ", string allocator size: " << stringAllocator_->size()
             << ", free space: " << stringAllocator_->freeSpace();
+#endif
   const bool sharedStringAllocator = (stringAllocator_.use_count() != 1);
   if (checkFree_ || sharedStringAllocator || usesExternalMemory_) {
     constexpr int32_t kBatch = 1000;
@@ -1057,6 +1071,11 @@ void RowContainer::clear() {
     }
   }
   rows_.clear();
+  {
+    std::vector<char*, StlAllocator<char*>> emptyRowPointers{
+        rowPointers_.get_allocator()};
+    rowPointers_.swap(emptyRowPointers);
+  }
   if (!sharedStringAllocator) {
     if (checkFree_) {
       stringAllocator_->checkEmpty();
@@ -1120,7 +1139,8 @@ std::optional<int64_t> RowContainer::estimateRowSize() const {
   }
   int64_t freeBytes = rows_.freeBytes() + fixedRowSize_ * numFreeRows_;
   int64_t usedSize = rows_.allocatedBytes() - freeBytes +
-      stringAllocator_->retainedSize() - stringAllocator_->freeSpace();
+      stringAllocator_->retainedSize() - stringAllocator_->freeSpace() -
+      rowPointers_.capacity() * sizeof(char*);
   int64_t rowSize = usedSize / numRows_;
   BOLT_CHECK_GT(
       rowSize, 0, "Estimated row size of the RowContainer must be positive.");
@@ -1507,7 +1527,6 @@ HybridContainer::~HybridContainer() {
 
 void HybridContainer::addPayload(RowVectorPtr input) {
   BOLT_CHECK_EQ(input->childrenSize(), payloadTypes_.size());
-  
   totalRows_ += input->size();
   totalBatches_++;
 
@@ -1517,8 +1536,8 @@ void HybridContainer::addPayload(RowVectorPtr input) {
   }
 
   // In scattered mode, decode payload columns upfront for efficient extraction.
-  // DecodedVector handles lazy loading and any encoding (dictionary, constant, etc.)
-  // and provides efficient valueAt<T>() access.
+  // DecodedVector handles lazy loading and any encoding (dictionary, constant,
+  // etc.) and provides efficient valueAt<T>() access.
   if (scatteredModeEnabled_) {
     std::vector<std::unique_ptr<DecodedVector>> decodedCols;
     decodedCols.reserve(payloadTypes_.size());
@@ -1538,7 +1557,7 @@ void HybridContainer::addPayload(RowVectorPtr input) {
 void HybridContainer::clear() {
   owningInputs_.clear();
   decodedPayloads_.clear();
-  isNullable_.resize(payloadTypes_.size(), false);
+  std::fill(isNullable_.begin(), isNullable_.end(), false);
   totalRows_ = 0;
   totalBatches_ = 0;
   std::fill(payloadFlatBytesSum_.begin(), payloadFlatBytesSum_.end(), 0);
@@ -1594,7 +1613,7 @@ int32_t HybridContainer::fixedSizeAt(column_index_t column) const {
 extern "C" {
 
 // An wrapper, called by LLVM IR.
-__attribute__((__visibility__("default"))) int32_t StringViewCompareWrapper(
+__attribute__((__visibility__("default"))) int32_t jit_StringViewCompareWrapper(
     char* l,
     char* r) {
   bytedance::bolt::StringView left = *(bytedance::bolt::StringView*)l;
@@ -1619,16 +1638,15 @@ __attribute__((__visibility__("default"))) int32_t StringViewCompareWrapper(
   }
 }
 
-__attribute__((__visibility__("default"))) int32_t RowBasedStringViewCompare(
-    char* l,
-    char* r) {
+__attribute__((__visibility__("default"))) int32_t
+jit_RowBasedStringViewCompare(char* l, char* r) {
   bytedance::bolt::StringView left = *(bytedance::bolt::StringView*)l;
   bytedance::bolt::StringView right = *(bytedance::bolt::StringView*)r;
   auto ans = left.compare(right);
   return ans == 0 ? 0 : (ans > 0 ? 1 : -1);
 }
 
-__attribute__((__visibility__("default"))) int32_t ComplexTypeRowCmpRow(
+__attribute__((__visibility__("default"))) int32_t jit_ComplexTypeRowCmpRow(
     char* left,
     char* right,
     int64_t typePtr,
@@ -1646,7 +1664,8 @@ __attribute__((__visibility__("default"))) int32_t ComplexTypeRowCmpRow(
       {static_cast<bool>(nullFirst), static_cast<bool>(ascending), false});
 }
 
-__attribute__((__visibility__("default"))) int32_t RowBasedComplexTypeRowCmpRow(
+__attribute__((__visibility__("default"))) int32_t
+jit_RowBased_ComplexTypeRowCmpRow(
     char* left,
     char* right,
     int64_t typePtr,
@@ -1676,7 +1695,7 @@ __attribute__((__visibility__("default"))) int32_t RowBasedComplexTypeRowCmpRow(
       {static_cast<bool>(nullFirst), static_cast<bool>(ascending), false});
 }
 
-__attribute__((__visibility__("default"))) int8_t StringViewRowEqVectors(
+__attribute__((__visibility__("default"))) int8_t jit_StringViewRowEqVectors(
     char* l,
     char* r) {
   bytedance::bolt::StringView left = *(bytedance::bolt::StringView*)l;
@@ -1687,35 +1706,35 @@ __attribute__((__visibility__("default"))) int8_t StringViewRowEqVectors(
              .compare(right) == 0;
 }
 
-__attribute__((__visibility__("default"))) int8_t GetDecodedValueBool(
+__attribute__((__visibility__("default"))) int8_t jit_GetDecodedValueBool(
     char* vec,
     int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)->valueAt<bool>(
       index);
 }
 
-__attribute__((__visibility__("default"))) int8_t GetDecodedValueI8(
+__attribute__((__visibility__("default"))) int8_t jit_GetDecodedValueI8(
     char* vec,
     int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)
       ->valueAt<int8_t>(index);
 }
 
-__attribute__((__visibility__("default"))) int16_t GetDecodedValueI16(
+__attribute__((__visibility__("default"))) int16_t jit_GetDecodedValueI16(
     char* vec,
     int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)
       ->valueAt<int16_t>(index);
 }
 
-__attribute__((__visibility__("default"))) int32_t GetDecodedValueI32(
+__attribute__((__visibility__("default"))) int32_t jit_GetDecodedValueI32(
     char* vec,
     int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)
       ->valueAt<int32_t>(index);
 }
 
-__attribute__((__visibility__("default"))) int64_t GetDecodedValueI64(
+__attribute__((__visibility__("default"))) int64_t jit_GetDecodedValueI64(
     char* vec,
     int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)
@@ -1723,19 +1742,19 @@ __attribute__((__visibility__("default"))) int64_t GetDecodedValueI64(
 }
 
 __attribute__((__visibility__("default"))) bytedance::bolt::int128_t
-GetDecodedValueI128(char* vec, int32_t index) {
+jit_GetDecodedValueI128(char* vec, int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)
       ->valueAt<bytedance::bolt::int128_t>(index);
 }
 
-__attribute__((__visibility__("default"))) float GetDecodedValueFloat(
+__attribute__((__visibility__("default"))) float jit_GetDecodedValueFloat(
     char* vec,
     int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)->valueAt<float>(
       index);
 }
 
-__attribute__((__visibility__("default"))) double GetDecodedValueDouble(
+__attribute__((__visibility__("default"))) double jit_GetDecodedValueDouble(
     char* vec,
     int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)
@@ -1743,7 +1762,7 @@ __attribute__((__visibility__("default"))) double GetDecodedValueDouble(
 }
 // get decoded value string
 __attribute__((__visibility__("default"))) const char*
-GetDecodedValueStringView(char* vec, int32_t index) {
+jit_GetDecodedValueStringView(char* vec, int32_t index) {
   auto* decoded = reinterpret_cast<bytedance::bolt::DecodedVector*>(vec);
   return reinterpret_cast<const char*>(
       decoded->data<bytedance::bolt::StringView>() + decoded->indices()[index]);
@@ -1751,7 +1770,7 @@ GetDecodedValueStringView(char* vec, int32_t index) {
 
 // TODO: consider little or big endianness?
 __attribute__((__visibility__("default"))) int8_t
-CmpRowVecTimestamp(char* vec, int32_t index, char* rowPtr) {
+jit_CmpRowVecTimestamp(char* vec, int32_t index, char* rowPtr) {
   auto ts = reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)
                 ->valueAt<bytedance::bolt::Timestamp>(index);
 
@@ -1761,15 +1780,15 @@ CmpRowVecTimestamp(char* vec, int32_t index, char* rowPtr) {
   return ts == rts;
 }
 
-// GetDecodedIsNull
-__attribute__((__visibility__("default"))) int8_t GetDecodedIsNull(
+// jit_GetDecodedIsNull
+__attribute__((__visibility__("default"))) int8_t jit_GetDecodedIsNull(
     char* vec,
     int32_t index) {
   return reinterpret_cast<bytedance::bolt::DecodedVector*>(vec)->isNullAt(
       index);
 }
 
-__attribute__((__visibility__("default"))) int8_t ComplexTypeRowEqVectors(
+__attribute__((__visibility__("default"))) int8_t jit_ComplexTypeRowEqVectors(
     const char* row,
     int32_t offset,
     char* vec,
@@ -1781,7 +1800,7 @@ __attribute__((__visibility__("default"))) int8_t ComplexTypeRowEqVectors(
 }
 
 __attribute__((__visibility__("default"))) void
-DebugPrint(int64_t mask, int64_t left, int64_t right) {
+jit_DebugPrint(int64_t mask, int64_t left, int64_t right) {
   std::cout << "mask: " << mask << ", left: " << left << ", right: " << right
             << std::endl;
   return;

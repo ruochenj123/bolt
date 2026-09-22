@@ -41,6 +41,7 @@
 #include "bolt/exec/Operator.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/RowContainer.h"
+#include "bolt/exec/SortBufferBase.h"
 #include "bolt/exec/Spill.h"
 #include "bolt/vector/BaseVector.h"
 
@@ -49,7 +50,7 @@ namespace bytedance::bolt::exec {
 /// A utility class to accumulate data inside and output the sorted result.
 /// Spilling would be triggered if spilling is enabled and memory usage exceeds
 /// limit.
-class SortBuffer {
+class SortBuffer : public SortBufferBase {
  public:
   SortBuffer(
       const RowTypePtr& input,
@@ -60,33 +61,40 @@ class SortBuffer {
       const common::SpillConfig* spillConfig = nullptr,
       uint64_t spillMemoryThreshold = 0,
       OperatorCtx* operatorCtx = nullptr,
-      bool hybridSortEnabled = false);
+      bool hybridSortEnabled = false,
+      bool scatteredModeEnabled = false);
 
-  void addInput(const VectorPtr& input);
+  ~SortBuffer() override;
+
+  void addInput(const VectorPtr& input) override;
 
   /// Indicates no more input and triggers either of:
   ///  - In-memory sorting on rows stored in 'data_' if spilling is not enabled.
   ///  - Finish spilling and setup the sort merge reader for the un-spilling
   ///  processing for the output.
-  void noMoreInput();
+  void noMoreInput() override;
 
   /// Returns the sorted output rows in batch.
-  RowVectorPtr getOutput(uint32_t maxOutputRows);
+  RowVectorPtr getOutput(vector_size_t maxOutputRows) override;
 
   /// Indicates if this sort buffer can spill or not.
-  bool canSpill() const {
+  bool canSpill() const override {
     return spillConfig_ != nullptr;
   }
 
+  bool canReclaim() const override {
+    return canSpill();
+  }
+
   /// Invoked to spill all the rows from 'data_'.
-  void spill();
+  void spill() override;
 
   memory::MemoryPool* pool() const {
     return pool_;
   }
 
   /// Returns the spiller stats including total bytes and rows spilled so far.
-  std::optional<common::SpillStats> spilledStats() const {
+  std::optional<common::SpillStats> spilledStats() const override {
     if (spiller_ == nullptr) {
       return std::nullopt;
     }
@@ -94,7 +102,7 @@ class SortBuffer {
   }
 
   /// Returns the spill read stats, currently only spillReadTime supported.
-  std::optional<common::SpillReadStats> spillReadStats() const {
+  std::optional<common::SpillReadStats> spillReadStats() const override {
     common::SpillReadStats spillReadStats;
     if (spillMerger_ != nullptr) {
       spillReadStats.spillReadTimeUs = spillMerger_->getSpillReadTime();
@@ -113,7 +121,7 @@ class SortBuffer {
     return spillReadStats;
   }
 
-  std::optional<common::SortStats> sortStats() const {
+  std::optional<common::SortStats> sortStats() const override {
     common::SortStats sortStats;
     sortStats.sortColToRowTimeUs = getSortColToRowTime();
     sortStats.sortInSortTimeUs = getSortInSortTime();
@@ -133,15 +141,15 @@ class SortBuffer {
     return sortInSortTimeUs_;
   }
 
-  size_t numOutputRows() {
+  size_t numOutputRows() const override {
     return numOutputRows_;
   }
 
-  size_t numInputRows() {
+  size_t numInputRows() const override {
     return numInputRows_;
   }
 
-  std::optional<uint64_t> estimateOutputRowSize() const;
+  std::optional<uint64_t> estimateOutputRowSize() const override;
 
   void setSortAlgo(SortAlgo algo) {
     sorter_ = HybridSorter{algo};
@@ -161,9 +169,12 @@ class SortBuffer {
  private:
   // Ensures there is sufficient memory reserved to process 'input'.
   void ensureInputFits(const VectorPtr& input);
+  // Reserves memory for output processing. If reservation cannot be increased,
+  // spills enough to make output fit.
+  void ensureOutputFits(vector_size_t outputBatchSize);
   void updateEstimatedOutputRowSize();
   // Invoked to initialize or reset the reusable output buffer to get output.
-  void prepareOutput(uint32_t maxOutputRows);
+  void prepareOutput(vector_size_t outputBatchSize);
   void getOutputWithoutSpill();
   void getOutputWithSpill();
   // Spill during input stage.
@@ -173,6 +184,7 @@ class SortBuffer {
   // Finish spill, and we shouldn't get any rows from non-spilled partition as
   // there is only one hash partition for SortBuffer.
   void finishSpill();
+  void prepareOutputWithSpill();
 
   const RowTypePtr input_;
   const std::vector<CompareFlags> sortCompareFlags_;
@@ -208,6 +220,7 @@ class SortBuffer {
   // sort key columns are stored first then the non-sorted data columns.
   RowTypePtr spillerStoreType_;
   std::unique_ptr<Spiller> spiller_;
+  std::unique_ptr<SpillPartition> pendingSpillPartition_;
   // Used to merge the sorted runs from in-memory rows and spilled rows on disk.
   std::unique_ptr<TreeOfLosers<SpillMergeStream>> spillMerger_;
   std::unique_ptr<TreeOfLosers<RowBasedSpillMergeStream>> rowBasedSpillMerger_;
@@ -236,6 +249,8 @@ class SortBuffer {
 
   // For hybrid design
   bool hybridSortEnabled_{false};
+  bool scatteredMode_{
+      false}; // Use scattered (non-coalesced) mode for hybrid sort
   std::unique_ptr<HybridContainer> hybridData_{nullptr};
   std::vector<IdentityProjection> keyColumnMap_;
   std::vector<IdentityProjection> payloadColumnMap_;

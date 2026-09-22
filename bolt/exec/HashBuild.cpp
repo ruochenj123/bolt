@@ -32,6 +32,7 @@
 #include <boost/sort/pdqsort/pdqsort.hpp>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 #include "bolt/common/base/Counters.h"
 #include "bolt/common/base/Exceptions.h"
@@ -116,6 +117,11 @@ HashBuild::HashBuild(
     LOG(INFO) << __FUNCTION__ << ": isDREnabled_ = " << isDREnabled_;
   }
   joinBridge_->addBuilder();
+  if (auto opaqueHashTable = joinNode_->reusableHashTable()) {
+    TestValue::adjust("bytedance::bolt::exec::HashBuild::HashBuild", this);
+    setReusableHashTable(opaqueHashTable);
+    return;
+  }
 
   auto inputType = joinNode_->sources()[1]->outputType();
 
@@ -148,22 +154,11 @@ HashBuild::HashBuild(
   std::vector<std::string> dependentNames;
   std::vector<TypePtr> dependentTypes;
 
-  // Hybrid mode stores payload row-wise in HybridContainer; requires
-  // numDependents > 0.
-  hybridJoin_ =
-      operatorCtx_->driverCtx()->queryConfig().hybridJoinEnabled() &&
+  hybridJoin_ = operatorCtx_->driverCtx()->queryConfig().hybridJoinEnabled() &&
       numDependents > 0 && !joinNode_->isLeftSemiFilterJoin() &&
       !joinNode_->isLeftSemiProjectJoin() && !joinNode_->isAntiJoin();
-
-  // Scattered mode: keep payload batches separate instead of coalescing
-  scatteredModeEnabled_ = hybridJoin_ &&
+  scatteredMode_ = hybridJoin_ &&
       operatorCtx_->driverCtx()->queryConfig().hybridJoinScatteredModeEnabled();
-
-  VLOG(1) << "HashBuild " << planNodeId() << " constructor:"
-            << " hybridJoin_=" << hybridJoin_
-            << ", scatteredModeEnabled_=" << scatteredModeEnabled_
-            << ", numKeys=" << numKeys
-            << ", numDependents=" << numDependents;
 
   if (!dropDuplicates_ && numDependents > 0) {
     // Number of join keys (numKeys) may be less then number of input columns
@@ -209,11 +204,16 @@ HashBuild::HashBuild(
   LOG(INFO) << name() << " HashBuild created for " << operatorCtx_->toString()
             << ", spill enabled: " << spillEnabled()
             << ", maxHashTableSize = " << maxHashTableBucketCount_
-            << ", hybrid mode " << (hybridJoin_ ? "enabled" : "disbaled");
+            << ", hybrid mode " << (hybridJoin_ ? "enabled" : "disabled")
+            << ", scattered mode " << (scatteredMode_ ? "enabled" : "disabled");
 }
 
 void HashBuild::initialize() {
   Operator::initialize();
+
+  if (reuseHashTable_) {
+    return;
+  }
 
   if (isAntiJoin(joinType_) && joinNode_->filter()) {
     setupFilterForAntiJoins(keyChannelMap_);
@@ -289,10 +289,6 @@ void HashBuild::setupTable() {
   lookup_->reset(1);
   analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
 
-  // TEST: Force kHash mode to confirm J2 probe slowdown hypothesis
-  // Remove this line after testing!
-  analyzeKeys_ = false;
-
   if (hybridJoin_) {
     table_->hybridData()->setId(static_cast<uint8_t>(driverId_));
     // Initialize allContainers_ with itself so spilling can work before table
@@ -304,9 +300,37 @@ void HashBuild::setupTable() {
     // testing.
     table_->hybridData()->setReorderEnabled(
         queryConfig.hybridJoinReorderEnabled());
-    // Set scattered mode flag - when enabled, payloads are not coalesced
-    table_->hybridData()->setScatteredModeEnabled(scatteredModeEnabled_);
+    // Set scattered mode - in scattered mode, payload batches are kept separate
+    // and rowId encodes (batchId, rowInBatch) instead of global row index.
+    table_->hybridData()->setScatteredModeEnabled(scatteredMode_);
   }
+}
+
+void HashBuild::setReusableHashTable(
+    std::shared_ptr<core::OpaqueHashTable> opaqueHashTable) {
+  LOG(INFO) << "Enter setReusableHashTable!";
+  BOLT_USER_CHECK(
+      !joinNode_->isRightJoin() && !joinNode_->isFullJoin() &&
+          !joinNode_->isRightSemiFilterJoin() &&
+          !joinNode_->isRightSemiProjectJoin(),
+      "Reusable hash table is not supported for join types that require "
+      "build-side probed flags");
+  reuseHashTable_ = true;
+  joinBridge_->start();
+  setState(State::kFinish);
+
+  if (joinNode_->joinHasNullKeys() && isAntiJoin(joinType_) && nullAware_ &&
+      !joinNode_->filter()) {
+    joinBridge_->setAntiJoinHasNullKeys();
+    return;
+  }
+
+  auto reusableHashTable =
+      std::reinterpret_pointer_cast<exec::BaseHashTable>(opaqueHashTable);
+
+  joinBridge_->setHashTable(
+      std::move(reusableHashTable), {}, joinNode_->joinHasNullKeys(), nullptr);
+  LOG(INFO) << "setReusableHashTable success!";
 }
 
 void HashBuild::setupSpiller(
@@ -490,7 +514,7 @@ void HashBuild::addSpilledRowInput(std::vector<char*>& rows, uint32_t size) {
   if (rows.empty()) {
     return;
   }
-  // TODO: support directly respill rows readed from spiller
+  // TODO: support directly respill rows read from spiller
   // now direct copy spilled rows to table, increase the risic of OOM
 
   // even though ensureInputFits return false, we still need to spill rows
@@ -517,7 +541,7 @@ void HashBuild::addInput(RowVectorPtr input) {
     return;
   }
 
-  TestValue::adjust("bytedance::bolt::exec::HashBuild::addInput", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::HashBuild::addInput", this);
 
   auto& hashers = table_->hashers();
 
@@ -638,10 +662,10 @@ void HashBuild::addInput(RowVectorPtr input) {
   auto nextOffset = rows->nextOffset();
 
   if (hybridJoin_) {
-    auto baseRow = table_->hybridData()->getNumRows();
-    auto batchId = table_->hybridData()->getNumBatches();
-    const bool useScattered = scatteredModeEnabled_;
-    
+    // Get batch/row info before processing
+    auto batchId = table_->hybridData()->getNumBatches(); // for scattered mode
+    auto baseRow = table_->hybridData()->getNumRows(); // for coalesced mode
+
     activeRows_.applyToSelected([&](auto rowIndex) {
       char* newRow = rows->newRow();
       if (nextOffset) {
@@ -653,15 +677,19 @@ void HashBuild::addInput(RowVectorPtr input) {
       for (auto i = 0; i < hashers.size(); ++i) {
         rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
       }
-      // Store RowId:
-      // - Coalesced mode: driverId (8 bits) | globalRowId (56 bits)
-      // - Scattered mode: driverId (8 bits) | batchId (24 bits) | rowInBatch (32 bits)
+      // Store RowId - encoding depends on mode
       uint64_t encodedId;
-      if (useScattered) {
+      if (scatteredMode_) {
+        // Scattered mode: rowId = (batchId << 32) | rowInBatch
+        // driverId stored in top 8 bits, remaining 56 bits for
+        // batchId+rowInBatch
+        BOLT_CHECK_LT(batchId, (1u << 24));
         encodedId = (static_cast<uint64_t>(driverId_) << 56) |
-            HybridRowId::encodeScattered(batchId, rowIndex);
+            ((static_cast<uint64_t>(batchId) << 32) | rowIndex);
       } else {
-        encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+        // Coalesced mode: rowId = global row index
+        encodedId = (static_cast<uint64_t>(driverId_)
+                     << 56) | // top 8 bits: driverId [0, 255]
             (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
       }
       rows->storeSingleRowId(encodedId, newRow);
@@ -754,7 +782,12 @@ bool HashBuild::reserveMemory(
 
     // We check usage from the parent pool to take peers' allocations into
     // account.
-    const auto nodeUsage = pool()->currentBytes();
+    auto nodeUsage = pool()->currentBytes();
+    // For hybrid join without scattered mode, include payload memory that
+    // is not tracked by the pool but will be needed during coalesceBatches().
+    if (hybridJoin_ && table_->hybridData() && !scatteredMode_) {
+      nodeUsage += table_->hybridData()->payloadMemoryBytes();
+    }
     if (spillMemoryThreshold_ != 0 && nodeUsage > spillMemoryThreshold_) {
       const int64_t bytesToSpill =
           nodeUsage * spillConfig()->spillableReservationGrowthPct / 100;
@@ -1003,7 +1036,7 @@ void HashBuild::runSpill(const std::vector<Operator*>& spillOperators) {
     // batches.
     if (build->hybridJoin_ && build->table_->hybridData()) {
       BOLT_CHECK(
-          !build->scatteredModeEnabled_,
+          !build->scatteredMode_,
           "Spilling is not supported for hybrid join in scattered mode");
       build->table_->hybridData()->coalesceBatches();
     }
@@ -1021,6 +1054,10 @@ void HashBuild::addAndClearSpillTarget(uint64_t& numRows, uint64_t& numBytes) {
 }
 
 void HashBuild::noMoreInput() {
+  if (reuseHashTable_) {
+    return;
+  }
+
   checkRunning();
 
   if (noMoreInput_) {
@@ -1035,8 +1072,8 @@ void HashBuild::noMoreInputInternal() {
   // Coalesce batches in this driver's HybridContainer before merging with
   // peers. This handles both the normal path (from noMoreInput) and spill
   // restore path (from processSpillInput). Each driver does this independently.
-  // Skip coalescing if scattered mode is enabled - keep batches separate.
-  if (hybridJoin_ && table_->hybridData() && !scatteredModeEnabled_) {
+  // Skip in scattered mode - we keep batches separate.
+  if (hybridJoin_ && table_->hybridData() && !scatteredMode_) {
     table_->hybridData()->coalesceBatches();
   }
 
@@ -1073,7 +1110,7 @@ bool HashBuild::finishHashBuild() {
     return false;
   }
 
-  TestValue::adjust("bytedance::bolt::exec::HashBuild::finishHashBuild", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::HashBuild::finishHashBuild", this);
 
   auto promisesGuard = folly::makeGuard([&]() {
     // Realize the promises so that the other Drivers (which were not
@@ -1115,7 +1152,9 @@ bool HashBuild::finishHashBuild() {
     otherBuilds.push_back(build);
   }
 
-  ensureTableFits(numRows);
+  const uint64_t probeReservationBytes =
+      probeAdmissionExtraReservationBytes(numRows);
+  ensureTableFits(numRows, probeReservationBytes);
 
   std::vector<std::unique_ptr<BaseHashTable>> otherTables;
   otherTables.reserve(peers.size());
@@ -1142,7 +1181,7 @@ bool HashBuild::finishHashBuild() {
   if (spiller_ != nullptr) {
     if (spillThreshold_.has_value()) {
       // after read from spill file, memory used for HashTable entries
-      // shoule be taken into consideration especially when spillThreshold_
+      // should be taken into consideration especially when spillThreshold_
       // is extremely large
       BOLT_CHECK(memoryUsedForFirstSpill_.has_value());
       auto maxRestoreRowCount = spillThreshold_.value();
@@ -1152,7 +1191,8 @@ bool HashBuild::finishHashBuild() {
         maxRestoreRowCount =
             (double)(1 - bytesForHashTable * 1.0 / usedMemBytes) *
             maxRestoreRowCount;
-        LOG(INFO) << __FUNCTION__ << " recal : usedMemBytes = " << usedMemBytes
+        LOG(INFO) << __FUNCTION__
+                  << " recalculated : usedMemBytes = " << usedMemBytes
                   << ", bytesForHashTable = " << bytesForHashTable
                   << ", spillThreshold_.value() = " << spillThreshold_.value()
                   << ", maxRestoreRowCount = " << maxRestoreRowCount;
@@ -1237,7 +1277,6 @@ bool HashBuild::finishHashBuild() {
       }
     }
   }
-
   if (joinBridge_->setHashTable(
           std::move(table_),
           std::move(spillPartitions),
@@ -1250,6 +1289,54 @@ bool HashBuild::finishHashBuild() {
   // table build.
   pool()->release();
   return true;
+}
+
+uint64_t HashBuild::probeAdmissionExtraReservationBytes(
+    uint64_t numRows) const {
+  const bool notReadyForProbeAdmission =
+      !operatorCtx_->driverCtx()
+           ->queryConfig()
+           .hashBuildProbeAdmissionUnderMemoryPressureEnabled() ||
+      !spillEnabled() || isInputFromSpill() || numRows == 0;
+  const bool spillUnavailable = spiller_ == nullptr ||
+      spiller_->isAllSpilled() || exceededMaxSpillLevelLimit_;
+  if (notReadyForProbeAdmission || spillUnavailable) {
+    return 0;
+  }
+
+  const auto currentBytes = pool()->currentBytes();
+  const auto* task = operatorCtx_->task().get();
+  const auto pressure = task->memoryPressureSnapshot();
+  const auto pressureWatermarkBytes = pressure.admissionWatermarkBytes();
+  // Reclaim records a task-level pressure watermark. Borrow-from-RSS records
+  // the current task's execution memory usage at the point dynamic memory
+  // management is triggered. Taking the minimum non-zero watermark makes the
+  // earliest pressure signal drive a stronger pre-probe admission reservation
+  // while the build side can still spill.
+  LOG(INFO) << name() << " probeAdmissionExtraReservationBytes: currentBytes="
+            << succinctBytes(currentBytes) << ", reclaimWatermarkBytes="
+            << succinctBytes(pressure.reclaimWatermarkBytes)
+            << ", borrowFromRssWatermarkBytes="
+            << succinctBytes(pressure.borrowFromRssWatermarkBytes)
+            << ", configuredTaskMemoryQuotaBytes="
+            << succinctBytes(pressure.configuredTaskMemoryQuotaBytes)
+            << ", pressureWatermarkBytes="
+            << succinctBytes(pressureWatermarkBytes) << ", details "
+            << task->memoryPressureDetails();
+  if (pressureWatermarkBytes != 0 &&
+      currentBytes > pressureWatermarkBytes *
+              operatorCtx_->driverCtx()
+                  ->queryConfig()
+                  .memoryPressureWatermarkRatio()) {
+    return pressureWatermarkBytes;
+  }
+
+  const uint64_t probeReservationLimit =
+      operatorCtx_->driverCtx()->queryConfig().preferredOutputBatchBytes() *
+      operatorCtx_->driverCtx()
+          ->queryConfig()
+          .outputBatchMemoryReservationMultiple();
+  return std::min<uint64_t>(currentBytes / 2, probeReservationLimit);
 }
 
 void HashBuild::recordSpillStats() {
@@ -1279,7 +1366,9 @@ void HashBuild::recordSpillStats(Spiller* spiller) {
   }
 }
 
-void HashBuild::ensureTableFits(uint64_t numRows) {
+void HashBuild::ensureTableFits(
+    uint64_t numRows,
+    uint64_t extraReservationBytes) {
   // NOTE: we don't need memory reservation if all the partitions have been
   // spilled as nothing need to be built.
   if (!spillEnabled() || spiller_ == nullptr || spiller_->isAllSpilled() ||
@@ -1289,12 +1378,29 @@ void HashBuild::ensureTableFits(uint64_t numRows) {
 
   // NOTE: reserve a bit more memory to consider the extra memory used for
   // parallel table build operation.
-  const uint64_t bytesToReserve = table_->estimateHashTableSize(numRows) * 1.1;
+  const uint64_t tableBytesToReserve =
+      table_->estimateHashTableSize(numRows) * 1.1;
+  const uint64_t bytesToReserve = tableBytesToReserve + extraReservationBytes;
+
   {
     Operator::ReclaimableSectionGuard guard(this);
-    TestValue::adjust(
-        "bytedance::bolt::exec::HashBuild::ensureTableFits", this);
+    BOLT_TEST_ADJUST("bytedance::bolt::exec::HashBuild::ensureTableFits", this);
+    const auto scopedDisableMemoryExpansion =
+        operatorCtx_->task()->maybeScopedDisableMemoryExpansion();
+    LOG(INFO) << name() << " ensureTableFits: try to reserve "
+              << succinctBytes(bytesToReserve) << " for hash table, "
+              << "tableReservation=" << succinctBytes(tableBytesToReserve)
+              << ", probeExtraReservation="
+              << succinctBytes(extraReservationBytes) << ", " << pool()->name()
+              << "[" << succinctBytes(pool()->currentBytes()) << ", "
+              << succinctBytes(pool()->reservedBytes()) << ", "
+              << succinctBytes(pool()->capacity()) << "]"
+              << ", memoryPressure="
+              << operatorCtx_->task()->memoryPressureDetails();
     if (pool()->maybeReserve(bytesToReserve)) {
+      if (spiller_->isAllSpilled()) {
+        pool()->release();
+      }
       return;
     }
   }
@@ -1303,7 +1409,10 @@ void HashBuild::ensureTableFits(uint64_t numRows) {
                << succinctBytes(bytesToReserve) << " for memory pool "
                << pool()->name()
                << ", usage: " << succinctBytes(pool()->currentBytes())
-               << ", reservation: " << succinctBytes(pool()->reservedBytes());
+               << ", reservation: " << succinctBytes(pool()->reservedBytes())
+               << ", tableReservation=" << succinctBytes(tableBytesToReserve)
+               << ", probeExtraReservation="
+               << succinctBytes(extraReservationBytes);
 }
 
 void HashBuild::postHashBuildProcess() {
@@ -1561,7 +1670,7 @@ void HashBuild::reclaim(
   BOLT_CHECK_NOT_NULL(driver);
   BOLT_CHECK(!nonReclaimableSection_);
 
-  TestValue::adjust("bytedance::bolt::exec::HashBuild::reclaim", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::HashBuild::reclaim", this);
 
   // can another thread  call close() while hashbuild is in arbitration and
   // reclaim is called on it?
@@ -1635,8 +1744,10 @@ void HashBuild::reclaim(
         std::make_shared<AsyncSource<SpillResult>>([buildOp]() {
           try {
             // Coalesce batches before spilling to ensure hybrid data is
-            // properly laid out.
-            if (buildOp->hybridJoin_ && buildOp->table_->hybridData()) {
+            // properly laid out. Skip in scattered mode - batches are kept
+            // separate.
+            if (buildOp->hybridJoin_ && buildOp->table_->hybridData() &&
+                !buildOp->scatteredMode_) {
               buildOp->table_->hybridData()->coalesceBatches();
             }
             buildOp->spiller_->spill();
@@ -1679,7 +1790,7 @@ void HashBuild::reclaim(
 bool HashBuild::nonReclaimableState() const {
   // Apart from being in the nonReclaimable section,
   // its also not reclaimable if:
-  // 1) the hash table has been built by the last build thread (inidicated
+  // 1) the hash table has been built by the last build thread (indicated
   //    by state_)
   // 2) the last build operator has transferred ownership of 'this' operator's
   //    intermediate state (table_ and spiller_) to itself

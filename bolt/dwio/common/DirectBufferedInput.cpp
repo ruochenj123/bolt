@@ -30,20 +30,22 @@
 
 #include <folly/GLog.h>
 #include <folly/ScopeGuard.h>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
+#include <limits>
 #include <stdexcept>
 
 #include "bolt/common/base/GlobalParameters.h"
 #include "bolt/common/caching/AsyncDataCache.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/memory/Allocation.h"
 #include "bolt/common/process/ThreadNameHolder.h"
 #include "bolt/common/process/TraceContext.h"
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/dwio/common/DirectBufferedInput.h"
 #include "bolt/dwio/common/DirectInputStream.h"
-
-DECLARE_int32(cache_prefetch_min_pct);
 
 using ::bytedance::bolt::common::Region;
 using bytedance::bolt::common::testutil::TestValue;
@@ -52,6 +54,166 @@ namespace bytedance::bolt::dwio::common {
 using cache::CoalescedLoad;
 using cache::ScanTracker;
 using cache::TrackingId;
+
+namespace {
+
+struct SharedSeekableInputChunk {
+  uint64_t offset;
+  BufferPtr data;
+};
+
+class SharedSeekableInputData {
+ public:
+  SharedSeekableInputData(
+      std::unique_ptr<SeekableInputStream> input,
+      Region region,
+      std::shared_ptr<memory::MemoryPool> pool,
+      uint64_t loadQuantum)
+      : input_(std::move(input)),
+        region_(region),
+        pool_(std::move(pool)),
+        loadQuantum_(loadQuantum) {
+    BOLT_CHECK_GT(loadQuantum_, 0);
+  }
+
+  std::shared_ptr<const SharedSeekableInputChunk> load(uint64_t position) {
+    BOLT_CHECK_LT(position, region_.length);
+    const auto offset = position / loadQuantum_ * loadQuantum_;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (failure_) {
+      std::rethrow_exception(failure_);
+    }
+    for (auto i = 0; i < chunks_.size(); ++i) {
+      if (chunks_[i] && chunks_[i]->offset == offset) {
+        auto chunk = chunks_[i];
+        if (i == 0) {
+          std::swap(chunks_[0], chunks_[1]);
+        }
+        return chunk;
+      }
+    }
+
+    const auto size = std::min(loadQuantum_, region_.length - offset);
+    auto buffer = AlignedBuffer::allocate<char>(size, pool_.get());
+    const std::vector<uint64_t> positions{offset};
+    PositionProvider positionProvider(positions);
+    try {
+      input_->seekToPosition(positionProvider);
+      input_->readFully(buffer->asMutable<char>(), size);
+    } catch (...) {
+      failure_ = std::current_exception();
+      throw;
+    }
+
+    auto chunk = std::make_shared<SharedSeekableInputChunk>(
+        SharedSeekableInputChunk{offset, std::move(buffer)});
+    chunks_[0] = std::move(chunks_[1]);
+    chunks_[1] = chunk;
+    return chunk;
+  }
+
+ private:
+  const std::unique_ptr<SeekableInputStream> input_;
+  const Region region_;
+  const std::shared_ptr<memory::MemoryPool> pool_;
+  const uint64_t loadQuantum_;
+  std::mutex mutex_;
+  std::exception_ptr failure_;
+  std::array<std::shared_ptr<const SharedSeekableInputChunk>, 2> chunks_;
+};
+
+class SharedSeekableInputStream final : public SeekableInputStream {
+ public:
+  explicit SharedSeekableInputStream(
+      std::shared_ptr<SharedSeekableInputData> data,
+      uint64_t size)
+      : data_(std::move(data)), size_(size) {}
+
+  bool Next(const void** buffer, int32_t* size) override {
+    currentChunk_.reset();
+    lastNextSize_ = 0;
+    if (position_ >= size_) {
+      *size = 0;
+      return false;
+    }
+
+    currentChunk_ = data_->load(position_);
+    const auto offsetInChunk = position_ - currentChunk_->offset;
+    const auto available = currentChunk_->data->size() - offsetInChunk;
+    BOLT_CHECK_LE(available, std::numeric_limits<int32_t>::max());
+    *buffer = currentChunk_->data->as<char>() + offsetInChunk;
+    *size = static_cast<int32_t>(available);
+    position_ += available;
+    lastNextSize_ = *size;
+    return true;
+  }
+
+  void BackUp(int32_t count) override {
+    BOLT_CHECK_GE(count, 0, "can't backup negative distances");
+    BOLT_CHECK_LE(count, lastNextSize_, "Can't backup that much!");
+    currentChunk_.reset();
+    position_ -= count;
+    lastNextSize_ = 0;
+  }
+
+  bool SkipInt64(int64_t count) override {
+    currentChunk_.reset();
+    lastNextSize_ = 0;
+    if (count < 0) {
+      return false;
+    }
+    const auto unsignedCount = static_cast<uint64_t>(count);
+    if (unsignedCount <= size_ - position_) {
+      position_ += unsignedCount;
+      return true;
+    }
+    position_ = size_;
+    return false;
+  }
+
+  google::protobuf::int64 ByteCount() const override {
+    return static_cast<google::protobuf::int64>(position_);
+  }
+
+  void seekToPosition(PositionProvider& position) override {
+    const auto newPosition = position.next();
+    BOLT_CHECK_LE(newPosition, size_);
+    currentChunk_.reset();
+    lastNextSize_ = 0;
+    position_ = newPosition;
+  }
+
+  std::string getName() const override {
+    return fmt::format("SharedSeekableInputStream {} of {}", position_, size_);
+  }
+
+  size_t positionSize() override {
+    return 1;
+  }
+
+ private:
+  const std::shared_ptr<SharedSeekableInputData> data_;
+  const uint64_t size_;
+  uint64_t position_{0};
+  int32_t lastNextSize_{0};
+  std::shared_ptr<const SharedSeekableInputChunk> currentChunk_;
+};
+
+SeekableInputStreamPair makeSharedSeekableInputStreamPair(
+    std::unique_ptr<SeekableInputStream> input,
+    Region region,
+    std::shared_ptr<memory::MemoryPool> pool,
+    uint64_t loadQuantum) {
+  auto data = std::make_shared<SharedSeekableInputData>(
+      std::move(input), region, std::move(pool), loadQuantum);
+  auto makeStream = [&]() {
+    return std::make_unique<SharedSeekableInputStream>(data, region.length);
+  };
+  return {makeStream(), makeStream()};
+}
+
+} // namespace
 
 std::unique_ptr<SeekableInputStream> DirectBufferedInput::enqueue(
     Region region,
@@ -71,7 +233,6 @@ std::unique_ptr<SeekableInputStream> DirectBufferedInput::enqueue(
     id = TrackingId(sid->getId());
   }
   BOLT_CHECK_LE(region.offset + region.length, fileSize_);
-  requests_.emplace_back(region, id);
   if (tracker_) {
     tracker_->recordReference(id, region.length, fileNum_, groupId_);
   }
@@ -85,13 +246,39 @@ std::unique_ptr<SeekableInputStream> DirectBufferedInput::enqueue(
       id,
       groupId_,
       options_.loadQuantum());
-  requests_.back().stream = stream.get();
+  if (!preloaded()) {
+    requests_.emplace_back(region, id);
+    requests_.back().stream = stream.get();
+  }
   return stream;
+}
+
+SeekableInputStreamPair DirectBufferedInput::enqueuePair(
+    Region region,
+    const StreamIdentifier* sid) {
+  if (region.length == 0 || preloaded()) {
+    return BufferedInput::enqueuePair(region, sid);
+  }
+
+  BOLT_CHECK_LE(region.offset, fileSize_);
+  BOLT_CHECK_LE(region.length, fileSize_ - region.offset);
+  BOLT_CHECK_GT(options_.loadQuantum(), 0);
+  auto input = enqueue(region, sid);
+  BOLT_CHECK(!requests_.empty());
+  // Only preload the first quantum. Subsequent chunks are fetched on demand,
+  // keeping the shared pair bounded while retaining initial coalescing.
+  requests_.back().region.length =
+      std::min<uint64_t>(region.length, options_.loadQuantum());
+  return makeSharedSeekableInputStreamPair(
+      std::move(input),
+      region,
+      pool_.shared_from_this(),
+      options_.loadQuantum());
 }
 
 bool DirectBufferedInput::isBuffered(uint64_t /*offset*/, uint64_t /*length*/)
     const {
-  return false;
+  return preloaded();
 }
 
 bool DirectBufferedInput::shouldPreload(int32_t numPages) {
@@ -107,6 +294,28 @@ bool isPrefetchablePct(int32_t pct) {
 
 bool lessThan(const LoadRequest* left, const LoadRequest* right) {
   return *left < *right;
+}
+
+void appendRanges(
+    memory::Allocation& allocation,
+    size_t length,
+    std::vector<folly::Range<char*>>& buffers) {
+  BOLT_CHECK_LE(
+      length,
+      memory::AllocationTraits::pageBytes(allocation.numPages()),
+      "Length exceeds allocation size");
+  uint64_t offsetInRuns = 0;
+  for (int i = 0; i < allocation.numRuns(); ++i) {
+    BOLT_CHECK_GE(length, offsetInRuns);
+    auto run = allocation.runAt(i);
+    const uint64_t bytes = memory::AllocationTraits::pageBytes(run.numPages());
+    const uint64_t readSize = std::min(bytes, length - offsetInRuns);
+    buffers.emplace_back(run.data<char>(), readSize);
+    offsetInRuns += readSize;
+    if (offsetInRuns >= length) {
+      break;
+    }
+  }
 }
 
 } // namespace
@@ -246,20 +455,24 @@ void DirectBufferedInput::readRegions(
           if (asyncLoad.load->state() != DirectCoalescedLoad::State::kPlanned) {
             return;
           }
-          // the load is valid, so asyncThreadCtx is not freed yet.
-          auto guard =
-              folly::makeGuard([&]() { asyncLoad.asyncThreadCtx->out(); });
-          asyncLoad.asyncThreadCtx->in(); // trace in-flight loading
+          connector::AsyncThreadCtx::Guard guard(
+              asyncLoad.asyncThreadCtx.get(), 0);
+          if (!guard) {
+            return;
+          }
+
           // first check available memory allows to preload data, even if not,
           // the non-preload load will be sync loaded on the main thread.
-          if (asyncLoad.canPreload()) {
+          if (asyncLoad.canPreload(guard)) {
             process::TraceContext trace("Read Ahead");
             BOLT_CHECK_NOT_NULL(asyncLoad.load);
             auto res = asyncLoad.load->loadOrFuture(nullptr);
-            LOG_IF(INFO, !res)
-                << "Preload fails to load " << (uint64_t)asyncLoad.load.get()
-                << " by async thread " << folly::getCurrentThreadName().value();
-            asyncLoad.asyncThreadCtx->disallowPreload();
+            if (!res) {
+              LOG(INFO) << "Preload fails to load "
+                        << (uint64_t)asyncLoad.load.get() << " by async thread "
+                        << folly::getCurrentThreadName().value();
+              asyncLoad.asyncThreadCtx->disallowPreload();
+            }
           }
         });
       }
@@ -281,6 +494,58 @@ std::shared_ptr<DirectCoalescedLoad> DirectBufferedInput::coalescedLoad(
       });
 }
 
+void DirectBufferedInput::preload() {
+  BOLT_CHECK(!preloadData_.has_value(), "preload() called more than once");
+  BOLT_CHECK(requests_.empty(), "preload() must be called before enqueue()");
+
+  preloadData_.emplace(fileSize_);
+
+  std::vector<folly::Range<char*>> buffers;
+  if (fileSize_ <= kTinySize) {
+    preloadData_->tinyData.resize(fileSize_);
+    buffers.emplace_back(preloadData_->tinyData.data(), fileSize_);
+  } else {
+    const auto numPages = memory::AllocationTraits::numPages(fileSize_);
+    pool_.allocateNonContiguous(numPages, preloadData_->data);
+    appendRanges(preloadData_->data, fileSize_, buffers);
+  }
+
+  uint64_t usecs = 0;
+  {
+    MicrosecondTimer timer(&usecs);
+    input_->read(buffers, 0, LogType::FILE);
+  }
+  if (ioStats_) {
+    ioStats_->read().increment(fileSize_);
+    ioStats_->incRawBytesRead(fileSize_);
+    ioStats_->queryThreadIoLatencySync().increment(usecs);
+    ioStats_->queryThreadIoLatency().increment(usecs);
+    ioStats_->incTotalScanTime(usecs * 1'000);
+  }
+}
+
+folly::Range<const char*> DirectBufferedInput::preloadedData(
+    uint64_t offset,
+    uint64_t length) const {
+  BOLT_CHECK(
+      preloadData_.has_value(), "preloadedData() called without preload");
+  BOLT_CHECK_LT(offset, preloadData_->size, "Offset exceeds preloaded size");
+  const auto available =
+      std::min<uint64_t>(length, preloadData_->size - offset);
+  if (preloadData_->data.numPages() == 0) {
+    return {preloadData_->tinyData.data() + offset, available};
+  }
+
+  int32_t runIndex;
+  int32_t offsetInRun;
+  preloadData_->data.findRun(offset, &runIndex, &offsetInRun);
+  auto run = preloadData_->data.runAt(runIndex);
+  const auto runBytes = memory::AllocationTraits::pageBytes(run.numPages());
+  const auto contiguousBytes =
+      std::min<uint64_t>(available, runBytes - offsetInRun);
+  return {run.data<const char>() + offsetInRun, contiguousBytes};
+}
+
 std::unique_ptr<SeekableInputStream> DirectBufferedInput::read(
     uint64_t offset,
     uint64_t length,
@@ -297,22 +562,6 @@ std::unique_ptr<SeekableInputStream> DirectBufferedInput::read(
       0,
       options_.loadQuantum());
 }
-
-namespace {
-void appendRanges(
-    memory::Allocation& allocation,
-    size_t length,
-    std::vector<folly::Range<char*>>& buffers) {
-  uint64_t offsetInRuns = 0;
-  for (int i = 0; i < allocation.numRuns(); ++i) {
-    auto run = allocation.runAt(i);
-    const uint64_t bytes = memory::AllocationTraits::pageBytes(run.numPages());
-    const uint64_t readSize = std::min(bytes, length - offsetInRuns);
-    buffers.push_back(folly::Range<char*>(run.data<char>(), readSize));
-    offsetInRuns += readSize;
-  }
-}
-} // namespace
 
 std::vector<cache::CachePin> DirectCoalescedLoad::loadData(bool isPrefetch) {
   std::vector<folly::Range<char*>> buffers;
@@ -400,7 +649,7 @@ std::vector<cache::CachePin> DirectCoalescedLoad::loadData(bool isPrefetch) {
   if (isPrefetch) {
     ioStats_->prefetch().increment(size + overread);
   }
-  TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::cache::DirectCoalescedLoad::loadData", this);
   return {};
 }

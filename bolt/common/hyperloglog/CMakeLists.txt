@@ -29,10 +29,6 @@ if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
 
-add_library(bolt_common_hyperloglog BiasCorrection.cpp DenseHll.cpp SparseHll.cpp)
+bolt_add_library(bolt_common_hyperloglog BiasCorrection.cpp DenseHll.cpp SparseHll.cpp)
 
-target_link_libraries(
-  bolt_common_hyperloglog
-  PUBLIC bolt_memory
-  PRIVATE bolt_exception
-)
+target_link_libraries(bolt_common_hyperloglog PUBLIC bolt_memory PRIVATE bolt_exception)

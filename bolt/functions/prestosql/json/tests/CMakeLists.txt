@@ -26,8 +26,10 @@
 # --------------------------------------------------------------------------
 
 add_executable(
-  bolt_functions_json_test JsonExtractorTest.cpp JsonPathTokenizerTest.cpp
-                           SIMDJsonExtractorTest.cpp
+  bolt_functions_json_test
+  JsonExtractorTest.cpp
+  JsonPathTokenizerTest.cpp
+  SIMDJsonExtractorTest.cpp
 )
 
 add_test(bolt_functions_json_test bolt_functions_json_test)
@@ -36,11 +38,6 @@ find_package(sonic-cpp CONFIG REQUIRED)
 
 target_link_libraries(
   bolt_functions_json_test
-  bolt_functions_json
-  ${FOLLY_WITH_DEPENDENCIES}
-  ${FOLLY_BENCHMARK}
-  GTest::gtest
-  GTest::gtest_main
-  gflags::gflags
-  glog::glog
+  Folly::follybenchmark
+  bolt_gtest_main
 )

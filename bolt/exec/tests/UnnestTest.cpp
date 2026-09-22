@@ -35,6 +35,8 @@
 using namespace bytedance::bolt;
 using namespace bytedance::bolt::exec::test;
 
+using bytedance::bolt::test::emptyArray;
+
 class UnnestTest : public OperatorTestBase {};
 
 TEST_F(UnnestTest, basicArray) {
@@ -60,7 +62,7 @@ TEST_F(UnnestTest, arrayWithOrdinality) {
       {{{1, 2, std::nullopt, 4}},
        std::nullopt,
        {{5, 6}},
-       {{}},
+       emptyArray,
        {{{{std::nullopt}}}},
        {{7, 8, 9}}});
   auto vector = makeRowVector(

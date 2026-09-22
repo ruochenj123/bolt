@@ -29,8 +29,13 @@ if(${BOLT_BUILD_TESTING})
   add_subdirectory(test)
 endif()
 
-add_library(bolt_dwio_dwrf_utils BitIterator.h ProtoUtils.cpp)
+bolt_add_library(bolt_dwio_dwrf_utils BitIterator.h ProtoUtils.cpp)
 
 add_dependencies(bolt_dwio_dwrf_utils bolt_dwio_dwrf_proto)
 
-target_link_libraries(bolt_dwio_dwrf_utils bolt_dwio_dwrf_proto bolt_type bolt_memory)
+target_link_libraries(
+  bolt_dwio_dwrf_utils
+  bolt_dwio_dwrf_proto
+  bolt_type
+  bolt_memory
+)

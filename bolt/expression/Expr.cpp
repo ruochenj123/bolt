@@ -34,6 +34,7 @@
 #include "bolt/common/base/Fs.h"
 #include "bolt/common/base/SuccinctPrinter.h"
 #include "bolt/common/base/Uuid.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/process/ThreadDebugInfo.h"
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/core/Expressions.h"
@@ -48,24 +49,6 @@
 #include "bolt/vector/SelectivityVector.h"
 #include "bolt/vector/VectorSaver.h"
 
-DEFINE_bool(
-    force_eval_simplified,
-    false,
-    "Whether to overwrite queryCtx and force the "
-    "use of simplified expression evaluation path.");
-
-DEFINE_bool(
-    bolt_experimental_save_input_on_fatal_signal,
-    false,
-    "This is an experimental flag only to be used for debugging "
-    "purposes. If set to true, serializes the input vector data and "
-    "all the SQL expressions in the ExprSet that is currently "
-    "executing, whenever a fatal signal is encountered. Enabling "
-    "this flag makes the signal handler async signal unsafe, so it "
-    "should only be used for debugging purposes. The vector and SQLs "
-    "are serialized to files in directories specified by either "
-    "'bolt_save_input_on_expression_any_failure_path' or "
-    "'bolt_save_input_on_expression_system_failure_path'");
 namespace bytedance::bolt::exec {
 
 folly::Synchronized<std::vector<std::shared_ptr<ExprSetListener>>>&
@@ -133,6 +116,11 @@ void checkOrSetEmptyResult(
   if (!result) {
     result = BaseVector::createNullConstant(type, 0, pool);
   }
+}
+
+bool exprEvalFlatNoNullsEnabled(const EvalCtx& context) {
+  auto* queryCtx = context.execCtx()->queryCtx();
+  return !queryCtx || queryCtx->queryConfig().exprEvalFlatNoNulls();
 }
 } // namespace
 
@@ -657,7 +645,7 @@ class ExprExceptionContext {
   const Expr* FOLLY_NONNULL expr_;
 
   /// The input vector, i.e. EvalCtx::row(). In some cases, input columns are
-  /// re-used for results. Hence, 'vector' may no longer contain input data at
+  /// reused for results. Hence, 'vector' may no longer contain input data at
   /// the time of exception.
   const RowVector* FOLLY_NONNULL vector_;
 
@@ -800,7 +788,7 @@ void Expr::eval(
     VectorPtr& result,
     const ExprSet* parentExprSet) {
   if (supportsFlatNoNullsFastPath_ && context.throwOnError() &&
-      context.inputFlatNoNulls() && rows.countSelected() < 1'000) {
+      context.inputFlatNoNulls() && exprEvalFlatNoNullsEnabled(context)) {
     evalFlatNoNulls(rows, context, result, parentExprSet);
     checkResultInternalState(result);
     return;
@@ -1051,7 +1039,7 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
         !peeledVectors[0]->memoDisabled();
   }
 
-  common::testutil::TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::exec::Expr::peelEncodings::mayCache", &mayCache);
   return {newRows, finalRowsHolder.get(), mayCache};
 }
@@ -1217,6 +1205,7 @@ void Expr::evalWithMemo(
 
   if (baseOfDictionaryRepeats_ == 1) {
     evalWithNulls(rows, context, result);
+    context.exprSet()->addToMemo(this);
     baseOfDictionary_ = base;
     dictionaryCache_ = result;
     dictionaryCacheSize_ = dictionaryCache_->retainedSize();
@@ -1259,7 +1248,6 @@ void Expr::evalWithMemo(
 
     // stop updating dictionary if retained memory is too large
     if (!context.exprSet()->dictionaryCacheSizeExceedLimit()) {
-      context.exprSet()->addToMemo(this);
       auto newCacheSize = uncached->end();
 
       // dictionaryCache_ is valid only for cachedDictionaryIndices_. Hence, a
@@ -1323,7 +1311,7 @@ void computeIsAsciiForInputs(
     indices.push_back(index);
   }
 
-  // Compute string encoding for input vectors at indicies.
+  // Compute string encoding for input vectors at indices.
   for (auto& index : indices) {
     // Some arguments are optional and hence may not exist. And some
     // functions operate on dynamic types, but we only scan them when the
@@ -1430,7 +1418,7 @@ void Expr::evalAllImpl(
 
   if (hasJITed()) {
     // TODO:
-    // 1. evalate non-compilable sub exprs.
+    // 1. evaluate non-compilable sub exprs.
     // 2. Only support isDefaultNullBehavior() right now
     applyFunction(rows, context, result);
     return;
@@ -2054,7 +2042,7 @@ std::unique_ptr<ExprSet> makeExprSetFromFlag(
     std::vector<core::TypedExprPtr>&& source,
     core::ExecCtx* execCtx) {
   if (execCtx->queryCtx()->queryConfig().exprEvalSimplified() ||
-      FLAGS_force_eval_simplified) {
+      FLAGS_bolt_force_eval_simplified) {
     return std::make_unique<ExprSetSimplified>(std::move(source), execCtx);
   }
   return std::make_unique<ExprSet>(std::move(source), execCtx);

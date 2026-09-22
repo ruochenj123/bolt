@@ -158,6 +158,9 @@ class SimpleVector : public BaseVector {
       vector_size_t index,
       vector_size_t otherIndex,
       CompareFlags flags) const override {
+    // 'this' cannot be a LazyVector, but it may be a dictionary or constant
+    // wrapping a lazy vector. Load it before accessing values.
+    loadedVector();
     other = other->loadedVector();
     DCHECK(dynamic_cast<const SimpleVector<T>*>(other) != nullptr)
         << "Attempting to compare vectors not of the same type";
@@ -241,7 +244,7 @@ class SimpleVector : public BaseVector {
   /// the SelectivityVector to corresponding indexes in this vector. Then we
   /// return:
   /// 1. True if all specified rows after the translation are known to be ASCII.
-  /// 2. False if all specified rows after translation contain atleast one non
+  /// 2. False if all specified rows after translation contain at least one non
   ///    ASCII character.
   /// 3. std::nullopt if ASCII-ness is not known for even one of the translated
   /// rows. If rowMappings is null then we revert to indexes in the
@@ -270,7 +273,7 @@ class SimpleVector : public BaseVector {
   /// This function takes an index and returns:
   /// 1. True if the string at that index is ASCII
   /// 2. False if the string at that index is not ASCII
-  /// 3. std::nullopt if we havent computed ASCII'ness at that index.
+  /// 3. std::nullopt if we haven't computed ASCII'ness at that index.
   template <typename U = T>
   typename std::enable_if_t<std::is_same_v<U, StringView>, std::optional<bool>>
   isAscii(vector_size_t index) const {

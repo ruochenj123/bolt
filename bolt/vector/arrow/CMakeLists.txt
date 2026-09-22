@@ -25,10 +25,16 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_arrow_bridge Bridge.cpp)
+bolt_add_library(bolt_arrow_bridge Bridge.cpp)
 
 target_link_libraries(
-  bolt_arrow_bridge bolt_memory bolt_type_base bolt_buffer bolt_exception ${ICU_LIBRARIES}
+  bolt_arrow_bridge
+  utf8proc::utf8proc
+  bolt_memory
+  bolt_type_base
+  bolt_buffer
+  bolt_exception
+  ${ICU_LIBRARIES}
 )
 
 if(BOLT_BUILD_TESTING AND BOLT_ENABLE_ARROW)

@@ -26,19 +26,12 @@
 # --------------------------------------------------------------------------
 
 add_executable(
-  bolt_dwio_dwrf_utils_test BitIteratorTests.cpp BufferedWriterTest.cpp ProtoUtilsTests.cpp
+  bolt_dwio_dwrf_utils_test
+  BitIteratorTests.cpp
+  BufferedWriterTest.cpp
+  ProtoUtilsTests.cpp
 )
 
 add_test(bolt_dwio_dwrf_utils_test bolt_dwio_dwrf_utils_test)
 
-target_link_libraries(
-  bolt_dwio_dwrf_utils_test
-  bolt_dwio_common
-  bolt_dwio_dwrf_utils
-  bolt_dwio_common_exception
-  bolt_type_fbhive
-  gflags::gflags
-  GTest::gtest
-  GTest::gtest_main
-  glog::glog
-)
+target_link_libraries(bolt_dwio_dwrf_utils_test bolt_gtest_main)

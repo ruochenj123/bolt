@@ -13,49 +13,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+set(
+  BOLT_BENCHMARK_DEPS
+  bolt_testutils
+  ${FOLLY_BENCHMARK}
+  GTest::gtest
+)
 add_executable(export_bolt_arrow_bridge_benchmark ExportBoltToArrowBenchmark.cpp)
 target_link_libraries(
   export_bolt_arrow_bridge_benchmark
-  bolt_arrow_bridge
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  bolt_exec_test_lib
-  arrow::arrow
-  ${FOLLY_BENCHMARK}
+  PRIVATE
+    bolt_arrow_bridge
+    ${BOLT_BENCHMARK_DEPS}
 )
 
 add_executable(arrow_bolt_bridge_benchmark ArrowToBoltBenchmark.cpp)
 target_link_libraries(
   arrow_bolt_bridge_benchmark
-  bolt_arrow_bridge
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  bolt_exec_test_lib
-  arrow::arrow
-  ${FOLLY_BENCHMARK}
+  PRIVATE
+    bolt_arrow_bridge
+    ${BOLT_BENCHMARK_DEPS}
 )
 
 add_executable(arrow_bolt_array_bridge_benchmark ArrowToBoltArrayBenchmark.cpp)
 target_link_libraries(
   arrow_bolt_array_bridge_benchmark
-  bolt_arrow_bridge
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  bolt_exec_test_lib
-  arrow::arrow
-  ${FOLLY_BENCHMARK}
+  PRIVATE
+    bolt_arrow_bridge
+    ${BOLT_BENCHMARK_DEPS}
 )
 
 add_executable(import_arrow_bolt_bridge_benchmark ImportArrowToBoltBenchmark.cpp)
 target_link_libraries(
   import_arrow_bolt_bridge_benchmark
-  bolt_arrow_bridge
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  bolt_exec_test_lib
-  arrow::arrow
-  arrow::libarrow_testing
-  ${FOLLY_BENCHMARK}
+  PRIVATE
+    bolt_arrow_bridge
+    ${BOLT_BENCHMARK_DEPS}
 )
 
 set_target_properties(export_bolt_arrow_bridge_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

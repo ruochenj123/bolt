@@ -35,6 +35,7 @@
 #include "bolt/connectors/hive/HiveSplitReaderBase.h"
 #include "bolt/connectors/hive/PaimonMetadataColumn.h"
 #include "bolt/dwio/common/Options.h"
+
 namespace bytedance::bolt {
 class BaseVector;
 class variant;
@@ -111,7 +112,7 @@ class SplitReader : public HiveSplitReaderBase {
 
   /// This function is used by different table formats like Iceberg and Hudi to
   /// do additional preparations before reading the split, e.g. Open delete
-  /// files or log files, and add column adapatations for metadata columns
+  /// files or log files, and add column adaptations for metadata columns
   virtual void prepareSplit(
       std::shared_ptr<common::MetadataFilter> metadataFilter,
       dwio::common::RuntimeStatistics& runtimeStats,
@@ -120,19 +121,20 @@ class SplitReader : public HiveSplitReaderBase {
       std::vector<int>& columnCacheBlackList,
       const HiveConnectorSplitCacheLimit* hiveConnectorSplitCacheLimit);
 
-  virtual uint64_t next(int64_t size, VectorPtr& output);
+  uint64_t next(int64_t size, VectorPtr& output) override;
 
-  void resetFilterCaches();
+  void resetFilterCaches() override;
 
-  bool emptySplit() const;
+  bool emptySplit() const override;
 
-  void resetSplit();
+  void resetSplit() override;
 
-  int64_t estimatedRowSize() const;
+  int64_t estimatedRowSize() const override;
 
-  void updateRuntimeStats(dwio::common::RuntimeStatistics& stats) const;
+  void updateRuntimeStats(
+      dwio::common::RuntimeStatistics& stats) const override;
 
-  bool allPrefetchIssued() const;
+  bool allPrefetchIssued() const override;
 
   std::string toString() const;
 
@@ -141,7 +143,7 @@ class SplitReader : public HiveSplitReaderBase {
   }
 
  protected:
-  // Different table formats may have different meatadata columns. This function
+  // Different table formats may have different metadata columns. This function
   // will be used to update the scanSpec for these columns.
   virtual std::vector<TypePtr> adaptColumns(
       const RowTypePtr& fileType,
@@ -196,6 +198,8 @@ class SplitReader : public HiveSplitReaderBase {
       metadataColumns_{};
 
  private:
+  void validateReaderCastFilter() const;
+
   bool emptySplit_;
   bool isPartOfPaimonSplit_;
 };

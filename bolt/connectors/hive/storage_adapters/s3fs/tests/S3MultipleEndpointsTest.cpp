@@ -27,7 +27,6 @@
  * This modified file is released under the same license.
  * --------------------------------------------------------------------------
  */
-#include <folly/init/Init.h>
 
 #include "bolt/connectors/hive/HiveConnector.h"
 #include "bolt/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h"
@@ -46,7 +45,7 @@ static const std::string_view kBucketName = "writedata";
 
 using namespace bytedance::bolt::exec::test;
 
-namespace facebook::bolt {
+namespace bytedance::bolt {
 namespace {
 
 class S3MultipleEndpoints : public S3Test, public ::test::VectorTestBase {
@@ -234,10 +233,4 @@ TEST_F(S3MultipleEndpoints, bucketEndpoints) {
   connector::unregisterConnector(std::string(kConnectorId2));
 }
 
-} // namespace facebook::bolt
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  folly::Init init{&argc, &argv, false};
-  return RUN_ALL_TESTS();
-}
+} // namespace bytedance::bolt

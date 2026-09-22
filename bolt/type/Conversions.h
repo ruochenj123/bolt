@@ -38,10 +38,10 @@
 #include <string>
 #include <type_traits>
 #include "bolt/common/base/Exceptions.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/type/TimestampConversion.h"
 #include "bolt/type/Type.h"
 
-DECLARE_bool(experimental_enable_legacy_cast);
 namespace bytedance::bolt::util {
 
 struct DefaultCastPolicy {
@@ -62,6 +62,32 @@ struct LegacyCastPolicy {
 struct TruncateLegacyCastPolicy {
   static constexpr bool truncate = true;
   static constexpr bool legacyCast = true;
+};
+
+// Floating point to signed integer conversion is defined only when the
+// truncated value is representable. These limits identify the first values
+// outside that range without converting the floating point input first.
+template <typename T>
+struct FloatingPointToIntegralLimits {
+  template <typename FP>
+  static constexpr FP firstPositiveOverflow() {
+    return -static_cast<FP>(std::numeric_limits<T>::min());
+  }
+
+  template <typename FP>
+  static constexpr bool isPositiveOverflow(const FP& value) {
+    return value >= firstPositiveOverflow<FP>();
+  }
+
+  template <typename FP>
+  static constexpr bool isNegativeOverflow(const FP& value) {
+    constexpr FP kMin = static_cast<FP>(std::numeric_limits<T>::min());
+    constexpr FP kFirstNegativeOverflow = kMin - FP{1};
+    if constexpr (kFirstNegativeOverflow == kMin) {
+      return value < kMin;
+    }
+    return value <= kFirstNegativeOverflow;
+  }
 };
 
 template <TypeKind KIND, typename = void, typename TPolicy = DefaultCastPolicy>
@@ -323,6 +349,24 @@ struct Converter<
   struct LimitType {
     static constexpr bool kByteOrSmallInt =
         std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t>;
+    using FirstStageType = std::conditional_t<kByteOrSmallInt, int32_t, T>;
+    using FirstStageLimits = FloatingPointToIntegralLimits<FirstStageType>;
+
+    template <typename FP>
+    static constexpr FP firstPositiveOverflow() {
+      return FirstStageLimits::template firstPositiveOverflow<FP>();
+    }
+
+    template <typename FP>
+    static constexpr bool isPositiveOverflow(const FP& value) {
+      return FirstStageLimits::template isPositiveOverflow<FP>(value);
+    }
+
+    template <typename FP>
+    static constexpr bool isNegativeOverflow(const FP& value) {
+      return FirstStageLimits::template isNegativeOverflow<FP>(value);
+    }
+
     static int64_t minLimit() {
       if (kByteOrSmallInt) {
         return std::numeric_limits<int32_t>::min();
@@ -349,10 +393,7 @@ struct Converter<
     }
     template <typename FP>
     static T cast(const FP& v) {
-      if (kByteOrSmallInt) {
-        return T(int32_t(v));
-      }
-      return T(v);
+      return static_cast<T>(static_cast<FirstStageType>(v));
     }
   };
 
@@ -363,12 +404,12 @@ struct Converter<
       }
       if constexpr (std::is_same_v<T, int128_t>) {
         return std::numeric_limits<int128_t>::max();
-      } else if (v > LimitType::maxLimit()) {
+      } else if (LimitType::isPositiveOverflow(v)) {
         return LimitType::max();
       }
       if constexpr (std::is_same_v<T, int128_t>) {
         return std::numeric_limits<int128_t>::min();
-      } else if (v < LimitType::minLimit()) {
+      } else if (LimitType::isNegativeOverflow(v)) {
         return LimitType::min();
       }
       return LimitType::cast(v);
@@ -392,12 +433,12 @@ struct Converter<
       }
       if constexpr (std::is_same_v<T, int128_t>) {
         return std::numeric_limits<int128_t>::max();
-      } else if (v > LimitType::maxLimit()) {
+      } else if (LimitType::isPositiveOverflow(v)) {
         return LimitType::max();
       }
       if constexpr (std::is_same_v<T, int128_t>) {
         return std::numeric_limits<int128_t>::min();
-      } else if (v < LimitType::minLimit()) {
+      } else if (LimitType::isNegativeOverflow(v)) {
         return LimitType::min();
       }
       return LimitType::cast(v);
@@ -590,7 +631,7 @@ struct Converter<TypeKind::VARCHAR, void, TPolicy> {
   /// appending '.0' if it has only the integer part but no fractional part. For
   /// example, for the given string '12345', replace it with '12345.0'.
   static void normalizeStandardNotation(std::string& str) {
-    if (!FLAGS_experimental_enable_legacy_cast &&
+    if (!FLAGS_bolt_experimental_enable_legacy_cast &&
         str.find(".") == std::string::npos && isdigit(str[str.length() - 1])) {
       str += ".0";
     }

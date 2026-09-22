@@ -45,7 +45,10 @@ std::unordered_map<std::string, std::shared_ptr<Connector>>& connectors() {
 } // namespace
 
 bool DataSink::Stats::empty() const {
-  return numWrittenBytes == 0 && numWrittenFiles == 0 && spillStats.empty();
+  return numWrittenBytes == 0 && numWrittenFiles == 0 &&
+      writeRecodeWallNanos == 0 && writeEncodeWallNanos == 0 &&
+      writeCompressionWallNanos == 0 && writeIOWallNanos == 0 &&
+      writeFinalizeWallNanos == 0 && spillStats.empty();
 }
 
 std::string DataSink::Stats::toString() const {
@@ -157,7 +160,7 @@ std::string commitStrategyToString(CommitStrategy commitStrategy) {
       return "TASK_COMMIT";
     default:
       BOLT_UNREACHABLE(
-          "UNKOWN COMMIT STRATEGY: {}", static_cast<int>(commitStrategy));
+          "UNKNOWN COMMIT STRATEGY: {}", static_cast<int>(commitStrategy));
   }
 }
 
@@ -167,7 +170,7 @@ CommitStrategy stringToCommitStrategy(const std::string& strategy) {
   } else if (strategy == "TASK_COMMIT") {
     return CommitStrategy::kTaskCommit;
   } else {
-    BOLT_UNREACHABLE("UNKOWN COMMIT STRATEGY: {}", strategy);
+    BOLT_UNREACHABLE("UNKNOWN COMMIT STRATEGY: {}", strategy);
   }
 }
 
@@ -192,4 +195,9 @@ folly::dynamic ConnectorTableHandle::serializeBase(
 folly::dynamic ConnectorTableHandle::serialize() const {
   return serializeBase("ConnectorTableHandle");
 }
+
+// Allow the compiler to emit vtable and typeinfo for ConnectorLocationHandle at
+// a single point instead of every translation unit.
+ConnectorLocationHandle::~ConnectorLocationHandle() = default;
+
 } // namespace bytedance::bolt::connector

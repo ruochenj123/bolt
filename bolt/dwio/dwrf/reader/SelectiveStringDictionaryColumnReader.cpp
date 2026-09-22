@@ -78,25 +78,37 @@ SelectiveStringDictionaryColumnReader::SelectiveStringDictionaryColumnReader(
       params.streamLabels().label(),
       false);
   if (inDictStream) {
-    inDictionaryReader_ =
-        createBooleanRleDecoder(std::move(inDictStream), encodingKey);
-
-    // stride dictionary only exists if in dictionary exists
+    // stride dictionary only exists if in dictionary exists. For stripes where
+    // no stride-level dictionary entries are written, the stride dictionary
+    // streams may be legitimately missing.
     strideDictStream_ = stripe.getStream(
         encodingKey.forKind(proto::Stream_Kind_STRIDE_DICTIONARY),
         params.streamLabels().label(),
         true);
-    DWIO_ENSURE_NOT_NULL(strideDictStream_, "Stride dictionary is missing");
-
     const auto strideDictLenId =
         encodingKey.forKind(proto::Stream_Kind_STRIDE_DICTIONARY_LENGTH);
-    bool strideLenVInt = stripe.getUseVInts(strideDictLenId);
-    strideDictLengthDecoder_ = createRleDecoder</*isSigned*/ false>(
-        stripe.getStream(strideDictLenId, params.streamLabels().label(), true),
-        version_,
-        memoryPool_,
-        strideLenVInt,
-        dwio::common::INT_BYTE_SIZE);
+    auto strideDictLenStream =
+        stripe.getStream(strideDictLenId, params.streamLabels().label(), true);
+    if (strideDictStream_) {
+      inDictionaryReader_ =
+          createBooleanRleDecoder(std::move(inDictStream), encodingKey);
+
+      // Either both stride dictionary streams should be present or both absent.
+      DWIO_ENSURE_NOT_NULL(
+          strideDictLenStream, "stride dictionary length stream is missing");
+      bool strideLenVInt = stripe.getUseVInts(strideDictLenId);
+      strideDictLengthDecoder_ = createRleDecoder</*isSigned*/ false>(
+          std::move(strideDictLenStream),
+          version_,
+          memoryPool_,
+          strideLenVInt,
+          dwio::common::INT_BYTE_SIZE);
+    } else {
+      DWIO_ENSURE(
+          !strideDictLenStream, "stride dictionary data stream is missing");
+      scanState_.dictionary2.numValues = 0;
+      LOG(WARNING) << "stride dictionary is missing";
+    }
   }
   scanState_.updateRawState();
 }
@@ -142,6 +154,9 @@ void SelectiveStringDictionaryColumnReader::loadDictionary(
 }
 
 void SelectiveStringDictionaryColumnReader::loadStrideDictionary() {
+  if (!strideDictStream_) {
+    return;
+  }
   auto nextStride = provider_.getStrideIndex();
   if (nextStride == lastStrideIndex_) {
     return;
@@ -247,14 +262,12 @@ void SelectiveStringDictionaryColumnReader::read(
         readHelper<common::AlwaysTrue, true>(
             &alwaysTrue(),
             rows,
-            ExtractStringDictionaryToGenericHook(
-                scanSpec_->valueHook(), rows, scanState_.rawState));
+            dwio::common::ExtractToGenericHook(scanSpec_->valueHook()));
       } else {
         readHelper<common::AlwaysTrue, false>(
             &alwaysTrue(),
             rows,
-            ExtractStringDictionaryToGenericHook(
-                scanSpec_->valueHook(), rows, scanState_.rawState));
+            dwio::common::ExtractToGenericHook(scanSpec_->valueHook()));
       }
     } else {
       if (isDense) {
@@ -342,7 +355,7 @@ void SelectiveStringDictionaryColumnReader::ensureInitialized() {
     return;
   }
 
-  Timer timer;
+  ClockTimer timer{initTimeClocks_};
 
   loadDictionary(*blobStream_, *lengthDecoder_, scanState_.dictionary);
 
@@ -365,12 +378,13 @@ void SelectiveStringDictionaryColumnReader::ensureInitialized() {
     positionOffset_ = dwrfData.notNullDecoder()
         ? dwrfData.notNullDecoder()->loadIndices(indexStartOffset)
         : indexStartOffset;
-    size_t offset = strideDictStream_->positionSize() + positionOffset_;
-    strideDictSizeOffset_ = strideDictLengthDecoder_->loadIndices(offset);
+    if (strideDictStream_ && strideDictLengthDecoder_) {
+      size_t offset = strideDictStream_->positionSize() + positionOffset_;
+      strideDictSizeOffset_ = strideDictLengthDecoder_->loadIndices(offset);
+    }
   }
   scanState_.updateRawState();
   initialized_ = true;
-  initTimeClocks_ = timer.elapsedClocks();
 }
 
 } // namespace bytedance::bolt::dwrf

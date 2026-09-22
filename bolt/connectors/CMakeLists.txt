@@ -25,9 +25,13 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_connector Connector.cpp)
+bolt_add_library(bolt_connector Connector.cpp ConnectorObjectFactory.cpp)
 
-target_link_libraries(bolt_connector bolt_common_config bolt_vector)
+target_link_libraries(
+  bolt_connector
+  bolt_common_config
+  bolt_vector
+)
 
 add_subdirectory(fuzzer)
 
@@ -37,6 +41,10 @@ endif()
 
 if(${BOLT_ENABLE_TPCH_CONNECTOR})
   add_subdirectory(tpch)
+endif()
+
+if(${BOLT_ENABLE_PAIMON})
+  add_subdirectory(paimon)
 endif()
 
 if(${BOLT_BUILD_TESTING})

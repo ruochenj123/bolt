@@ -61,27 +61,20 @@ Spiller::Spiller(
     Type type,
     RowContainer* container,
     RowTypePtr rowType,
-    int32_t numSortingKeys,
-    const std::vector<CompareFlags>& sortCompareFlags,
+    const std::vector<SpillSortKey>& sortingKeys,
     const common::SpillConfig* spillConfig)
     : Spiller(
           type,
           container,
           std::move(rowType),
           HashBitRange{},
-          numSortingKeys,
-          sortCompareFlags,
-          spillConfig->getSpillDirPathCb,
-          spillConfig->updateAndCheckSpillLimitCb,
-          spillConfig->fileNamePrefix,
+          sortingKeys,
+          spillConfig->spillIOConfig(1),
           std::numeric_limits<uint64_t>::max(),
-          spillConfig->spillUringEnabled,
-          spillConfig->writeBufferSize,
-          spillConfig->compressionKind,
           spillConfig->executor,
           spillConfig->maxSpillRunRows,
-          spillConfig->fileCreateConfig,
           spillConfig->rowBasedSpillMode) {
+  setSpillConfig(spillConfig);
   BOLT_CHECK(
       type_ == Type::kOrderByInput || type_ == Type::kAggregateInput,
       "Unexpected spiller type: {}",
@@ -100,19 +93,13 @@ Spiller::Spiller(
           container,
           std::move(rowType),
           HashBitRange{},
-          0,
-          {},
-          spillConfig->getSpillDirPathCb,
-          spillConfig->updateAndCheckSpillLimitCb,
-          spillConfig->fileNamePrefix,
+          std::vector<SpillSortKey>{},
+          spillConfig->spillIOConfig(1),
           std::numeric_limits<uint64_t>::max(),
-          spillConfig->spillUringEnabled,
-          spillConfig->writeBufferSize,
-          spillConfig->compressionKind,
           spillConfig->executor,
           spillConfig->maxSpillRunRows,
-          spillConfig->fileCreateConfig,
           spillConfig->rowBasedSpillMode) {
+  setSpillConfig(spillConfig);
   BOLT_CHECK(
       type_ == Type::kAggregateOutput || type_ == Type::kOrderByOutput,
       "Unexpected spiller type: {}",
@@ -132,19 +119,13 @@ Spiller::Spiller(
           container,
           std::move(rowType),
           HashBitRange{},
-          0,
-          {},
-          spillConfig->getSpillDirPathCb,
-          spillConfig->updateAndCheckSpillLimitCb,
-          spillConfig->fileNamePrefix,
+          std::vector<SpillSortKey>{},
+          spillConfig->spillIOConfig(1),
           std::numeric_limits<uint64_t>::max(),
-          spillConfig->spillUringEnabled,
-          spillConfig->writeBufferSize,
-          spillConfig->compressionKind,
           spillConfig->executor,
           spillConfig->maxSpillRunRows,
-          spillConfig->fileCreateConfig,
           spillConfig->rowBasedSpillMode) {
+  setSpillConfig(spillConfig);
   BOLT_CHECK(
       type_ == Type::kAggregateOutput || type_ == Type::kOrderByOutput,
       "Unexpected spiller type: {}",
@@ -165,22 +146,41 @@ Spiller::Spiller(
           nullptr,
           std::move(rowType),
           bits,
-          0,
-          {},
-          spillConfig->getSpillDirPathCb,
-          spillConfig->updateAndCheckSpillLimitCb,
-          spillConfig->fileNamePrefix,
+          std::vector<SpillSortKey>{},
+          spillConfig->spillIOConfig(bits.numPartitions()),
           targetFileSize,
-          spillConfig->spillUringEnabled,
-          spillConfig->writeBufferSize,
-          spillConfig->compressionKind,
           spillConfig->executor,
           0,
-          spillConfig->fileCreateConfig,
           spillConfig->rowBasedSpillMode) {
+  setSpillConfig(spillConfig);
   BOLT_CHECK_EQ(
       type_,
       Type::kHashJoinProbe,
+      "Unexpected spiller type: {}",
+      typeName(type_));
+}
+
+Spiller::Spiller(
+    Type type,
+    RowTypePtr rowType,
+    HashBitRange bits,
+    const std::vector<SpillSortKey>& sortingKeys,
+    const common::SpillConfig* spillConfig)
+    : Spiller(
+          type,
+          nullptr,
+          std::move(rowType),
+          bits,
+          sortingKeys,
+          spillConfig->spillIOConfig(bits.numPartitions()),
+          spillConfig->maxFileSize,
+          spillConfig->executor,
+          0,
+          spillConfig->rowBasedSpillMode) {
+  setSpillConfig(spillConfig);
+  BOLT_CHECK_EQ(
+      type_,
+      Type::kLocalMergeInput,
       "Unexpected spiller type: {}",
       typeName(type_));
 }
@@ -198,19 +198,13 @@ Spiller::Spiller(
           container,
           std::move(rowType),
           bits,
-          0,
-          {},
-          spillConfig->getSpillDirPathCb,
-          spillConfig->updateAndCheckSpillLimitCb,
-          spillConfig->fileNamePrefix,
+          std::vector<SpillSortKey>{},
+          spillConfig->spillIOConfig(bits.numPartitions()),
           targetFileSize,
-          spillConfig->spillUringEnabled,
-          spillConfig->writeBufferSize,
-          spillConfig->compressionKind,
           spillConfig->executor,
           spillConfig->maxSpillRunRows,
-          spillConfig->fileCreateConfig,
           spillConfig->rowBasedSpillMode) {
+  setSpillConfig(spillConfig);
   BOLT_CHECK_EQ(
       type_,
       Type::kHashJoinBuild,
@@ -228,19 +222,13 @@ Spiller::Spiller(
           nullptr,
           std::move(rowType),
           HashBitRange{},
-          0,
-          {},
-          spillConfig->getSpillDirPathCb,
-          spillConfig->updateAndCheckSpillLimitCb,
-          spillConfig->fileNamePrefix,
+          std::vector<SpillSortKey>{},
+          spillConfig->spillIOConfig(1),
           0, /*targetFileSize*/
-          spillConfig->spillUringEnabled,
-          spillConfig->writeBufferSize,
-          spillConfig->compressionKind,
           spillConfig->executor,
           0,
-          spillConfig->fileCreateConfig,
           common::RowBasedSpillMode::DISABLE) {
+  setSpillConfig(spillConfig);
   BOLT_CHECK_EQ(
       type_,
       Type::kHashJoinProbeMatchFlag,
@@ -253,18 +241,11 @@ Spiller::Spiller(
     RowContainer* container,
     RowTypePtr rowType,
     HashBitRange bits,
-    int32_t numSortingKeys,
-    const std::vector<CompareFlags>& sortCompareFlags,
-    const common::GetSpillDirectoryPathCB& getSpillDirPathCb,
-    const common::UpdateAndCheckSpillLimitCB& updateAndCheckSpillLimitCb,
-    const std::string& fileNamePrefix,
+    const std::vector<SpillSortKey>& sortingKeys,
+    const common::SpillConfig::SpillIOConfig& ioConfig,
     uint64_t targetFileSize,
-    bool spillUringEnabled,
-    uint64_t writeBufferSize,
-    common::CompressionKind compressionKind,
     folly::Executor* executor,
     uint64_t maxSpillRunRows,
-    const std::string& fileCreateConfig,
     common::RowBasedSpillMode rowBasedSpillMode)
     : type_(type),
       container_(container),
@@ -272,20 +253,21 @@ Spiller::Spiller(
       bits_(bits),
       rowType_(std::move(rowType)),
       maxSpillRunRows_(maxSpillRunRows),
+      compareFlags_([&sortingKeys]() {
+        std::vector<CompareFlags> compareFlags;
+        compareFlags.reserve(sortingKeys.size());
+        for (const auto& [_, flags] : sortingKeys) {
+          compareFlags.push_back(flags);
+        }
+        return compareFlags;
+      }()),
       state_(
-          getSpillDirPathCb,
-          updateAndCheckSpillLimitCb,
-          fileNamePrefix,
+          ioConfig,
           bits.numPartitions(),
-          numSortingKeys,
-          sortCompareFlags,
+          sortingKeys,
           targetFileSize,
-          spillUringEnabled,
-          writeBufferSize,
-          compressionKind,
           memory::spillMemoryPool(),
-          &stats_,
-          fileCreateConfig),
+          &stats_),
       spillMode_(Mode::kRowVector),
       rowInfo_(std::nullopt) {
   if (rowBasedSpillMode != common::RowBasedSpillMode::DISABLE) {
@@ -294,13 +276,16 @@ Spiller::Spiller(
         container_,
         rowBasedSpillMode == common::RowBasedSpillMode::COMPRESSION);
   }
-  TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::exec::Spiller", const_cast<HashBitRange*>(&bits_));
 
   BOLT_CHECK_EQ(
       container_ == nullptr,
       (type_ == Type::kHashJoinProbe ||
-       type_ == Type::kHashJoinProbeMatchFlag));
+       type_ == Type::kHashJoinProbeMatchFlag ||
+       type_ == Type::kLocalMergeInput),
+      "Unexpected spiller type: {}",
+      typeName(type_));
   spillRuns_.reserve(state_.maxPartitions());
   for (int i = 0; i < state_.maxPartitions(); ++i) {
     spillRuns_.emplace_back(*memory::spillMemoryPool());
@@ -370,7 +355,7 @@ int64_t Spiller::extractSpillVector(
     int64_t maxBytes,
     RowVectorPtr& spillVector,
     size_t& nextBatchIndex) {
-  BOLT_CHECK_NE(type_, Type::kHashJoinProbe);
+  BOLT_CHECK(type_ != Type::kHashJoinProbe && type_ != Type::kLocalMergeInput);
 
   auto limit = std::min<size_t>(rows.size() - nextBatchIndex, maxRows);
   BOLT_CHECK(!rows.empty());
@@ -454,14 +439,10 @@ namespace {
 class RowContainerSpillMergeStream : public SpillMergeStream {
  public:
   RowContainerSpillMergeStream(
-      int32_t numSortKeys,
-      const std::vector<CompareFlags>& sortCompareFlags,
+      const std::vector<SpillSortKey>& sortingKeys,
       Spiller::SpillRows&& rows,
       Spiller& spiller)
-      : numSortKeys_(numSortKeys),
-        sortCompareFlags_(sortCompareFlags),
-        rows_(std::move(rows)),
-        spiller_(spiller) {
+      : sortingKeys_(sortingKeys), rows_(std::move(rows)), spiller_(spiller) {
     if (!rows_.empty()) {
       nextBatch();
     }
@@ -474,12 +455,8 @@ class RowContainerSpillMergeStream : public SpillMergeStream {
   }
 
  private:
-  int32_t numSortKeys() const override {
-    return numSortKeys_;
-  }
-
-  const std::vector<CompareFlags>& sortCompareFlags() const override {
-    return sortCompareFlags_;
+  const std::vector<SpillSortKey>& sortingKeys() const override {
+    return sortingKeys_;
   }
 
   void nextBatch() override {
@@ -488,7 +465,9 @@ class RowContainerSpillMergeStream : public SpillMergeStream {
     // since this is all processed row by row.
     static constexpr vector_size_t kMaxRows = 64;
     constexpr uint64_t kMaxBytes = 1 << 18;
+    BOLT_CHECK(!closed_);
     if (nextBatchIndex_ >= rows_.size()) {
+      close();
       index_ = 0;
       size_ = 0;
       return;
@@ -499,9 +478,13 @@ class RowContainerSpillMergeStream : public SpillMergeStream {
     index_ = 0;
   }
 
-  const int32_t numSortKeys_;
-  const std::vector<CompareFlags> sortCompareFlags_;
+  void close() override {
+    BOLT_CHECK(!closed_);
+    SpillMergeStream::close();
+    rows_.clear();
+  }
 
+  const std::vector<SpillSortKey>& sortingKeys_;
   Spiller::SpillRows rows_;
   Spiller& spiller_;
   size_t nextBatchIndex_ = 0;
@@ -522,10 +505,7 @@ std::unique_ptr<SpillMergeStream> Spiller::spillMergeStreamOverRows(
   }
   ensureSorted(spillRuns_[partition]);
   return std::make_unique<RowContainerSpillMergeStream>(
-      container_->keyTypes().size(),
-      state_.sortCompareFlags(),
-      std::move(spillRuns_[partition].rows),
-      *this);
+      state_.sortingKeys(), std::move(spillRuns_[partition].rows), *this);
 }
 
 void Spiller::ensureSorted(SpillRun& run) {
@@ -538,12 +518,9 @@ void Spiller::ensureSorted(SpillRun& run) {
   {
     MicrosecondTimer timer(&sortTimeUs);
 
-    std::vector<CompareFlags> compareFlags;
-    bool noFlags = state_.sortCompareFlags().size() == 0;
-    if (noFlags) {
-      for (auto i = 0; i < container_->keyIndices().size(); ++i)
-        compareFlags.emplace_back(CompareFlags());
-    }
+    auto compareFlags = compareFlags_.empty()
+        ? std::vector<CompareFlags>(container_->keyTypes().size())
+        : compareFlags_;
 
 #ifdef ENABLE_BOLT_JIT
     if (cmp_ == nullptr && spillConfig_ &&
@@ -551,7 +528,7 @@ void Spiller::ensureSorted(SpillRun& run) {
       if (container_->JITable(container_->keyTypes())) {
         auto [jitMod, rowRowCmpfn] = container_->codegenCompare(
             container_->keyTypes(),
-            noFlags ? compareFlags : state_.sortCompareFlags(),
+            compareFlags,
             bytedance::bolt::jit::CmpType::SORT_LESS,
             true);
         jitModule_ = std::move(jitMod);
@@ -564,8 +541,8 @@ void Spiller::ensureSorted(SpillRun& run) {
           run.rows.begin(),
           run.rows.end(),
           [&](const char* left, const char* right) {
-            auto expected = container_->compareRows(
-                                left, right, state_.sortCompareFlags()) < 0;
+            auto expected =
+                container_->compareRows(left, right, compareFlags) < 0;
             auto res = cmp_(left, right) > 0;
             bool jitEqual = (int)res > 0; // as cmp_ may return 255 for true
             if ((expected != jitEqual)) {
@@ -591,14 +568,13 @@ void Spiller::ensureSorted(SpillRun& run) {
           container_,
           sorter_,
           container_->keyIndices(),
-          noFlags ? compareFlags : state_.sortCompareFlags());
+          compareFlags);
 #else
     sorter_.sort(
         run.rows.begin(),
         run.rows.end(),
         [&](const char* left, const char* right) {
-          return container_->compareRows(
-                     left, right, state_.sortCompareFlags()) < 0;
+          return container_->compareRows(left, right, compareFlags) < 0;
         });
 
 #endif
@@ -631,9 +607,8 @@ size_t Spiller::setNextEqualForAgg(SpillRun& run) {
       equal = !cmp_(run.rows[i], run.rows[i + 1]);
 #if DEBUG_JIT
       bool jitEqual = (int)equal > 0; // as cmp_ may return 255 for true
-      auto expected =
-          container_->compareRows(
-              run.rows[i], run.rows[i + 1], state_.sortCompareFlags()) == 0;
+      auto expected = container_->compareRows(
+                          run.rows[i], run.rows[i + 1], compareFlags_) == 0;
       if ((expected != jitEqual)) {
         std::stringstream ss;
         ss << " bypass expected: " << (int)expected
@@ -647,7 +622,7 @@ size_t Spiller::setNextEqualForAgg(SpillRun& run) {
 #endif
     } else {
       equal = container_->compareRows(
-                  run.rows[i], run.rows[i + 1], state_.sortCompareFlags()) == 0;
+                  run.rows[i], run.rows[i + 1], compareFlags_) == 0;
     }
     if (equal) {
       bits::setBit(run.rows[i], container_->probedFlagOffset(), true);
@@ -675,9 +650,9 @@ size_t Spiller::setNextEqualForAgg(SpillRun& run) {
 }
 
 std::unique_ptr<Spiller::SpillStatus> Spiller::writeSpill(int32_t partition) {
-  BOLT_CHECK_NE(type_, Type::kHashJoinProbe);
+  BOLT_CHECK(type_ != Type::kHashJoinProbe && type_ != Type::kLocalMergeInput);
 
-  // 1. The flush thredhold is controlled by writeBufferSize_ from configuration
+  // 1. The flush threshold is controlled by writeBufferSize_ from configuration
   // 2. The materialized size is controlled by kMaxReadBufferSize
   constexpr int32_t kTargetBatchBytes = (1UL << 20) -
       AlignedBuffer::kPaddedSize; // 1M, Same as kMaxReadBufferSize
@@ -820,7 +795,8 @@ void Spiller::updateSpillTotalTime(uint64_t timeUs) {
 
 bool Spiller::needSort() const {
   return type_ != Type::kHashJoinProbe && type_ != Type::kHashJoinBuild &&
-      type_ != Type::kAggregateOutput && type_ != Type::kOrderByOutput;
+      type_ != Type::kAggregateOutput && type_ != Type::kOrderByOutput &&
+      type_ != Type::kLocalMergeInput;
 }
 
 void Spiller::spill() {
@@ -834,15 +810,22 @@ void Spiller::spill(const RowContainerIterator& startRowIter) {
 
 void Spiller::spill(const RowContainerIterator* startRowIter) {
   CHECK_NOT_FINALIZED();
-  BOLT_CHECK_NE(type_, Type::kHashJoinProbe);
-  BOLT_CHECK_NE(type_, Type::kOrderByOutput);
-  const bool doPotentialRangePartitionCheck =
-      (supportSkewPartition_ && container_ &&
-       container_->numRows() >
-           std::max(maxSpillRunRows_, kDefaultSpillRunRows));
+  BOLT_CHECK(
+      type_ != Type::kHashJoinProbe && type_ != Type::kOrderByOutput &&
+      type_ != Type::kLocalMergeInput);
   uint64_t totalTimeUs{0};
   {
     MicrosecondTimer timer(&totalTimeUs);
+
+    uint64_t maxRowsPerPartition{0};
+    if (supportSkewPartition_) {
+      if (skewedVictim_.has_value() && maxRowsPerFile_ > 0) {
+        maxRowsPerPartition = maxRowsPerFile_;
+      } else if (!isAnySpilled()) {
+        maxRowsPerPartition =
+            bits::divRoundUp(container_->numRows(), state_.maxPartitions());
+      }
+    }
     markAllPartitionsSpilled();
 
     RowContainerIterator rowIter;
@@ -852,9 +835,9 @@ void Spiller::spill(const RowContainerIterator* startRowIter) {
 
     bool lastRun{false};
     do {
-      lastRun = fillSpillRuns(&rowIter);
+      lastRun = fillSpillRuns(&rowIter, maxRowsPerPartition);
       runSpill(lastRun);
-      if (doPotentialRangePartitionCheck) {
+      if (supportSkewPartition_ || skewedVictim_.has_value()) {
         prepareForRangPartitionIfNeeded();
       }
     } while (!lastRun);
@@ -903,7 +886,8 @@ void Spiller::spill(uint32_t partition, const RowVectorPtr& spillVector) {
   CHECK_NOT_FINALIZED();
   BOLT_CHECK(
       type_ == Type::kHashJoinProbe || type_ == Type::kHashJoinBuild ||
-          type_ == Type::kHashJoinProbeMatchFlag,
+          type_ == Type::kHashJoinProbeMatchFlag ||
+          type_ == Type::kLocalMergeInput,
       "Unexpected spiller type: {}",
       typeName(type_));
   if (FOLLY_UNLIKELY(!state_.isPartitionSpilled(partition))) {
@@ -923,8 +907,8 @@ void Spiller::spill(uint32_t partition, const RowVectorPtr& spillVector) {
     state_.appendToPartition(partition, spillVector);
   }
   updateSpillTotalTime(totalTimeUs);
-  if (supportSkewPartition_ && partition == skewedVictim_ &&
-      maxRowsPerFile_ > 0 &&
+  if (supportSkewPartition_ && skewedVictim_.has_value() &&
+      partition == *skewedVictim_ && maxRowsPerFile_ > 0 &&
       state_.rowsInCurrentFile(partition) >= maxRowsPerFile_) {
     state_.finishFile(partition);
   }
@@ -963,7 +947,9 @@ void Spiller::finalizeSpill() {
   finalized_ = true;
 }
 
-bool Spiller::fillSpillRuns(RowContainerIterator* iterator) {
+bool Spiller::fillSpillRuns(
+    RowContainerIterator* iterator,
+    const uint64_t maxRowsPerPartition) {
   checkEmptySpillRuns();
   bool lastRun{false};
   uint64_t execTimeUs{0};
@@ -977,9 +963,10 @@ bool Spiller::fillSpillRuns(RowContainerIterator* iterator) {
     const bool isSinglePartition = bits_.numPartitions() == 1;
 
     uint64_t totalRows{0};
+    bool maxRowsPerPartitionReached = false;
     for (;;) {
-      const auto numRows = container_->listRows(
-          iterator, rows.size(), RowContainer::kUnlimited, rows.data());
+      const auto numRows =
+          container_->listRows(iterator, rows.size(), rows.data());
       if (numRows == 0) {
         lastRun = true;
         break;
@@ -1005,9 +992,20 @@ bool Spiller::fillSpillRuns(RowContainerIterator* iterator) {
         spillRuns_[partition].rows.push_back(rows[i]);
         spillRuns_[partition].numBytes += container_->rowSize(rows[i]);
       }
-
       totalRows += numRows;
-      if (maxSpillRunRows_ > 0 && totalRows >= maxSpillRunRows_) {
+      // Stop filling this run once any partition reaches the per-partition row
+      // target, so the skewed partition can be identified before writing an
+      // oversized spill file.
+      if (maxRowsPerPartition > 0 && !maxRowsPerPartitionReached) {
+        for (auto partition = 0; partition < spillRuns_.size(); ++partition) {
+          if (spillRuns_[partition].rows.size() >= maxRowsPerPartition) {
+            maxRowsPerPartitionReached = true;
+            break;
+          }
+        }
+      }
+      if ((maxSpillRunRows_ > 0 && totalRows >= maxSpillRunRows_) ||
+          maxRowsPerPartitionReached) {
         break;
       }
     }
@@ -1131,9 +1129,9 @@ void Spiller::trySplitSkewPartition(SpillPartitionSet& partitionSet) {
 }
 
 void Spiller::prepareForRangPartitionIfNeeded() {
-  if (skewedVictim_ >= 0 && maxRowsPerFile_ >= 0 &&
-      state_.rowsInCurrentFile(skewedVictim_) >= maxRowsPerFile_) {
-    state_.finishFile(skewedVictim_);
+  if (skewedVictim_.has_value() && maxRowsPerFile_ > 0 &&
+      state_.rowsInCurrentFile(*skewedVictim_) >= maxRowsPerFile_) {
+    state_.finishFile(*skewedVictim_);
     return;
   }
   const auto& rowCountVec = state_.spilledRowCount();
@@ -1144,11 +1142,11 @@ void Spiller::prepareForRangPartitionIfNeeded() {
   for (auto i = 0; i < rowCountVec.size(); ++i) {
     auto rowCount = rowCountVec[i];
     if (rowCount > 0) {
-      if (rowCountVec[i] > maxRowCount) {
+      if (rowCount > maxRowCount) {
         maxRowCount = rowCount;
         skewedPartitionNumber = i;
       }
-      minRowCount = std::min(minRowCount, rowCountVec[i]);
+      minRowCount = std::min(minRowCount, rowCount);
     }
   }
   if (minRowCount != 0 &&
@@ -1159,7 +1157,7 @@ void Spiller::prepareForRangPartitionIfNeeded() {
     state_.finishFile(skewedPartitionNumber);
     BOLT_CHECK(state_.numFinishedFiles(skewedPartitionNumber) > 0);
     LOG(INFO) << __FUNCTION__ << ": set maxRowsPerFile_ = " << maxRowsPerFile_
-              << ", skewedVictim_ = " << skewedVictim_;
+              << ", skewedVictim_ = " << *skewedVictim_;
   }
 }
 
@@ -1187,6 +1185,8 @@ std::string Spiller::typeName(Type type) {
       return "AGGREGATE_INPUT";
     case Type::kAggregateOutput:
       return "AGGREGATE_OUTPUT";
+    case Type::kLocalMergeInput:
+      return "LOCAL_MERGE_INPUT";
     case Type::kHashJoinProbeMatchFlag:
       return "kHashJoinProbeMatchFlag";
     default:

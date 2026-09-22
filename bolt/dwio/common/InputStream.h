@@ -131,7 +131,7 @@ class InputStream {
 
   /**
    * Take advantage of vectorized read API provided by some file system.
-   * Allow file system to do optimzied reading plan to disk to minimize
+   * Allow file system to do optimized reading plan to disk to minimize
    * total bytes transferred through network. Stores the result in an IOBuf
    * range named at `iobufs`, which must have the same size as `regions`.
    */
@@ -164,24 +164,7 @@ class ReadFileInputStream final : public InputStream {
 
   virtual ~ReadFileInputStream() {}
 
-  uint64_t getLength() const final override {
-    // file_size_ is populated by hdfsGetPathInfo for Spark
-    // which involves an RPC with hdfs namenode
-    uint64_t len = 0;
-#ifdef SPARK_COMPATIBLE
-    uint64_t readTime = 0;
-    {
-      NanosecondTimer timer(&readTime);
-      len = readFile_->size();
-    }
-    if (stats_) {
-      stats_->incLoadFileMetaDataTimeNs(readTime);
-    }
-#else
-    len = readFile_->size();
-#endif
-    return len;
-  }
+  uint64_t getLength() const final override;
 
   uint64_t getNaturalReadSize() const final override {
     return readFile_->getNaturalReadSize();

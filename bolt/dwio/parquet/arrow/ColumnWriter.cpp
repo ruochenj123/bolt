@@ -36,8 +36,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -45,6 +48,7 @@
 #include "arrow/buffer_builder.h"
 #include "arrow/compute/api.h"
 #include "arrow/io/memory.h"
+#include "arrow/memory_pool.h"
 #include "arrow/status.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
@@ -59,11 +63,13 @@
 
 #include "bolt/dwio/parquet/arrow/ColumnPage.h"
 #include "bolt/dwio/parquet/arrow/Encoding.h"
+#include "bolt/dwio/parquet/arrow/EncodingInternal.h"
 #include "bolt/dwio/parquet/arrow/Encryption.h"
 #include "bolt/dwio/parquet/arrow/EncryptionInternal.h"
 #include "bolt/dwio/parquet/arrow/FileEncryptorInternal.h"
 #include "bolt/dwio/parquet/arrow/LevelConversion.h"
 #include "bolt/dwio/parquet/arrow/Metadata.h"
+#include "bolt/dwio/parquet/arrow/PageBufferArena.h"
 #include "bolt/dwio/parquet/arrow/PageIndex.h"
 #include "bolt/dwio/parquet/arrow/Platform.h"
 #include "bolt/dwio/parquet/arrow/Properties.h"
@@ -93,7 +99,67 @@ using util::CodecOptions;
 
 namespace {
 
-// Visitor that exracts the value buffer from a FlatArray at a given offset.
+constexpr int64_t kMaxPageHeaderSize = std::numeric_limits<int32_t>::max();
+constexpr int64_t kDataPageValueCountFlushThreshold =
+    std::numeric_limits<int32_t>::max() / 2;
+
+int32_t checkPageHeaderSize(std::string_view size_name, int64_t size) {
+  if (size < 0 || size > kMaxPageHeaderSize) {
+    throw ParquetException(
+        std::string(size_name),
+        " page size cannot be represented in a Parquet PageHeader int32 "
+        "field: ",
+        size);
+  }
+  return static_cast<int32_t>(size);
+}
+
+int32_t checkPageHeaderCount(std::string_view count_name, int64_t count) {
+  if (count < 0 || count > std::numeric_limits<int32_t>::max()) {
+    throw ParquetException(
+        std::string(count_name),
+        " cannot be represented in a Parquet page header int32 field: ",
+        count);
+  }
+  return static_cast<int32_t>(count);
+}
+
+int64_t bufferAllocatedBytes(const std::shared_ptr<Buffer>& buffer) {
+  return buffer != nullptr ? buffer->capacity() : 0;
+}
+
+int64_t resizableBufferAllocatedBytes(
+    const std::shared_ptr<ResizableBuffer>& buffer) {
+  return buffer != nullptr ? buffer->capacity() : 0;
+}
+
+template <typename PagePtr>
+int64_t pageBufferAllocatedBytes(const PagePtr& page) {
+  if (page == nullptr) {
+    return 0;
+  }
+  return bufferAllocatedBytes(page->buffer());
+}
+
+template <typename PagePtr>
+int64_t pageBufferFallbackAllocatedBytes(
+    const PagePtr& page,
+    const std::shared_ptr<PageBufferArena>& page_buffer_arena) {
+  if (page == nullptr) {
+    return 0;
+  }
+  const auto& buffer = page->buffer();
+  if (buffer == nullptr) {
+    return 0;
+  }
+  if (page_buffer_arena != nullptr &&
+      page_buffer_arena->Contains(buffer.get())) {
+    return 0;
+  }
+  return bufferAllocatedBytes(buffer);
+}
+
+// Visitor that extracts the value buffer from a FlatArray at a given offset.
 struct ValueBufferSlicer {
   template <typename T>
   ::arrow::enable_if_base_binary<typename T::TypeClass, Status> Visit(
@@ -206,6 +272,45 @@ inline const T* AddIfNotNull(const T* base, int64_t offset) {
 
 } // namespace
 
+BufferedColumnWriterResources::BufferedColumnWriterResources(
+    MemoryPool* allocator,
+    std::shared_ptr<PageBufferArena> page_buffer_arena)
+    : allocator_(allocator), page_buffer_arena_(std::move(page_buffer_arena)) {}
+
+const std::shared_ptr<PageBufferArena>&
+BufferedColumnWriterResources::page_buffer_arena() const {
+  return page_buffer_arena_;
+}
+
+void BufferedColumnWriterResources::ResetPageBufferArena() {
+  if (page_buffer_arena_ != nullptr) {
+    page_buffer_arena_->Reset();
+  }
+}
+
+std::shared_ptr<ResizableBuffer>
+BufferedColumnWriterResources::GetUncompressedDataBuffer() {
+  if (uncompressed_data_ == nullptr) {
+    uncompressed_data_ = std::static_pointer_cast<ResizableBuffer>(
+        AllocateBuffer(allocator_, 0));
+  }
+  return uncompressed_data_;
+}
+
+std::shared_ptr<ResizableBuffer>
+BufferedColumnWriterResources::GetCompressorTempBuffer() {
+  if (compressor_temp_buffer_ == nullptr) {
+    compressor_temp_buffer_ = std::static_pointer_cast<ResizableBuffer>(
+        AllocateBuffer(allocator_, 0));
+  }
+  return compressor_temp_buffer_;
+}
+
+int64_t BufferedColumnWriterResources::shared_scratch_allocated_bytes() const {
+  return resizableBufferAllocatedBytes(uncompressed_data_) +
+      resizableBufferAllocatedBytes(compressor_temp_buffer_);
+}
+
 LevelEncoder::LevelEncoder() {}
 LevelEncoder::~LevelEncoder() {}
 
@@ -305,7 +410,8 @@ class SerializedPageWriter : public PageWriter {
       std::shared_ptr<Encryptor> data_encryptor = nullptr,
       ColumnIndexBuilder* column_index_builder = nullptr,
       OffsetIndexBuilder* offset_index_builder = nullptr,
-      const CodecOptions& codec_options = CodecOptions{})
+      const CodecOptions& codec_options = CodecOptions{},
+      std::shared_ptr<WriterMetricsCollector> writerMetrics = nullptr)
       : sink_(std::move(sink)),
         metadata_(metadata),
         pool_(pool),
@@ -322,7 +428,8 @@ class SerializedPageWriter : public PageWriter {
         data_encryptor_(std::move(data_encryptor)),
         encryption_buffer_(AllocateBuffer(pool, 0)),
         column_index_builder_(column_index_builder),
-        offset_index_builder_(offset_index_builder) {
+        offset_index_builder_(offset_index_builder),
+        writerMetrics_(std::move(writerMetrics)) {
     if (data_encryptor_ != nullptr || meta_encryptor_ != nullptr) {
       InitEncryption();
     }
@@ -333,7 +440,9 @@ class SerializedPageWriter : public PageWriter {
   int64_t WriteDictionaryPage(
       std::unique_ptr<DictionaryPage> pagePtr) override {
     const auto& page = *pagePtr;
-    int64_t uncompressed_size = page.size();
+    const int64_t uncompressed_size = page.buffer()->size();
+    const int32_t uncompressed_page_size =
+        checkPageHeaderSize("Uncompressed dictionary", uncompressed_size);
     std::shared_ptr<Buffer> compressed_data;
     if (has_compressor()) {
       auto buffer = std::static_pointer_cast<ResizableBuffer>(
@@ -350,25 +459,31 @@ class SerializedPageWriter : public PageWriter {
     dict_page_header.__set_is_sorted(page.is_sorted());
 
     const uint8_t* output_data_buffer = compressed_data->data();
-    int32_t output_data_len = static_cast<int32_t>(compressed_data->size());
+    int64_t output_data_len = compressed_data->size();
+    int32_t compressed_page_size =
+        checkPageHeaderSize("Compressed dictionary", output_data_len);
 
     if (data_encryptor_.get()) {
       UpdateEncryption(encryption::kDictionaryPage);
-      PARQUET_THROW_NOT_OK(encryption_buffer_->Resize(
-          data_encryptor_->CiphertextSizeDelta() + output_data_len, false));
+      const int32_t encrypted_buffer_size = checkPageHeaderSize(
+          "Encrypted dictionary",
+          static_cast<int64_t>(data_encryptor_->CiphertextSizeDelta()) +
+              compressed_page_size);
+      PARQUET_THROW_NOT_OK(
+          encryption_buffer_->Resize(encrypted_buffer_size, false));
       output_data_len = data_encryptor_->Encrypt(
           compressed_data->data(),
-          output_data_len,
+          compressed_page_size,
           encryption_buffer_->mutable_data());
       output_data_buffer = encryption_buffer_->data();
+      compressed_page_size =
+          checkPageHeaderSize("Encrypted dictionary", output_data_len);
     }
 
     format::PageHeader page_header;
     page_header.__set_type(format::PageType::DICTIONARY_PAGE);
-    page_header.__set_uncompressed_page_size(
-        static_cast<int32_t>(uncompressed_size));
-    page_header.__set_compressed_page_size(
-        static_cast<int32_t>(output_data_len));
+    page_header.__set_uncompressed_page_size(uncompressed_page_size);
+    page_header.__set_compressed_page_size(compressed_page_size);
     page_header.__set_dictionary_page_header(dict_page_header);
     if (page_checksum_verification_) {
       uint32_t crc32 =
@@ -429,47 +544,65 @@ class SerializedPageWriter : public PageWriter {
     DCHECK(compressor_ != nullptr);
 
     // Compress the data
-    int64_t max_compressed_size =
-        compressor_->MaxCompressedLen(src_buffer.size(), src_buffer.data());
+    const int64_t max_compressed_size = MaxCompressedLen(src_buffer);
 
     // Use Arrow::Buffer::shrink_to_fit = false
     // underlying buffer only keeps growing. Resize to a smaller size does not
     // reallocate.
     PARQUET_THROW_NOT_OK(dest_buffer->Resize(max_compressed_size, false));
 
-    PARQUET_ASSIGN_OR_THROW(
-        int64_t compressed_size,
-        compressor_->Compress(
-            src_buffer.size(),
-            src_buffer.data(),
-            max_compressed_size,
-            dest_buffer->mutable_data()));
+    int64_t compressed_size;
+    {
+      WriterMetricTimer timer(
+          writerMetrics_ ? &writerMetrics_->writeCompressionWallNanos : nullptr,
+          true);
+      PARQUET_ASSIGN_OR_THROW(
+          compressed_size,
+          compressor_->Compress(
+              src_buffer.size(),
+              src_buffer.data(),
+              max_compressed_size,
+              dest_buffer->mutable_data()));
+    }
     PARQUET_THROW_NOT_OK(dest_buffer->Resize(compressed_size, false));
+  }
+
+  int64_t MaxCompressedLen(const Buffer& src_buffer) const override {
+    DCHECK(compressor_ != nullptr);
+    return compressor_->MaxCompressedLen(src_buffer.size(), src_buffer.data());
   }
 
   int64_t WriteDataPage(std::unique_ptr<DataPage> pagePtr) override {
     const DataPage& page = *pagePtr;
     const int64_t uncompressed_size = page.uncompressed_size();
+    const int32_t uncompressed_page_size =
+        checkPageHeaderSize("Uncompressed data", uncompressed_size);
     std::shared_ptr<Buffer> compressed_data = page.buffer();
     const uint8_t* output_data_buffer = compressed_data->data();
-    int32_t output_data_len = static_cast<int32_t>(compressed_data->size());
+    int64_t output_data_len = compressed_data->size();
+    int32_t compressed_page_size =
+        checkPageHeaderSize("Compressed data", output_data_len);
 
     if (data_encryptor_.get()) {
-      PARQUET_THROW_NOT_OK(encryption_buffer_->Resize(
-          data_encryptor_->CiphertextSizeDelta() + output_data_len, false));
+      const int32_t encrypted_buffer_size = checkPageHeaderSize(
+          "Encrypted data",
+          static_cast<int64_t>(data_encryptor_->CiphertextSizeDelta()) +
+              compressed_page_size);
+      PARQUET_THROW_NOT_OK(
+          encryption_buffer_->Resize(encrypted_buffer_size, false));
       UpdateEncryption(encryption::kDataPage);
       output_data_len = data_encryptor_->Encrypt(
           compressed_data->data(),
-          output_data_len,
+          compressed_page_size,
           encryption_buffer_->mutable_data());
       output_data_buffer = encryption_buffer_->data();
+      compressed_page_size =
+          checkPageHeaderSize("Encrypted data", output_data_len);
     }
 
     format::PageHeader page_header;
-    page_header.__set_uncompressed_page_size(
-        static_cast<int32_t>(uncompressed_size));
-    page_header.__set_compressed_page_size(
-        static_cast<int32_t>(output_data_len));
+    page_header.__set_uncompressed_page_size(uncompressed_page_size);
+    page_header.__set_compressed_page_size(compressed_page_size);
 
     if (page_checksum_verification_) {
       uint32_t crc32 =
@@ -721,6 +854,7 @@ class SerializedPageWriter : public PageWriter {
 
   ColumnIndexBuilder* column_index_builder_;
   OffsetIndexBuilder* offset_index_builder_;
+  const std::shared_ptr<WriterMetricsCollector> writerMetrics_;
 };
 
 // This implementation of the PageWriter writes to the final sink on Close .
@@ -734,14 +868,17 @@ class BufferedPageWriter : public PageWriter {
       int16_t current_column_ordinal,
       bool use_page_checksum_verification,
       MemoryPool* pool = ::arrow::default_memory_pool(),
+      std::shared_ptr<PageBufferArena> page_buffer_arena = nullptr,
       std::shared_ptr<Encryptor> meta_encryptor = nullptr,
       std::shared_ptr<Encryptor> data_encryptor = nullptr,
       ColumnIndexBuilder* column_index_builder = nullptr,
       OffsetIndexBuilder* offset_index_builder = nullptr,
-      const CodecOptions& codec_options = CodecOptions{})
+      const CodecOptions& codec_options = CodecOptions{},
+      std::shared_ptr<WriterMetricsCollector> writerMetrics = nullptr)
       : final_sink_(std::move(sink)),
         metadata_(metadata),
-        has_dictionary_pages_(false) {
+        has_dictionary_pages_(false),
+        page_buffer_arena_(std::move(page_buffer_arena)) {
     pager_ = std::make_unique<SerializedPageWriter>(
         final_sink_,
         codec,
@@ -754,7 +891,8 @@ class BufferedPageWriter : public PageWriter {
         std::move(data_encryptor),
         column_index_builder,
         offset_index_builder,
-        codec_options);
+        codec_options,
+        std::move(writerMetrics));
   }
 
   int64_t WriteDictionaryPage(std::unique_ptr<DictionaryPage> page) override {
@@ -814,9 +952,48 @@ class BufferedPageWriter : public PageWriter {
     return data_pages_.back()->uncompressed_size() + sizeof(format::PageHeader);
   }
 
+  int64_t buffered_data_page_allocated_bytes() const {
+    int64_t total_buffered_data_page_allocated_bytes = 0;
+    for (const auto& page : data_pages_) {
+      total_buffered_data_page_allocated_bytes +=
+          pageBufferAllocatedBytes(page);
+    }
+    return total_buffered_data_page_allocated_bytes;
+  }
+
+  int64_t buffered_data_page_fallback_allocated_bytes() const {
+    int64_t total_buffered_data_page_fallback_allocated_bytes = 0;
+    for (const auto& page : data_pages_) {
+      total_buffered_data_page_fallback_allocated_bytes +=
+          pageBufferFallbackAllocatedBytes(page, page_buffer_arena_);
+    }
+    return total_buffered_data_page_fallback_allocated_bytes;
+  }
+
+  int64_t buffered_data_page_count() const {
+    return data_pages_.size();
+  }
+
+  int64_t buffered_dictionary_page_allocated_bytes() const {
+    return pageBufferAllocatedBytes(dictionary_page_);
+  }
+
+  int64_t buffered_dictionary_page_fallback_allocated_bytes() const {
+    return pageBufferFallbackAllocatedBytes(
+        dictionary_page_, page_buffer_arena_);
+  }
+
+  int64_t buffered_dictionary_page_count() const {
+    return dictionary_page_ != nullptr ? 1 : 0;
+  }
+
   void Compress(const Buffer& src_buffer, ResizableBuffer* dest_buffer)
       override {
     pager_->Compress(src_buffer, dest_buffer);
+  }
+
+  int64_t MaxCompressedLen(const Buffer& src_buffer) const override {
+    return pager_->MaxCompressedLen(src_buffer);
   }
 
   bool has_compressor() override {
@@ -832,6 +1009,7 @@ class BufferedPageWriter : public PageWriter {
   ColumnChunkMetaDataBuilder* metadata_;
   std::unique_ptr<SerializedPageWriter> pager_;
   bool has_dictionary_pages_;
+  std::shared_ptr<PageBufferArena> page_buffer_arena_;
   std::unique_ptr<DictionaryPage> dictionary_page_;
   std::vector<std::unique_ptr<DataPage>> data_pages_;
   int64_t total_compressed_bytes_written_{0};
@@ -850,7 +1028,9 @@ std::unique_ptr<PageWriter> PageWriter::Open(
     bool page_write_checksum_enabled,
     ColumnIndexBuilder* column_index_builder,
     OffsetIndexBuilder* offset_index_builder,
-    const CodecOptions& codec_options) {
+    const CodecOptions& codec_options,
+    std::shared_ptr<PageBufferArena> page_buffer_arena,
+    std::shared_ptr<WriterMetricsCollector> writer_metrics) {
   if (buffered_row_group) {
     return std::unique_ptr<PageWriter>(new BufferedPageWriter(
         std::move(sink),
@@ -860,11 +1040,13 @@ std::unique_ptr<PageWriter> PageWriter::Open(
         column_chunk_ordinal,
         page_write_checksum_enabled,
         pool,
+        std::move(page_buffer_arena),
         std::move(meta_encryptor),
         std::move(data_encryptor),
         column_index_builder,
         offset_index_builder,
-        codec_options));
+        codec_options,
+        std::move(writer_metrics)));
   } else {
     return std::unique_ptr<PageWriter>(new SerializedPageWriter(
         std::move(sink),
@@ -878,7 +1060,8 @@ std::unique_ptr<PageWriter> PageWriter::Open(
         std::move(data_encryptor),
         column_index_builder,
         offset_index_builder,
-        codec_options));
+        codec_options,
+        std::move(writer_metrics)));
   }
 }
 
@@ -895,7 +1078,9 @@ std::unique_ptr<PageWriter> PageWriter::Open(
     std::shared_ptr<Encryptor> data_encryptor,
     bool page_write_checksum_enabled,
     ColumnIndexBuilder* column_index_builder,
-    OffsetIndexBuilder* offset_index_builder) {
+    OffsetIndexBuilder* offset_index_builder,
+    std::shared_ptr<PageBufferArena> page_buffer_arena,
+    std::shared_ptr<WriterMetricsCollector> writer_metrics) {
   return PageWriter::Open(
       sink,
       codec,
@@ -909,7 +1094,9 @@ std::unique_ptr<PageWriter> PageWriter::Open(
       page_write_checksum_enabled,
       column_index_builder,
       offset_index_builder,
-      CodecOptions{compression_level});
+      CodecOptions{compression_level},
+      std::move(page_buffer_arena),
+      std::move(writer_metrics));
 }
 // ----------------------------------------------------------------------
 // ColumnWriter
@@ -927,7 +1114,9 @@ class ColumnWriterImpl {
       std::unique_ptr<PageWriter> pager,
       const bool use_dictionary,
       Encoding::type encoding,
-      const WriterProperties* properties)
+      const WriterProperties* properties,
+      std::shared_ptr<BufferedColumnWriterResources> buffered_resources,
+      int64_t byte_array_page_size_limit)
       : metadata_(metadata),
         descr_(metadata->descr()),
         level_info_(ComputeLevelInfo(metadata->descr())),
@@ -935,10 +1124,18 @@ class ColumnWriterImpl {
         has_dictionary_(use_dictionary),
         encoding_(encoding),
         properties_(properties),
+        page_buffer_arena_(
+            buffered_resources != nullptr
+                ? buffered_resources->page_buffer_arena()
+                : nullptr),
         allocator_(properties->memory_pool()),
         dictionary_pagesize_limit_(
             properties->dictionary_pagesize_limit(descr_->path())),
         data_pagesize_(properties->data_pagesize(descr_->path())),
+        byte_array_page_size_limit_(std::clamp<int64_t>(
+            byte_array_page_size_limit,
+            0,
+            kMaxPageHeaderSize)),
         num_buffered_values_(0),
         num_buffered_encoded_values_(0),
         num_buffered_nulls_(0),
@@ -948,19 +1145,34 @@ class ColumnWriterImpl {
         total_compressed_bytes_(0),
         closed_(false),
         fallback_(false),
-        definition_levels_sink_(allocator_),
-        repetition_levels_sink_(allocator_) {
+        definition_levels_encoder_(nullptr),
+        repetition_levels_encoder_(nullptr) {
     definition_levels_rle_ = std::static_pointer_cast<ResizableBuffer>(
         AllocateBuffer(allocator_, 0));
     repetition_levels_rle_ = std::static_pointer_cast<ResizableBuffer>(
         AllocateBuffer(allocator_, 0));
-    uncompressed_data_ = std::static_pointer_cast<ResizableBuffer>(
-        AllocateBuffer(allocator_, 0));
-
-    if (pager_->has_compressor()) {
-      compressor_temp_buffer_ = std::static_pointer_cast<ResizableBuffer>(
+    if (buffered_resources != nullptr) {
+      uncompressed_data_ = buffered_resources->GetUncompressedDataBuffer();
+      uses_shared_uncompressed_data_ = true;
+    } else {
+      uncompressed_data_ = std::static_pointer_cast<ResizableBuffer>(
           AllocateBuffer(allocator_, 0));
     }
+    definition_levels_encoder_ =
+        IncrementalLevelRleEncoder(definition_levels_rle_.get());
+    repetition_levels_encoder_ =
+        IncrementalLevelRleEncoder(repetition_levels_rle_.get());
+
+    if (pager_->has_compressor()) {
+      if (buffered_resources != nullptr) {
+        compressor_temp_buffer_ = buffered_resources->GetCompressorTempBuffer();
+        uses_shared_compressor_temp_buffer_ = true;
+      } else {
+        compressor_temp_buffer_ = std::static_pointer_cast<ResizableBuffer>(
+            AllocateBuffer(allocator_, 0));
+      }
+    }
+    InitSinks();
   }
 
   virtual ~ColumnWriterImpl() = default;
@@ -981,6 +1193,12 @@ class ColumnWriterImpl {
 
   // Merges page statistics into chunk statistics, then resets the values
   virtual void ResetPageStatistics() = 0;
+
+  virtual int64_t EncoderMemoryBytes() const = 0;
+
+  virtual int64_t EncoderPeakMemoryBytes() const = 0;
+
+  virtual int64_t EncoderEstimatedDataEncodedSize() const = 0;
 
   // Adds Data Pages to an in memory buffer in dictionary encoding mode
   // Serializes the Data Pages in other encoding modes
@@ -1006,23 +1224,14 @@ class ColumnWriterImpl {
   // Write multiple definition levels
   void WriteDefinitionLevels(int64_t num_levels, const int16_t* levels) {
     DCHECK(!closed_);
-    PARQUET_THROW_NOT_OK(
-        definition_levels_sink_.Append(levels, sizeof(int16_t) * num_levels));
+    definition_levels_encoder_.Put(levels, num_levels);
   }
 
   // Write multiple repetition levels
   void WriteRepetitionLevels(int64_t num_levels, const int16_t* levels) {
     DCHECK(!closed_);
-    PARQUET_THROW_NOT_OK(
-        repetition_levels_sink_.Append(levels, sizeof(int16_t) * num_levels));
+    repetition_levels_encoder_.Put(levels, num_levels);
   }
-
-  // RLE encode the src_buffer into dest_buffer and return the encoded size
-  int64_t RleEncodeLevels(
-      const void* src_buffer,
-      ResizableBuffer* dest_buffer,
-      int16_t max_level,
-      bool include_length_prefix = true);
 
   // Serialize the buffered Data Pages
   void FlushBufferedDataPages();
@@ -1038,14 +1247,15 @@ class ColumnWriterImpl {
   bool has_dictionary_;
   Encoding::type encoding_;
   const WriterProperties* properties_;
-
-  LevelEncoder level_encoder_;
+  std::shared_ptr<PageBufferArena> page_buffer_arena_;
 
   MemoryPool* allocator_;
 
   const int64_t dictionary_pagesize_limit_;
 
   const int64_t data_pagesize_;
+
+  const int64_t byte_array_page_size_limit_;
 
   // The total number of values stored in the data page. This is the maximum of
   // the number of encoded definition levels or encoded values. For
@@ -1081,21 +1291,92 @@ class ColumnWriterImpl {
   // Flag to infer if dictionary encoding has fallen back to PLAIN
   bool fallback_;
 
-  ::arrow::BufferBuilder definition_levels_sink_;
-  ::arrow::BufferBuilder repetition_levels_sink_;
-
   std::shared_ptr<ResizableBuffer> definition_levels_rle_;
   std::shared_ptr<ResizableBuffer> repetition_levels_rle_;
+  IncrementalLevelRleEncoder definition_levels_encoder_;
+  IncrementalLevelRleEncoder repetition_levels_encoder_;
 
   std::shared_ptr<ResizableBuffer> uncompressed_data_;
   std::shared_ptr<ResizableBuffer> compressor_temp_buffer_;
+  bool uses_shared_uncompressed_data_{false};
+  bool uses_shared_compressor_temp_buffer_{false};
 
   std::vector<std::unique_ptr<DataPage>> data_pages_;
 
+ protected:
+  std::shared_ptr<ResizableBuffer> AllocateArenaOrFallbackBuffer(
+      int64_t size,
+      int64_t capacity) {
+    if (page_buffer_arena_ != nullptr) {
+      auto buffer = page_buffer_arena_->TryAllocate(size, capacity);
+      if (buffer != nullptr) {
+        return buffer;
+      }
+    }
+    return AllocateBuffer(allocator_, size);
+  }
+
  private:
+  std::shared_ptr<ResizableBuffer> AllocatePageBuffer(int64_t size) {
+    return AllocateArenaOrFallbackBuffer(size, size);
+  }
+
+  std::shared_ptr<Buffer> CopyToPageBuffer(
+      const std::shared_ptr<Buffer>& source_buffer) {
+    auto page_buffer = AllocatePageBuffer(source_buffer->size());
+    if (source_buffer->size() > 0) {
+      memcpy(
+          page_buffer->mutable_data(),
+          source_buffer->data(),
+          source_buffer->size());
+    }
+    return page_buffer;
+  }
+
+  // Choose the smallest practical page buffer for compressed output:
+  // compress directly into the arena when it can hold MaxCompressedLen(),
+  // otherwise compress into shared scratch and copy into an exact-sized page
+  // buffer so fallback allocations track the real compressed size.
+  std::shared_ptr<Buffer> CompressToPageBuffer(
+      const Buffer& uncompressed_buffer) {
+    const int64_t max_compressed_size =
+        pager_->MaxCompressedLen(uncompressed_buffer);
+    if (page_buffer_arena_ != nullptr &&
+        page_buffer_arena_->available_bytes() >= max_compressed_size) {
+      auto compressed_buffer =
+          page_buffer_arena_->TryAllocate(/*size=*/0, max_compressed_size);
+      DCHECK_NE(compressed_buffer, nullptr);
+      pager_->Compress(uncompressed_buffer, compressed_buffer.get());
+      PARQUET_THROW_NOT_OK(
+          page_buffer_arena_->CommitLastAllocation(compressed_buffer));
+      return compressed_buffer;
+    }
+    DCHECK(compressor_temp_buffer_ != nullptr);
+    pager_->Compress(uncompressed_buffer, compressor_temp_buffer_.get());
+    return CopyToPageBuffer(compressor_temp_buffer_);
+  }
+
   void InitSinks() {
-    definition_levels_sink_.Rewind(0);
-    repetition_levels_sink_.Rewind(0);
+    const int prefix_size =
+        properties_->data_page_version() == ParquetDataPageVersion::V1
+        ? static_cast<int>(sizeof(int32_t))
+        : 0;
+
+    if (descr_->max_definition_level() > 0) {
+      definition_levels_encoder_.Reset(
+          descr_->max_definition_level(), prefix_size);
+    } else {
+      PARQUET_THROW_NOT_OK(
+          definition_levels_rle_->Resize(0, /*shrink_to_fit=*/false));
+    }
+
+    if (descr_->max_repetition_level() > 0) {
+      repetition_levels_encoder_.Reset(
+          descr_->max_repetition_level(), prefix_size);
+    } else {
+      PARQUET_THROW_NOT_OK(
+          repetition_levels_rle_->Resize(0, /*shrink_to_fit=*/false));
+    }
   }
 
   // Concatenate the encoded levels and values into one buffer
@@ -1114,45 +1395,6 @@ class ColumnWriterImpl {
   }
 };
 
-// return the size of the encoded buffer
-int64_t ColumnWriterImpl::RleEncodeLevels(
-    const void* src_buffer,
-    ResizableBuffer* dest_buffer,
-    int16_t max_level,
-    bool include_length_prefix) {
-  // V1 DataPage includes the length of the RLE level as a prefix.
-  int32_t prefix_size = include_length_prefix ? sizeof(int32_t) : 0;
-
-  // TODO: This only works with due to some RLE specifics
-  int64_t rle_size =
-      LevelEncoder::MaxBufferSize(
-          Encoding::RLE, max_level, static_cast<int>(num_buffered_values_)) +
-      prefix_size;
-
-  // Use Arrow::Buffer::shrink_to_fit = false
-  // underlying buffer only keeps growing. Resize to a smaller size does not
-  // reallocate.
-  PARQUET_THROW_NOT_OK(dest_buffer->Resize(rle_size, false));
-
-  level_encoder_.Init(
-      Encoding::RLE,
-      max_level,
-      static_cast<int>(num_buffered_values_),
-      dest_buffer->mutable_data() + prefix_size,
-      static_cast<int>(dest_buffer->size() - prefix_size));
-  int encoded = level_encoder_.Encode(
-      static_cast<int>(num_buffered_values_),
-      reinterpret_cast<const int16_t*>(src_buffer));
-  DCHECK_EQ(encoded, num_buffered_values_);
-
-  if (include_length_prefix) {
-    reinterpret_cast<int32_t*>(dest_buffer->mutable_data())[0] =
-        level_encoder_.len();
-  }
-
-  return level_encoder_.len() + prefix_size;
-}
-
 void ColumnWriterImpl::AddDataPage() {
   int64_t definition_levels_rle_size = 0;
   int64_t repetition_levels_rle_size = 0;
@@ -1162,19 +1404,11 @@ void ColumnWriterImpl::AddDataPage() {
       properties_->data_page_version() == ParquetDataPageVersion::V1;
 
   if (descr_->max_definition_level() > 0) {
-    definition_levels_rle_size = RleEncodeLevels(
-        definition_levels_sink_.data(),
-        definition_levels_rle_.get(),
-        descr_->max_definition_level(),
-        /*include_length_prefix=*/is_v1_data_page);
+    definition_levels_rle_size = definition_levels_encoder_.Flush();
   }
 
   if (descr_->max_repetition_level() > 0) {
-    repetition_levels_rle_size = RleEncodeLevels(
-        repetition_levels_sink_.data(),
-        repetition_levels_rle_.get(),
-        descr_->max_repetition_level(),
-        /*include_length_prefix=*/is_v1_data_page);
+    repetition_levels_rle_size = repetition_levels_encoder_.Flush();
   }
 
   int64_t uncompressed_size =
@@ -1224,13 +1458,10 @@ void ColumnWriterImpl::BuildDataPageV1(
         repetition_levels_rle_size,
         values,
         uncompressed_data_->mutable_data());
-    std::shared_ptr<ResizableBuffer> compressed_buffer =
-        AllocateBuffer(allocator_);
-    pager_->Compress(*(uncompressed_data_.get()), compressed_buffer.get());
-    compressed_data = compressed_buffer;
+    compressed_data = CompressToPageBuffer(*uncompressed_data_);
   } else {
     std::shared_ptr<ResizableBuffer> combined =
-        AllocateBuffer(allocator_, uncompressed_size);
+        AllocatePageBuffer(uncompressed_size);
     ConcatenateBuffers(
         definition_levels_rle_size,
         repetition_levels_rle_size,
@@ -1239,7 +1470,8 @@ void ColumnWriterImpl::BuildDataPageV1(
     compressed_data = std::move(combined);
   }
 
-  int32_t num_values = static_cast<int32_t>(num_buffered_values_);
+  const int32_t num_values =
+      checkPageHeaderCount("DataPageV1 num_values", num_buffered_values_);
   int64_t first_row_index = rows_written_ - num_buffered_rows_;
 
   // Write the page to OutputStream eagerly if there is no dictionary or
@@ -1290,8 +1522,7 @@ void ColumnWriterImpl::BuildDataPageV2(
   // Concatenate uncompressed levels and the possibly compressed values
   int64_t combined_size = definition_levels_rle_size +
       repetition_levels_rle_size + compressed_values->size();
-  std::shared_ptr<ResizableBuffer> combined =
-      AllocateBuffer(allocator_, combined_size);
+  std::shared_ptr<ResizableBuffer> combined = AllocatePageBuffer(combined_size);
 
   ConcatenateBuffers(
       definition_levels_rle_size,
@@ -1305,13 +1536,16 @@ void ColumnWriterImpl::BuildDataPageV2(
   page_stats.set_is_signed(SortOrder::SIGNED == descr_->sort_order());
   ResetPageStatistics();
 
-  int32_t num_values = static_cast<int32_t>(num_buffered_values_);
-  int32_t null_count = static_cast<int32_t>(num_buffered_nulls_);
-  int32_t num_rows = static_cast<int32_t>(num_buffered_rows_);
-  int32_t def_levels_byte_length =
-      static_cast<int32_t>(definition_levels_rle_size);
-  int32_t rep_levels_byte_length =
-      static_cast<int32_t>(repetition_levels_rle_size);
+  const int32_t num_values =
+      checkPageHeaderCount("DataPageV2 num_values", num_buffered_values_);
+  const int32_t null_count =
+      checkPageHeaderCount("DataPageV2 null_count", num_buffered_nulls_);
+  const int32_t num_rows =
+      checkPageHeaderCount("DataPageV2 num_rows", num_buffered_rows_);
+  const int32_t def_levels_byte_length =
+      checkPageHeaderSize("Definition levels", definition_levels_rle_size);
+  const int32_t rep_levels_byte_length =
+      checkPageHeaderSize("Repetition levels", repetition_levels_rle_size);
   int64_t first_row_index = rows_written_ - num_buffered_rows_;
 
   // page_stats.null_count is not set when page_statistics_ is nullptr. It is
@@ -1355,6 +1589,9 @@ void ColumnWriterImpl::BuildDataPageV2(
 
 int64_t ColumnWriterImpl::Close() {
   if (!closed_) {
+    const auto& writerMetrics = properties_->writer_metrics();
+    WriterEncodeMetricTimer timer(
+        writerMetrics ? &writerMetrics->writeEncodeWallNanos : nullptr);
     closed_ = true;
     if (has_dictionary_ && !fallback_) {
       WriteDictionaryPage();
@@ -1392,71 +1629,125 @@ void ColumnWriterImpl::FlushBufferedDataPages() {
 // ----------------------------------------------------------------------
 // TypedColumnWriter
 
-template <typename Action>
-inline void DoInBatches(int64_t total, int64_t batch_size, Action&& action) {
-  int64_t num_batches = static_cast<int>(total / batch_size);
-  for (int round = 0; round < num_batches; round++) {
-    action(round * batch_size, batch_size, /*check_page_size=*/true);
-  }
-  // Write the remaining values
-  if (total % batch_size > 0) {
-    action(
-        num_batches * batch_size, total % batch_size, /*check_page_size=*/true);
+template <typename Action, typename GetBufferedRows>
+inline void DoInBatchesNonRepeated(
+    int64_t num_levels,
+    int64_t batch_size,
+    int64_t max_rows_per_page,
+    Action&& action,
+    GetBufferedRows&& current_page_buffered_rows) {
+  int64_t offset = 0;
+  while (offset < num_levels) {
+    const int64_t page_buffered_rows = current_page_buffered_rows();
+    DCHECK_LE(page_buffered_rows, max_rows_per_page);
+
+    int64_t max_batch_size = std::min(batch_size, num_levels - offset);
+    max_batch_size =
+        std::min(max_batch_size, max_rows_per_page - page_buffered_rows);
+    if (max_batch_size <= 0) {
+      throw ParquetException(
+          "Non-repeated column batching cannot make progress: batch size ",
+          batch_size,
+          ", buffered rows ",
+          page_buffered_rows,
+          ", maximum rows per page ",
+          max_rows_per_page);
+    }
+    const int64_t end_offset = offset + max_batch_size;
+
+    DCHECK_LE(offset, end_offset);
+    DCHECK_LE(end_offset, num_levels);
+    action(offset, end_offset - offset, /*check_page_limit=*/true);
+    offset = end_offset;
   }
 }
 
-template <typename Action>
+template <typename Action, typename GetBufferedRows>
+inline void DoInBatchesRepeated(
+    const int16_t* def_levels,
+    const int16_t* rep_levels,
+    int64_t num_levels,
+    int64_t batch_size,
+    int64_t max_rows_per_page,
+    bool pages_change_on_record_boundaries,
+    Action&& action,
+    GetBufferedRows&& current_page_buffered_rows) {
+  int64_t offset = 0;
+  while (offset < num_levels) {
+    const int64_t max_batch_size = std::min(batch_size, num_levels - offset);
+    if (max_batch_size <= 0) {
+      throw ParquetException(
+          "Repeated column batching cannot make progress: batch size ",
+          batch_size);
+    }
+    int64_t end_offset = num_levels;
+    int64_t check_page_limit_end_offset = -1;
+    int64_t page_buffered_rows = current_page_buffered_rows();
+    DCHECK_LE(page_buffered_rows, max_rows_per_page);
+
+    // Find a batch ending at a record boundary. A single repeated record may
+    // exceed the row limit in values, but it must not be split across pages
+    // when page indexes or DataPageV2 require record-aligned pages.
+    for (int64_t i = offset; i < num_levels; ++i) {
+      if (rep_levels[i] == 0) {
+        check_page_limit_end_offset = i;
+        if (i - offset >= max_batch_size ||
+            page_buffered_rows >= max_rows_per_page) {
+          end_offset = i;
+          break;
+        }
+        ++page_buffered_rows;
+      }
+    }
+
+    DCHECK_LE(offset, end_offset);
+    DCHECK_LE(check_page_limit_end_offset, end_offset);
+
+    if (check_page_limit_end_offset >= 0) {
+      action(
+          offset,
+          check_page_limit_end_offset - offset,
+          /*check_page_limit=*/true);
+      offset = check_page_limit_end_offset;
+    }
+    if (end_offset > offset) {
+      DCHECK_EQ(end_offset, num_levels);
+      action(
+          offset,
+          end_offset - offset,
+          /*check_page_limit=*/!pages_change_on_record_boundaries);
+    }
+    offset = end_offset;
+  }
+}
+
+template <typename Action, typename GetBufferedRows>
 inline void DoInBatches(
     const int16_t* def_levels,
     const int16_t* rep_levels,
     int64_t num_levels,
     int64_t batch_size,
+    int64_t max_rows_per_page,
+    bool pages_change_on_record_boundaries,
     Action&& action,
-    bool pages_change_on_record_boundaries) {
-  if (!pages_change_on_record_boundaries || !rep_levels) {
-    // If rep_levels is null, then we are writing a non-repeated column.
-    // In this case, every record contains only one level.
-    return DoInBatches(num_levels, batch_size, std::forward<Action>(action));
-  }
-
-  int64_t offset = 0;
-  while (offset < num_levels) {
-    int64_t end_offset = std::min(offset + batch_size, num_levels);
-
-    // Find next record boundary (i.e. ref_level = 0)
-    while (end_offset < num_levels && rep_levels[end_offset] != 0) {
-      end_offset++;
-    }
-
-    if (end_offset < num_levels) {
-      // This is not the last chunk of batch and end_offset is a record
-      // boundary. It is a good chance to check the page size.
-      action(offset, end_offset - offset, /*check_page_size=*/true);
-    } else {
-      DCHECK_EQ(end_offset, num_levels);
-      // This is the last chunk of batch, and we do not know whether end_offset
-      // is a record boundary. Find the offset to beginning of last record in
-      // this chunk, so we can check page size.
-      int64_t last_record_begin_offset = num_levels - 1;
-      while (last_record_begin_offset >= offset &&
-             rep_levels[last_record_begin_offset] != 0) {
-        last_record_begin_offset--;
-      }
-
-      if (offset < last_record_begin_offset) {
-        // We have found the beginning of last record and can check page size.
-        action(
-            offset,
-            last_record_begin_offset - offset,
-            /*check_page_size=*/true);
-        offset = last_record_begin_offset;
-      }
-
-      // There is no record boundary in this chunk and cannot check page size.
-      action(offset, end_offset - offset, /*check_page_size=*/false);
-    }
-
-    offset = end_offset;
+    GetBufferedRows&& current_page_buffered_rows) {
+  if (rep_levels == nullptr) {
+    DoInBatchesNonRepeated(
+        num_levels,
+        batch_size,
+        max_rows_per_page,
+        std::forward<Action>(action),
+        std::forward<GetBufferedRows>(current_page_buffered_rows));
+  } else {
+    DoInBatchesRepeated(
+        def_levels,
+        rep_levels,
+        num_levels,
+        batch_size,
+        max_rows_per_page,
+        pages_change_on_record_boundaries,
+        std::forward<Action>(action),
+        std::forward<GetBufferedRows>(current_page_buffered_rows));
   }
 }
 
@@ -1501,19 +1792,21 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       std::unique_ptr<PageWriter> pager,
       const bool use_dictionary,
       Encoding::type encoding,
-      const WriterProperties* properties)
+      const WriterProperties* properties,
+      std::shared_ptr<BufferedColumnWriterResources> buffered_resources,
+      int64_t byte_array_page_size_limit)
       : ColumnWriterImpl(
             metadata,
             std::move(pager),
             use_dictionary,
             encoding,
-            properties) {
+            properties,
+            std::move(buffered_resources),
+            byte_array_page_size_limit),
+        encoder_pool_(std::make_unique<::arrow::ProxyMemoryPool>(
+            properties->memory_pool())) {
     current_encoder_ = MakeEncoder(
-        DType::type_num,
-        encoding,
-        use_dictionary,
-        descr_,
-        properties->memory_pool());
+        DType::type_num, encoding, use_dictionary, descr_, encoder_pool_.get());
 
     // We have to dynamic_cast as some compilers don't want to static_cast
     // through virtual inheritance.
@@ -1576,8 +1869,10 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
         rep_levels,
         num_values,
         properties_->write_batch_size(),
+        properties_->max_rows_per_page(),
+        pages_change_on_record_boundaries(),
         WriteChunk,
-        pages_change_on_record_boundaries());
+        [this]() { return num_buffered_rows_; });
     return value_offset;
   }
 
@@ -1637,8 +1932,10 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
         rep_levels,
         num_values,
         properties_->write_batch_size(),
+        properties_->max_rows_per_page(),
+        pages_change_on_record_boundaries(),
         WriteChunk,
-        pages_change_on_record_boundaries());
+        [this]() { return num_buffered_rows_; });
   }
 
   Status WriteArrow(
@@ -1716,8 +2013,9 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
 
   void WriteDictionaryPage() override {
     DCHECK(current_dict_encoder_);
-    std::shared_ptr<ResizableBuffer> buffer = AllocateBuffer(
-        properties_->memory_pool(), current_dict_encoder_->dict_encoded_size());
+    const auto dict_encoded_size = current_dict_encoder_->dict_encoded_size();
+    std::shared_ptr<ResizableBuffer> buffer =
+        AllocateArenaOrFallbackBuffer(dict_encoded_size, dict_encoded_size);
     current_dict_encoder_->WriteDict(buffer->mutable_data());
 
     auto page = std::make_unique<DictionaryPage>(
@@ -1783,8 +2081,69 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
     return total_bytes;
   }
 
+  WriterMemoryStats memory_stats() const override {
+    WriterMemoryStats stats;
+    stats.encoderCurrentBytes = EncoderMemoryBytes();
+    stats.encoderEstimatedDataEncodedBytes = EncoderEstimatedDataEncodedSize();
+    if (current_dict_encoder_) {
+      stats.dictEncoderCurrentBytes = EncoderMemoryBytes();
+      stats.dictEncoderEstimatedDataEncodedBytes =
+          current_dict_encoder_->dict_encoded_size();
+    }
+    for (const auto& page : data_pages_) {
+      stats.bufferedPageAllocatedBytes += pageBufferAllocatedBytes(page);
+      stats.bufferedPageFallbackAllocatedBytes +=
+          pageBufferFallbackAllocatedBytes(page, page_buffer_arena_);
+    }
+    const auto* buffered_pager =
+        dynamic_cast<const BufferedPageWriter*>(pager_.get());
+    if (buffered_pager != nullptr) {
+      stats.bufferedPageWriterDataPageAllocatedBytes =
+          buffered_pager->buffered_data_page_allocated_bytes();
+      stats.bufferedPageWriterDataPageFallbackAllocatedBytes =
+          buffered_pager->buffered_data_page_fallback_allocated_bytes();
+      stats.bufferedPageWriterDataPageCount =
+          buffered_pager->buffered_data_page_count();
+      stats.bufferedPageWriterDictionaryPageAllocatedBytes =
+          buffered_pager->buffered_dictionary_page_allocated_bytes();
+      stats.bufferedPageWriterDictionaryPageFallbackAllocatedBytes =
+          buffered_pager->buffered_dictionary_page_fallback_allocated_bytes();
+      stats.bufferedPageWriterDictionaryPageCount =
+          buffered_pager->buffered_dictionary_page_count();
+      stats.bufferedPageAllocatedBytes +=
+          stats.bufferedPageWriterDataPageAllocatedBytes +
+          stats.bufferedPageWriterDictionaryPageAllocatedBytes;
+      stats.bufferedPageFallbackAllocatedBytes +=
+          stats.bufferedPageWriterDataPageFallbackAllocatedBytes +
+          stats.bufferedPageWriterDictionaryPageFallbackAllocatedBytes;
+    }
+    stats.columnScratchAllocatedBytes =
+        resizableBufferAllocatedBytes(bits_buffer_) +
+        resizableBufferAllocatedBytes(definition_levels_rle_) +
+        resizableBufferAllocatedBytes(repetition_levels_rle_) +
+        (uses_shared_uncompressed_data_
+             ? 0
+             : resizableBufferAllocatedBytes(uncompressed_data_)) +
+        (uses_shared_compressor_temp_buffer_
+             ? 0
+             : resizableBufferAllocatedBytes(compressor_temp_buffer_));
+    return stats;
+  }
+
   const WriterProperties* properties() override {
     return properties_;
+  }
+
+  int64_t EncoderMemoryBytes() const override {
+    return encoder_pool_->bytes_allocated();
+  }
+
+  int64_t EncoderPeakMemoryBytes() const override {
+    return encoder_pool_->max_memory();
+  }
+
+  int64_t EncoderEstimatedDataEncodedSize() const override {
+    return current_encoder_->EstimatedDataEncodedSize();
   }
 
   bool pages_change_on_record_boundaries() const {
@@ -1794,6 +2153,7 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
  private:
   using ValueEncoderType = typename EncodingTraits<DType>::Encoder;
   using TypedStats = TypedStatistics<DType>;
+  std::unique_ptr<::arrow::MemoryPool> encoder_pool_;
   std::unique_ptr<Encoder> current_encoder_;
   // Downcasted observers of current_encoder_.
   // The downcast is performed once as opposed to at every use since
@@ -1815,6 +2175,7 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       int64_t num_values,
       const int16_t* def_levels,
       const int16_t* rep_levels) {
+    CheckPageValueCountCanBeBuffered(num_values);
     int64_t values_to_write = 0;
     // If the field is required and non-repeated, there are no definition levels
     if (descr_->max_definition_level() > 0) {
@@ -1924,6 +2285,7 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       int64_t num_levels,
       const int16_t* def_levels,
       const int16_t* rep_levels) {
+    CheckPageValueCountCanBeBuffered(num_levels);
     // If the field is required and non-repeated, there are no definition levels
     if (descr_->max_definition_level() > 0) {
       WriteDefinitionLevels(num_levels, def_levels);
@@ -1950,14 +2312,28 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       int64_t num_levels,
       int64_t num_values,
       int64_t num_nulls,
-      bool check_page_size) {
+      bool check_page_limit) {
     num_buffered_values_ += num_levels;
     num_buffered_encoded_values_ += num_values;
     num_buffered_nulls_ += num_nulls;
 
-    if (check_page_size &&
-        current_encoder_->EstimatedDataEncodedSize() >= data_pagesize_) {
+    if (num_buffered_values_ > 0 && check_page_limit &&
+        (current_encoder_->EstimatedDataEncodedSize() >= data_pagesize_ ||
+         num_buffered_rows_ >= properties_->max_rows_per_page() ||
+         num_buffered_values_ >= kDataPageValueCountFlushThreshold)) {
       AddDataPage();
+    }
+  }
+
+  void CheckPageValueCountCanBeBuffered(int64_t num_levels) const {
+    if (num_levels < 0 ||
+        num_levels > kMaxPageHeaderSize - num_buffered_values_) {
+      throw ParquetException(
+          "DataPage num_values cannot be represented in a Parquet page "
+          "header int32 field: buffered ",
+          num_buffered_values_,
+          ", incoming ",
+          num_levels);
     }
   }
 
@@ -1969,11 +2345,7 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       fallback_ = true;
       // Only PLAIN encoding is supported for fallback in V1
       current_encoder_ = MakeEncoder(
-          DType::type_num,
-          Encoding::PLAIN,
-          false,
-          descr_,
-          properties_->memory_pool());
+          DType::type_num, Encoding::PLAIN, false, descr_, encoder_pool_.get());
       current_value_encoder_ =
           dynamic_cast<ValueEncoderType*>(current_encoder_.get());
       current_dict_encoder_ = nullptr; // not using dict
@@ -1994,8 +2366,10 @@ class TypedColumnWriterImpl : public ColumnWriterImpl,
       return;
     }
 
+    const int64_t dictionary_page_byte_limit = std::clamp<int64_t>(
+        dictionary_pagesize_limit_, 0, byte_array_page_size_limit_);
     if (current_dict_encoder_->dict_encoded_size() >=
-        dictionary_pagesize_limit_) {
+        dictionary_page_byte_limit) {
       FallbackToPlainEncoding();
     }
   }
@@ -2122,7 +2496,7 @@ Status TypedColumnWriterImpl<DType>::WriteArrowDictionary(
         ::arrow::Datum referenced_indices,
         ::arrow::compute::Unique(*chunk_indices, &exec_ctx));
 
-    // On first run, we might be able to re-use the existing dictionary
+    // On first run, we might be able to reuse the existing dictionary
     if (referenced_indices.length() == dictionary->length()) {
       referenced_dictionary = dictionary;
     } else {
@@ -2203,8 +2577,10 @@ Status TypedColumnWriterImpl<DType>::WriteArrowDictionary(
       rep_levels,
       num_levels,
       properties_->write_batch_size(),
+      properties_->max_rows_per_page(),
+      pages_change_on_record_boundaries(),
       WriteIndicesChunk,
-      pages_change_on_record_boundaries()));
+      [this]() { return num_buffered_rows_; }));
   return Status::OK();
 }
 
@@ -2754,18 +3130,110 @@ Status TypedColumnWriterImpl<ByteArrayType>::WriteArrowDense(
     ARROW_UNSUPPORTED();
   }
 
-  int64_t value_offset = 0;
-  auto WriteChunk = [&](int64_t offset, int64_t batch_size, bool check_page) {
-    int64_t batch_num_values = 0;
-    int64_t batch_num_spaced_values = 0;
-    int64_t null_count = 0;
+  // The configured page sizes are soft flush targets. PageHeader fields are
+  // the hard format boundary, so cap byte-budget arithmetic at INT32_MAX and
+  // leave the final encoded/compressed size checks to PageWriter.
+  auto PageByteLimit = [&](int64_t configured_limit) {
+    return std::clamp<int64_t>(
+        configured_limit, 0, byte_array_page_size_limit_);
+  };
+  const int64_t data_page_byte_limit = PageByteLimit(data_pagesize_);
+  const int64_t dictionary_page_byte_limit =
+      PageByteLimit(dictionary_pagesize_limit_);
 
-    MaybeCalculateValidityBits(
-        AddIfNotNull(def_levels, offset),
-        batch_size,
-        &batch_num_values,
-        &batch_num_spaced_values,
-        &null_count);
+  // We only need to know whether an encoded byte count fits in a given budget.
+  // Saturating at limit + 1 avoids overflowing int64_t for malformed or
+  // exceptionally large LargeBinary offsets.
+  auto CappedPageBytes = [](int64_t first, int64_t second, int64_t limit) {
+    if (first < 0 || second < 0) {
+      throw ParquetException("Invalid negative BYTE_ARRAY encoded size");
+    }
+    if (first > limit || second > limit - first) {
+      return limit + 1;
+    }
+    return first + second;
+  };
+
+  auto ValueLength = [&](int64_t index) {
+    if (::arrow::is_binary_like(array.type_id())) {
+      return static_cast<int64_t>(
+          checked_cast<const ::arrow::BinaryArray&>(array).value_length(index));
+    }
+    DCHECK(::arrow::is_large_binary_like(array.type_id()));
+    return static_cast<int64_t>(
+        checked_cast<const ::arrow::LargeBinaryArray&>(array).value_length(
+            index));
+  };
+
+  auto ValueRangeByteLength = [&](int64_t start, int64_t count) {
+    if (::arrow::is_binary_like(array.type_id())) {
+      const auto& binary_array =
+          checked_cast<const ::arrow::BinaryArray&>(array);
+      return static_cast<int64_t>(
+          binary_array.value_offset(start + count) -
+          binary_array.value_offset(start));
+    }
+    DCHECK(::arrow::is_large_binary_like(array.type_id()));
+    const auto& large_binary_array =
+        checked_cast<const ::arrow::LargeBinaryArray&>(array);
+    return static_cast<int64_t>(
+        large_binary_array.value_offset(start + count) -
+        large_binary_array.value_offset(start));
+  };
+
+  auto HasSpacedValue = [&](int64_t level_index) {
+    if (def_levels == nullptr || level_info_.def_level == 0) {
+      return true;
+    }
+    return def_levels[level_index] >= level_info_.repeated_ancestor_def_level;
+  };
+
+  auto HasNonNullValue = [&](int64_t level_index, int64_t value_index) {
+    if (def_levels != nullptr &&
+        def_levels[level_index] != level_info_.def_level) {
+      return false;
+    }
+    return array.IsValid(value_index);
+  };
+
+  auto PlainEncodedRangeSize = [&](int64_t start,
+                                   int64_t spaced_values,
+                                   int64_t non_null_values,
+                                   int64_t byte_limit) {
+    const int64_t length_prefix_bytes =
+        non_null_values > byte_limit / sizeof(uint32_t)
+        ? byte_limit + 1
+        : non_null_values * static_cast<int64_t>(sizeof(uint32_t));
+    return CappedPageBytes(
+        ValueRangeByteLength(start, spaced_values),
+        length_prefix_bytes,
+        byte_limit);
+  };
+
+  auto IsCurrentDictionaryEncoding = [&]() {
+    return IsDictionaryEncoding(current_encoder_->encoding());
+  };
+
+  auto CurrentPageByteLimit = [&]() {
+    return IsCurrentDictionaryEncoding() ? dictionary_page_byte_limit
+                                         : data_page_byte_limit;
+  };
+
+  auto CurrentPageBytes = [&]() {
+    if (IsCurrentDictionaryEncoding()) {
+      DCHECK_NE(current_dict_encoder_, nullptr);
+      return current_dict_encoder_->dict_encoded_size();
+    }
+    return current_encoder_->EstimatedDataEncodedSize();
+  };
+
+  int64_t value_offset = 0;
+  auto WritePreparedChunk = [&](int64_t offset,
+                                int64_t batch_size,
+                                int64_t batch_num_values,
+                                int64_t batch_num_spaced_values,
+                                int64_t null_count,
+                                bool check_page) {
     WriteLevelsSpaced(
         batch_size,
         AddIfNotNull(def_levels, offset),
@@ -2790,13 +3258,201 @@ Status TypedColumnWriterImpl<ByteArrayType>::WriteArrowDense(
     value_offset += batch_num_spaced_values;
   };
 
+  auto PrepareAndWriteChunk =
+      [&](int64_t offset, int64_t batch_size, bool check_page) {
+        int64_t batch_num_values = 0;
+        int64_t batch_num_spaced_values = 0;
+        int64_t null_count = 0;
+        MaybeCalculateValidityBits(
+            AddIfNotNull(def_levels, offset),
+            batch_size,
+            &batch_num_values,
+            &batch_num_spaced_values,
+            &null_count);
+        WritePreparedChunk(
+            offset,
+            batch_size,
+            batch_num_values,
+            batch_num_spaced_values,
+            null_count,
+            check_page);
+      };
+
+  auto WriteChunk = [&](int64_t offset, int64_t batch_size, bool check_page) {
+    // Calculate the metadata that the old write path needs before deciding
+    // whether this chunk requires splitting. This makes the no-split path use
+    // the same single level scan as before, including for nullable and nested
+    // columns.
+    int64_t batch_num_values = 0;
+    int64_t batch_num_spaced_values = 0;
+    int64_t null_count = 0;
+    MaybeCalculateValidityBits(
+        AddIfNotNull(def_levels, offset),
+        batch_size,
+        &batch_num_values,
+        &batch_num_spaced_values,
+        &null_count);
+
+    // For PLAIN encoding this is the data-page value size. For dictionary and
+    // DELTA encodings it bounds the raw bytes passed to one encoder Put().
+    const int64_t page_byte_limit = CurrentPageByteLimit();
+    const int64_t batch_plain_bytes = PlainEncodedRangeSize(
+        value_offset,
+        batch_num_spaced_values,
+        batch_num_values,
+        page_byte_limit);
+
+    const bool dictionary_encoding = IsCurrentDictionaryEncoding();
+    const bool plain_encoding = current_encoder_->encoding() == Encoding::PLAIN;
+
+    // The final nested chunk may end inside a record. Flush before writing it
+    // when the conservative bound cannot fit because it cannot be split later.
+    if (!dictionary_encoding && !check_page && num_buffered_values_ > 0 &&
+        CappedPageBytes(
+            CurrentPageBytes(), batch_plain_bytes, page_byte_limit) >
+            page_byte_limit) {
+      AddDataPage();
+      WritePreparedChunk(
+          offset,
+          batch_size,
+          batch_num_values,
+          batch_num_spaced_values,
+          null_count,
+          check_page);
+      return;
+    }
+
+    // PLAIN uses the exact remaining page budget, and dictionary uses a
+    // conservative remaining budget. DELTA raw bytes only bound one Put().
+    const bool batch_fits = dictionary_encoding || plain_encoding
+        ? CappedPageBytes(
+              CurrentPageBytes(), batch_plain_bytes, page_byte_limit) <=
+            page_byte_limit
+        : batch_plain_bytes <= page_byte_limit;
+    if (batch_fits) {
+      WritePreparedChunk(
+          offset,
+          batch_size,
+          batch_num_values,
+          batch_num_spaced_values,
+          null_count,
+          check_page);
+      return;
+    }
+
+    // A false check_page means this chunk is the final, potentially partial
+    // nested record. It cannot be split or flushed after writing, but its
+    // beginning is a known record boundary, so flush an existing page before
+    // appending an oversized record to it.
+    if (!dictionary_encoding && !check_page) {
+      if (num_buffered_values_ > 0) {
+        AddDataPage();
+      }
+      WritePreparedChunk(
+          offset,
+          batch_size,
+          batch_num_values,
+          batch_num_spaced_values,
+          null_count,
+          check_page);
+      return;
+    }
+
+    // Prefer starting a new page over scanning levels merely to fill the
+    // remainder of the current page. If the whole chunk fits on an empty page,
+    // this preserves the old one-pass path for nullable and nested columns.
+    if (plain_encoding && num_buffered_values_ > 0 &&
+        batch_plain_bytes <= data_page_byte_limit) {
+      AddDataPage();
+      WritePreparedChunk(
+          offset,
+          batch_size,
+          batch_num_values,
+          batch_num_spaced_values,
+          null_count,
+          check_page);
+      return;
+    }
+
+    // The chunk itself is larger than a page. Only this actual split path
+    // inspects individual levels. The PrepareAndWriteChunk lambda recalculates
+    // validity for each output segment because bits_buffer_ must start at that
+    // segment's offset.
+    int64_t local_offset = offset;
+    int64_t remaining = batch_size;
+    while (remaining > 0) {
+      const bool current_dictionary_encoding = IsCurrentDictionaryEncoding();
+      const bool current_plain_encoding =
+          current_encoder_->encoding() == Encoding::PLAIN;
+      const int64_t current_page_byte_limit = CurrentPageByteLimit();
+      const bool use_current_page_bytes =
+          current_dictionary_encoding || current_plain_encoding;
+      int64_t current_page_bytes =
+          use_current_page_bytes ? CurrentPageBytes() : 0;
+      int64_t subchunk_levels = 0;
+      int64_t subchunk_spaced_values = 0;
+      int64_t subchunk_plain_bytes = 0;
+
+      while (subchunk_levels < remaining) {
+        const int64_t level_index = local_offset + subchunk_levels;
+        const bool can_break_before_level =
+            !pages_change_on_record_boundaries() || rep_levels == nullptr ||
+            rep_levels[level_index] == 0;
+        int64_t value_bytes = 0;
+        if (HasSpacedValue(level_index)) {
+          const int64_t value_index = value_offset + subchunk_spaced_values;
+          if (HasNonNullValue(level_index, value_index)) {
+            value_bytes = CappedPageBytes(
+                static_cast<int64_t>(sizeof(uint32_t)),
+                ValueLength(value_index),
+                current_page_byte_limit);
+          }
+        }
+
+        if (can_break_before_level &&
+            CappedPageBytes(
+                CappedPageBytes(
+                    current_page_bytes,
+                    subchunk_plain_bytes,
+                    current_page_byte_limit),
+                value_bytes,
+                current_page_byte_limit) > current_page_byte_limit) {
+          if (subchunk_levels == 0) {
+            if (current_plain_encoding && num_buffered_values_ > 0) {
+              AddDataPage();
+              current_page_bytes = 0;
+            }
+          } else {
+            break;
+          }
+        }
+
+        if (HasSpacedValue(level_index)) {
+          ++subchunk_spaced_values;
+        }
+        subchunk_plain_bytes = CappedPageBytes(
+            subchunk_plain_bytes, value_bytes, current_page_byte_limit);
+        ++subchunk_levels;
+      }
+
+      if (subchunk_levels == 0) {
+        throw ParquetException("Unable to split BYTE_ARRAY write chunk");
+      }
+      PrepareAndWriteChunk(local_offset, subchunk_levels, check_page);
+      local_offset += subchunk_levels;
+      remaining -= subchunk_levels;
+    }
+  };
+
   PARQUET_CATCH_NOT_OK(DoInBatches(
       def_levels,
       rep_levels,
       num_levels,
       properties_->write_batch_size(),
+      properties_->max_rows_per_page(),
+      pages_change_on_record_boundaries(),
       WriteChunk,
-      pages_change_on_record_boundaries()));
+      [this]() { return num_buffered_rows_; }));
   return Status::OK();
 }
 
@@ -2931,10 +3587,14 @@ Status TypedColumnWriterImpl<FLBAType>::WriteArrowDense(
 // ----------------------------------------------------------------------
 // Dynamic column writer constructor
 
-std::shared_ptr<ColumnWriter> ColumnWriter::Make(
+namespace {
+
+std::shared_ptr<ColumnWriter> MakeColumnWriter(
     ColumnChunkMetaDataBuilder* metadata,
     std::unique_ptr<PageWriter> pager,
-    const WriterProperties* properties) {
+    const WriterProperties* properties,
+    std::shared_ptr<BufferedColumnWriterResources> buffered_resources,
+    int64_t byte_array_page_size_limit) {
   const ColumnDescriptor* descr = metadata->descr();
   const bool use_dictionary = properties->dictionary_enabled(descr->path()) &&
       descr->physical_type() != Type::BOOLEAN;
@@ -2956,33 +3616,109 @@ std::shared_ptr<ColumnWriter> ColumnWriter::Make(
   switch (descr->physical_type()) {
     case Type::BOOLEAN:
       return std::make_shared<TypedColumnWriterImpl<BooleanType>>(
-          metadata, std::move(pager), use_dictionary, encoding, properties);
+          metadata,
+          std::move(pager),
+          use_dictionary,
+          encoding,
+          properties,
+          std::move(buffered_resources),
+          byte_array_page_size_limit);
     case Type::INT32:
       return std::make_shared<TypedColumnWriterImpl<Int32Type>>(
-          metadata, std::move(pager), use_dictionary, encoding, properties);
+          metadata,
+          std::move(pager),
+          use_dictionary,
+          encoding,
+          properties,
+          std::move(buffered_resources),
+          byte_array_page_size_limit);
     case Type::INT64:
       return std::make_shared<TypedColumnWriterImpl<Int64Type>>(
-          metadata, std::move(pager), use_dictionary, encoding, properties);
+          metadata,
+          std::move(pager),
+          use_dictionary,
+          encoding,
+          properties,
+          std::move(buffered_resources),
+          byte_array_page_size_limit);
     case Type::INT96:
       return std::make_shared<TypedColumnWriterImpl<Int96Type>>(
-          metadata, std::move(pager), use_dictionary, encoding, properties);
+          metadata,
+          std::move(pager),
+          use_dictionary,
+          encoding,
+          properties,
+          std::move(buffered_resources),
+          byte_array_page_size_limit);
     case Type::FLOAT:
       return std::make_shared<TypedColumnWriterImpl<FloatType>>(
-          metadata, std::move(pager), use_dictionary, encoding, properties);
+          metadata,
+          std::move(pager),
+          use_dictionary,
+          encoding,
+          properties,
+          std::move(buffered_resources),
+          byte_array_page_size_limit);
     case Type::DOUBLE:
       return std::make_shared<TypedColumnWriterImpl<DoubleType>>(
-          metadata, std::move(pager), use_dictionary, encoding, properties);
+          metadata,
+          std::move(pager),
+          use_dictionary,
+          encoding,
+          properties,
+          std::move(buffered_resources),
+          byte_array_page_size_limit);
     case Type::BYTE_ARRAY:
       return std::make_shared<TypedColumnWriterImpl<ByteArrayType>>(
-          metadata, std::move(pager), use_dictionary, encoding, properties);
+          metadata,
+          std::move(pager),
+          use_dictionary,
+          encoding,
+          properties,
+          std::move(buffered_resources),
+          byte_array_page_size_limit);
     case Type::FIXED_LEN_BYTE_ARRAY:
       return std::make_shared<TypedColumnWriterImpl<FLBAType>>(
-          metadata, std::move(pager), use_dictionary, encoding, properties);
+          metadata,
+          std::move(pager),
+          use_dictionary,
+          encoding,
+          properties,
+          std::move(buffered_resources),
+          byte_array_page_size_limit);
     default:
       ParquetException::NYI("type reader not implemented");
   }
   // Unreachable code, but suppress compiler warning
   return std::shared_ptr<ColumnWriter>(nullptr);
+}
+
+} // namespace
+
+std::shared_ptr<ColumnWriter> ColumnWriter::Make(
+    ColumnChunkMetaDataBuilder* metadata,
+    std::unique_ptr<PageWriter> pager,
+    const WriterProperties* properties,
+    std::shared_ptr<BufferedColumnWriterResources> buffered_resources) {
+  return MakeColumnWriter(
+      metadata,
+      std::move(pager),
+      properties,
+      std::move(buffered_resources),
+      kMaxPageHeaderSize);
+}
+
+std::shared_ptr<ColumnWriter> ColumnWriter::MakeForTest(
+    ColumnChunkMetaDataBuilder* metadata,
+    std::unique_ptr<PageWriter> pager,
+    const WriterProperties* properties,
+    int64_t byte_array_page_size_limit) {
+  return MakeColumnWriter(
+      metadata,
+      std::move(pager),
+      properties,
+      nullptr,
+      byte_array_page_size_limit);
 }
 
 } // namespace bytedance::bolt::parquet::arrow

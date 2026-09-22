@@ -42,7 +42,9 @@
 #include "bolt/exec/tests/utils/HiveConnectorTestBase.h"
 #include "bolt/exec/tests/utils/LocalExchangeSource.h"
 #include "bolt/exec/tests/utils/PlanBuilder.h"
+#include "bolt/exec/tests/utils/TempDirectoryPath.h"
 #include "folly/experimental/EventCount.h"
+
 using namespace bytedance::bolt::exec::test;
 
 using bytedance::bolt::common::testutil::TestValue;
@@ -56,7 +58,7 @@ class MultiFragmentTest : public HiveConnectorTestBase {
     HiveConnectorTestBase::SetUp();
     exec::ExchangeSource::factories().clear();
     exec::ExchangeSource::registerFactory(createLocalExchangeSource);
-    TestValue::enable();
+    BOLT_TEST_VALUE_ENABLE();
   }
 
   void TearDown() override {
@@ -83,10 +85,40 @@ class MultiFragmentTest : public HiveConnectorTestBase {
       const core::PlanNodePtr& planNode,
       int destination = 0,
       Consumer consumer = nullptr,
-      int64_t maxMemory = memory::kMaxMemory) {
+      int64_t maxMemory = memory::kMaxMemory) const {
     auto configCopy = configSettings_;
     auto queryCtx = core::QueryCtx::create(
         executor_.get(), core::QueryConfig(std::move(configCopy)));
+    queryCtx->testingOverrideMemoryPool(memory::memoryManager()->addRootPool(
+        queryCtx->queryId(), maxMemory, MemoryReclaimer::create()));
+    core::PlanFragment planFragment{planNode};
+    return Task::create(
+        taskId,
+        std::move(planFragment),
+        destination,
+        std::move(queryCtx),
+        Task::ExecutionMode::kParallel,
+        std::move(consumer));
+  }
+
+  std::shared_ptr<Task> makeTask(
+      const std::string& taskId,
+      const core::PlanNodePtr& planNode,
+      std::unordered_map<std::string, std::string>& extraQueryConfigs,
+      int destination = 0,
+      Consumer consumer = nullptr,
+      int64_t maxMemory = memory::kMaxMemory) const {
+    auto configCopy = configSettings_;
+    for (const auto& [k, v] : extraQueryConfigs) {
+      configCopy[k] = v;
+    }
+    auto queryCtx = core::QueryCtx::create(
+        executor_.get(),
+        core::QueryConfig(std::move(configCopy)),
+        {},
+        nullptr,
+        nullptr,
+        executor_.get());
     queryCtx->testingOverrideMemoryPool(memory::memoryManager()->addRootPool(
         queryCtx->queryId(), maxMemory, MemoryReclaimer::create()));
     core::PlanFragment planFragment{planNode};
@@ -109,8 +141,8 @@ class MultiFragmentTest : public HiveConnectorTestBase {
     return vectors;
   }
 
-  void addHiveSplits(
-      std::shared_ptr<Task> task,
+  static void addHiveSplits(
+      const std::shared_ptr<Task>& task,
       const std::vector<std::shared_ptr<TempFilePath>>& filePaths) {
     for (auto& filePath : filePaths) {
       auto split = exec::Split(
@@ -125,12 +157,32 @@ class MultiFragmentTest : public HiveConnectorTestBase {
     task->noMoreSplits("0");
   }
 
-  exec::Split remoteSplit(const std::string& taskId) {
+  static void addHiveSplits(
+      const std::shared_ptr<Task>& task,
+      const std::vector<std::string>& scanNodeIds,
+      const std::vector<std::shared_ptr<TempFilePath>>& filePaths) {
+    for (auto i = 0; i < filePaths.size(); ++i) {
+      const auto& filePath = filePaths[i];
+      auto split = exec::Split(
+          std::make_shared<connector::hive::HiveConnectorSplit>(
+              kHiveConnectorId,
+              "file:" + filePath->getPath(),
+              bytedance::bolt::dwio::common::FileFormat::DWRF),
+          -1);
+      task->addSplit(scanNodeIds[i % scanNodeIds.size()], std::move(split));
+      VLOG(1) << filePath->getPath() << "\n";
+    }
+    for (const auto& id : scanNodeIds) {
+      task->noMoreSplits(id);
+    }
+  }
+
+  static exec::Split remoteSplit(const std::string& taskId) {
     return exec::Split(std::make_shared<RemoteConnectorSplit>(taskId));
   }
 
-  void addRemoteSplits(
-      std::shared_ptr<Task> task,
+  static void addRemoteSplits(
+      const std::shared_ptr<Task>& task,
       const std::vector<std::string>& remoteTaskIds) {
     for (auto& taskId : remoteTaskIds) {
       task->addSplit("0", remoteSplit(taskId));
@@ -406,20 +458,26 @@ TEST_F(MultiFragmentTest, mergeExchange) {
     auto sortTaskId = makeTaskId("orderby", tasks.size());
     partialSortTaskIds.push_back(sortTaskId);
     auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    std::vector<std::shared_ptr<const core::PlanNode>> sources;
+    std::vector<std::string> scanNodeIds;
+    for (int j = 0; j < 5; ++j) {
+      core::PlanNodeId scanNodeId;
+      sources.push_back(PlanBuilder(planNodeIdGenerator)
+                            .tableScan(rowType_)
+                            .capturePlanNodeId(scanNodeId)
+                            .orderBy({"c0"}, true)
+                            .planNode());
+      scanNodeIds.push_back(scanNodeId);
+    }
     auto partialSortPlan = PlanBuilder(planNodeIdGenerator)
-                               .localMerge(
-                                   {"c0"},
-                                   {PlanBuilder(planNodeIdGenerator)
-                                        .tableScan(rowType_)
-                                        .orderBy({"c0"}, true)
-                                        .planNode()})
+                               .localMerge({"c0"}, std::move(sources))
                                .partitionedOutput({}, 1)
                                .planNode();
 
     auto sortTask = makeTask(sortTaskId, partialSortPlan, tasks.size());
     tasks.push_back(sortTask);
-    sortTask->start(4);
-    addHiveSplits(sortTask, filePathsList[i]);
+    sortTask->start(2);
+    addHiveSplits(sortTask, scanNodeIds, filePathsList[i]);
     outputType = partialSortPlan->outputType();
   }
 
@@ -580,14 +638,108 @@ TEST_F(MultiFragmentTest, partitionedOutput) {
   }
 }
 
+TEST_F(MultiFragmentTest, mergeExchangeMultiMerge) {
+  setupSources(20, 1000);
+  static const core::SortOrder kAscNullsLast(true, false);
+  std::vector<std::shared_ptr<Task>> tasks;
+  std::vector<std::shared_ptr<TempFilePath>> filePaths0(
+      filePaths_.begin(), filePaths_.begin() + 10);
+  std::vector<std::shared_ptr<TempFilePath>> filePaths1(
+      filePaths_.begin() + 10, filePaths_.end());
+  std::vector<std::vector<std::shared_ptr<TempFilePath>>> filePathsList = {
+      filePaths0, filePaths1};
+  std::vector<std::string> partialSortTaskIds;
+  RowTypePtr outputType;
+  std::vector<std::shared_ptr<TempDirectoryPath>> spillDirectories;
+  core::PlanNodeId partitionNodeId;
+  std::unordered_map<std::string, std::string> spillMergeConfigs{
+      {"spill_enabled", "true"},
+      {"local_merge_spill_enabled", "true"},
+      {"local_merge_max_num_merge_sources", "3"}};
+  std::vector<core::PlanNodeId> localMergeNodeIds;
+  for (int i = 0; i < 2; ++i) {
+    auto sortTaskId = makeTaskId("orderby", tasks.size());
+    partialSortTaskIds.push_back(sortTaskId);
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    std::vector<std::shared_ptr<const core::PlanNode>> sources;
+    std::vector<std::string> scanNodeIds;
+    for (int j = 0; j < 5; ++j) {
+      core::PlanNodeId scanNodeId;
+      sources.push_back(PlanBuilder(planNodeIdGenerator)
+                            .tableScan(rowType_)
+                            .capturePlanNodeId(scanNodeId)
+                            .orderBy({"c0"}, true)
+                            .planNode());
+      scanNodeIds.push_back(scanNodeId);
+    }
+
+    core::PlanNodeId localMergeNodeId;
+    auto partialSortPlan = PlanBuilder(planNodeIdGenerator)
+                               .localMerge({"c0"}, std::move(sources))
+                               .capturePlanNodeId(localMergeNodeId)
+                               .partitionedOutput({}, 1)
+                               .capturePlanNodeId(partitionNodeId)
+                               .planNode();
+    localMergeNodeIds.push_back(localMergeNodeId);
+    auto sortTask =
+        makeTask(sortTaskId, partialSortPlan, spillMergeConfigs, tasks.size());
+    spillDirectories.push_back(TempDirectoryPath::create());
+    sortTask->setSpillDirectory(spillDirectories[i]->getPath());
+    tasks.push_back(sortTask);
+    sortTask->start(2);
+    addHiveSplits(sortTask, scanNodeIds, filePathsList[i]);
+    outputType = partialSortPlan->outputType();
+  }
+
+  auto finalSortTaskId = makeTaskId("orderby", tasks.size());
+  core::PlanNodeId mergeExchangeId;
+  auto finalSortPlan = PlanBuilder()
+                           .mergeExchange(outputType, {"c0"})
+                           .capturePlanNodeId(mergeExchangeId)
+                           .partitionedOutput({}, 1)
+                           .planNode();
+
+  auto mergeTask = makeTask(finalSortTaskId, finalSortPlan, 0);
+  tasks.push_back(mergeTask);
+  mergeTask->start(1);
+  addRemoteSplits(mergeTask, partialSortTaskIds);
+
+  auto op = PlanBuilder().exchange(outputType).planNode();
+
+  test::AssertQueryBuilder(op, duckDbQueryRunner_)
+      .split(remoteSplit(finalSortTaskId))
+      .assertResults(
+          "SELECT * FROM tmp ORDER BY 1 NULLS LAST", std::vector<uint32_t>{0});
+
+  for (auto& task : tasks) {
+    ASSERT_TRUE(waitForTaskCompletion(task.get())) << task->taskId();
+  }
+  for (auto i = 0; i < 2; ++i) {
+    auto taskStats = toPlanStats(tasks[i]->taskStats());
+    auto& planStats = taskStats.at(localMergeNodeIds[i]);
+    ASSERT_GT(planStats.spilledBytes, 0);
+    ASSERT_EQ(planStats.spilledPartitions, 3);
+    ASSERT_EQ(planStats.spilledFiles, 3);
+  }
+
+  const auto finalSortStats = toPlanStats(mergeTask->taskStats());
+  const auto& mergeExchangeStats = finalSortStats.at(mergeExchangeId);
+
+  EXPECT_EQ(20'000, mergeExchangeStats.inputRows);
+  EXPECT_EQ(20'000, mergeExchangeStats.rawInputRows);
+
+  EXPECT_LT(0, mergeExchangeStats.inputBytes);
+  EXPECT_LT(0, mergeExchangeStats.rawInputBytes);
+}
+
 TEST_F(MultiFragmentTest, partitionedOutputWithLargeInput) {
   // Verify that partitionedOutput operator is able to split a single input
   // vector if it hits memory or row limits.
-  // We create a large vector that hits the row limit (70% - 120% of 10,000)
+  // We create a large vector that hits the row limit (70% - 120% of 10,000).
   // which would hit a task level memory limit of 1MB unless its split up.
   // This test exercises splitting up the input both from the edges and the
-  // middle as it ends up splitting it in ~ 10 splits.
-  setupSources(1, 100'000);
+  // middle as it ends up splitting it into at least 3.
+  setupSources(1, 30'000);
   const int64_t kRootMemoryLimit = 1 << 20; // 1MB
   // Single Partition
   {
@@ -602,12 +754,15 @@ TEST_F(MultiFragmentTest, partitionedOutputWithLargeInput) {
     leafTask->start(1);
     auto op = PlanBuilder().exchange(leafPlan->outputType()).planNode();
 
-    auto task =
-        assertQuery(op, {leafTaskId}, "SELECT c0, c1, c2, c3, c4 FROM tmp");
-    auto taskStats = toPlanStats(task->taskStats());
-    ASSERT_GT(taskStats.at("0").inputVectors, 2);
+    assertQuery(op, {leafTaskId}, "SELECT c0, c1, c2, c3, c4 FROM tmp");
     ASSERT_TRUE(waitForTaskCompletion(leafTask.get()))
         << leafTask->taskId() << "state: " << leafTask->state();
+    // Check the leaf task's PartitionedOutput operator ("1") for outputVectors.
+    // Leaf plan: "0" = Values, "1" = PartitionedOutput.
+    // We avoid checking the consumer's Exchange inputVectors because the
+    // Exchange may merge small vectors, making the count non-deterministic.
+    auto taskStats = toPlanStats(leafTask->taskStats());
+    ASSERT_GT(taskStats.at("1").outputVectors, 2);
   }
 
   // Multiple partitions but round-robin.
@@ -643,14 +798,12 @@ TEST_F(MultiFragmentTest, partitionedOutputWithLargeInput) {
 
     auto op = PlanBuilder().exchange(intermediatePlan->outputType()).planNode();
 
-    auto task = assertQuery(
-        op, intermediateTaskIds, "SELECT c0, c1, c2, c3, c4 FROM tmp");
-    auto taskStats = toPlanStats(task->taskStats());
-    // Disable this test as it flakes
-    // ASSERT_GT(taskStats.at("0").inputVectors, 2);
-
+    assertQuery(op, intermediateTaskIds, "SELECT c0, c1, c2, c3, c4 FROM tmp");
     ASSERT_TRUE(waitForTaskCompletion(leafTask.get()))
         << "state: " << leafTask->state();
+    // Same as above: check the leaf's PartitionedOutput operator ("1").
+    auto taskStats = toPlanStats(leafTask->taskStats());
+    ASSERT_GT(taskStats.at("1").outputVectors, 2);
   }
 }
 
@@ -954,6 +1107,50 @@ TEST_F(MultiFragmentTest, mergeExchangeOverEmptySources) {
                   .planNode();
 
   assertQuery(plan, leafTaskIds, "");
+
+  for (auto& task : tasks) {
+    ASSERT_TRUE(waitForTaskCompletion(task.get())) << task->taskId();
+  }
+}
+
+DEBUG_ONLY_TEST_F(MultiFragmentTest, mergeExchangeFailureOnStart) {
+  std::vector<std::shared_ptr<Task>> tasks;
+  std::vector<std::string> leafTaskIds;
+
+  const auto injectErrorMsg{"injectError"};
+  SCOPED_TESTVALUE_SET(
+      "bytedance::bolt::exec::ExchangeQueue::dequeueLocked",
+      std::function<void(ExchangeQueue*)>(
+          ([&](ExchangeQueue* /*unused*/) { BOLT_FAIL(injectErrorMsg); })));
+
+  auto data = makeRowVector(rowType_, 0);
+
+  for (int i = 0; i < 2; ++i) {
+    auto taskId = makeTaskId("leaf-", i);
+    leafTaskIds.push_back(taskId);
+    auto plan =
+        PlanBuilder().values({data}).partitionedOutput({}, 1).planNode();
+
+    auto task = makeTask(taskId, plan, tasks.size());
+    tasks.push_back(task);
+    task->start(4);
+  }
+
+  auto exchangeTaskId = makeTaskId("exchange-", 0);
+  auto plan = PlanBuilder()
+                  .mergeExchange(rowType_, {"c0"})
+                  .singleAggregation({"c0"}, {"count(1)"})
+                  .planNode();
+
+  std::vector<Split> leafTaskSplits;
+  for (auto leafTaskId : leafTaskIds) {
+    leafTaskSplits.emplace_back(remoteSplit(leafTaskId));
+  }
+  BOLT_ASSERT_THROW(
+      test::AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .splits(std::move(leafTaskSplits))
+          .assertResults(""),
+      injectErrorMsg);
 
   for (auto& task : tasks) {
     ASSERT_TRUE(waitForTaskCompletion(task.get())) << task->taskId();
@@ -1802,7 +1999,7 @@ TEST_F(MultiFragmentTest, taskTerminateWithPendingOutputBuffers) {
 }
 
 TEST_F(MultiFragmentTest, taskTerminateWithProblematicRemainingRemoteSplits) {
-  // Start the task with 2 drivers.
+  // Start the task with one driver.
   auto probeData =
       makeRowVector({"p_c0"}, {makeFlatVector<int64_t>({1, 2, 3})});
   auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
@@ -1822,32 +2019,66 @@ TEST_F(MultiFragmentTest, taskTerminateWithProblematicRemainingRemoteSplits) {
                   .planNode();
   auto taskId = makeTaskId("final", 0);
   auto task = makeTask(taskId, plan, 0);
-  task->start(2);
 
-  // Wait for all drivers to be blocked, so that the promises will be made.
-  bool allDriversBlocked = false;
-  while (!allDriversBlocked) {
-    allDriversBlocked = true;
-    task->testingVisitDrivers([&](Driver* driver) {
-      if (driver->isOnThread() ||
-          (driver->blockingReason() != BlockingReason::kWaitForSplit &&
-           driver->blockingReason() != BlockingReason::kWaitForProducer &&
-           driver->blockingReason() != BlockingReason::kWaitForJoinBuild)) {
-        allDriversBlocked = false;
-      }
-    });
+  struct BadSplitFactoryState {
+    std::atomic_bool firstSplitEntered{false};
+    std::atomic_bool releaseFirstSplit{false};
+    std::atomic_int secondSplitAttempts{0};
+    folly::EventCount firstSplitBarrier;
+  };
+
+  const auto firstBadTaskId = makeBadTaskId("leaf", 0);
+  const auto secondBadTaskId = makeBadTaskId("leaf", 1);
+  auto factoryState = std::make_shared<BadSplitFactoryState>();
+  auto& exchangeSourceFactories = ExchangeSource::factories();
+  exchangeSourceFactories.insert(
+      exchangeSourceFactories.begin(),
+      [factoryState, firstBadTaskId, secondBadTaskId](
+          const std::string& remoteTaskId,
+          int /*destination*/,
+          std::shared_ptr<ExchangeQueue> /*queue*/,
+          memory::MemoryPool* /*pool*/) -> std::shared_ptr<ExchangeSource> {
+        if (remoteTaskId == firstBadTaskId) {
+          factoryState->firstSplitEntered = true;
+          factoryState->firstSplitBarrier.notifyAll();
+          factoryState->firstSplitBarrier.await(
+              [&]() { return factoryState->releaseFirstSplit.load(); });
+          throw std::runtime_error("Testing error");
+        }
+        if (remoteTaskId == secondBadTaskId) {
+          ++factoryState->secondSplitAttempts;
+          throw std::runtime_error("Testing error");
+        }
+        return nullptr;
+      });
+  auto cleanup = folly::makeGuard([&]() {
+    factoryState->releaseFirstSplit = true;
+    factoryState->firstSplitBarrier.notifyAll();
+    task->requestAbort().wait();
+    exchangeSourceFactories.erase(exchangeSourceFactories.begin());
+  });
+  task->start(1);
+
+  // Block the only driver while it creates the first bad ExchangeSource.
+  task->addSplit(exchangeNodeId, remoteSplit(firstBadTaskId));
+  const auto waitDeadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!factoryState->firstSplitEntered.load() &&
+         std::chrono::steady_clock::now() < waitDeadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  ASSERT_TRUE(factoryState->firstSplitEntered.load());
 
-  // Add one bad remote split and trigger Task::terminate.
-  task->addSplit(exchangeNodeId, remoteSplit(makeBadTaskId("leaf", 0)));
-
-  // Add one more bad split, making sure `remainingRemoteSplits` is not empty
-  // and processing it would cause an exception.
-  task->addSplit(exchangeNodeId, remoteSplit(makeBadTaskId("leaf", 1)));
+  // With the only driver blocked, this split remains queued and must be
+  // processed by Task::terminate after the first factory attempt fails.
+  task->addSplit(exchangeNodeId, remoteSplit(secondBadTaskId));
+  factoryState->releaseFirstSplit = true;
+  factoryState->firstSplitBarrier.notifyAll();
 
   // Wait for the task to fail, and make sure the task has been deleted instead
   // of hanging as a zombie task.
   ASSERT_TRUE(waitForTaskFailure(task.get(), 30'000'000)) << task->taskId();
+  EXPECT_EQ(factoryState->secondSplitAttempts.load(), 1);
 }
 
 TEST_F(
@@ -1902,12 +2133,22 @@ TEST_F(
       });
     }
 
+    auto addBadSplit = [&](int idx) {
+      try {
+        task->addSplit(exchangeNodeId, remoteSplit(makeBadTaskId("leaf", idx)));
+      } catch (const std::exception& e) {
+        LOG(INFO) << "Ignoring expected exception while adding bad split: "
+                  << e.what();
+      }
+    };
+
     // Add one bad remote split and trigger Task::terminate.
     task->addSplit(exchangeNodeId, remoteSplit(makeBadTaskId("leaf", 0)));
 
     // Add one more bad split, making sure `remainingRemoteSplits` is not empty
     // and processing it would cause an exception.
-    task->addSplit(exchangeNodeId, remoteSplit(makeBadTaskId("leaf", 1)));
+    addBadSplit(1);
+    addBadSplit(2);
 
     // Wait for the task to fail, and make sure the task has been deleted
     // instead of hanging as a zombie task.
@@ -2134,7 +2375,7 @@ TEST_F(MultiFragmentTest, maxBytes) {
 /// Verify that ExchangeClient stats are populated even if task fails.
 DEBUG_ONLY_TEST_F(MultiFragmentTest, exchangeStatsOnFailure) {
   // Trigger a failure after fetching first 10 pages.
-  TestValue::enable();
+  BOLT_TEST_VALUE_ENABLE();
   SCOPED_TESTVALUE_SET(
       "bytedance::bolt::exec::test::LocalExchangeSource",
       std::function<void(void* data)>([&](void* data) {

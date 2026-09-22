@@ -42,6 +42,7 @@
 #include "bolt/dwio/parquet/arrow/Properties.h"
 #include "bolt/dwio/parquet/arrow/Types.h"
 #include "bolt/dwio/parquet/arrow/util/Compression.h"
+#include "bolt/dwio/parquet/writer/WriterMetrics.h"
 #include "bolt/vector/ComplexVector.h"
 #include "bolt/vector/arrow/Bridge.h"
 namespace bytedance::bolt::parquet {
@@ -155,6 +156,10 @@ struct WriterOptions {
   int64_t parquet_block_size = -1;
   std::vector<int32_t> expectedRowsInEachBlock;
   int64_t dataPageSize = 1'024 * 1'024;
+  // A page is flushed when either dataPageSize or this logical row limit is
+  // reached. The row limit protects highly compressible and all-null columns,
+  // whose encoded byte size may otherwise stay small for billions of values.
+  int64_t maxRowsPerDataPage = arrow::kDefaultMaxRowsPerPage;
   int64_t dictionaryPageSizeLimit = 1'024 * 1'024;
   // Growth ratio passed to ArrowDataBufferSink. The default value is a
   // heuristic borrowed from
@@ -205,8 +210,8 @@ struct WriterOptions {
   // If 0 or less, threading is disabled (`set_use_threads` is set to false).
   int32_t threadPoolSize = 0;
 
-  std::shared_ptr<arrow::WriterProperties::Builder> getWriterPropertiesBuilder()
-      const;
+  std::shared_ptr<arrow::WriterProperties::Builder> getWriterPropertiesBuilder(
+      arrow::MemoryPool* arrowPool) const;
   std::shared_ptr<arrow::ArrowWriterProperties::Builder>
   getArrowWriterPropertiesBuilder() const;
 };
@@ -254,6 +259,8 @@ class Writer : public dwio::common::Writer {
 
   void abort() override;
 
+  dwio::common::WriterMetrics metrics() const override;
+
   // Used in data retention scenario. Write parquet with specific row numbers in
   // each row group.
   void rowGroupAlignedFlush(
@@ -262,9 +269,9 @@ class Writer : public dwio::common::Writer {
       std::shared_ptr<::arrow::RecordBatch>& recordBatch);
 
  private:
-  void splitWriteRecordBatch(
-      const VectorPtr& data,
-      std::shared_ptr<::arrow::Schema> arraySchemaPtr);
+  void initializeArrowSchema(const VectorPtr& data);
+
+  void splitWriteRecordBatch(const VectorPtr& data);
 
   // Sets the memory reclaimers for all the memory pools used by this writer.
   void setMemoryReclaimers();
@@ -284,6 +291,8 @@ class Writer : public dwio::common::Writer {
   std::shared_ptr<memory::MemoryPool> generalPool_;
   std::shared_ptr<memory::MemoryPool> exportPool_;
   arrow::MemoryPool* arrowPool_{nullptr};
+
+  const std::shared_ptr<WriterMetricsCollector> metrics_;
 
   // Temporary Arrow stream for capturing the output.
   std::shared_ptr<ArrowDataBufferSink> stream_;

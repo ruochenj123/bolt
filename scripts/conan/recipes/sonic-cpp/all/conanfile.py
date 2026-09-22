@@ -15,10 +15,14 @@
 from conan import ConanFile
 from conan.errors import ConanInvalidConfiguration
 from conan.tools.build import check_min_cppstd
-from conan.tools.files import apply_conandata_patches, export_conandata_patches, get, copy
+from conan.tools.files import (
+    apply_conandata_patches,
+    export_conandata_patches,
+    get,
+    copy,
+)
 from conan.tools.layout import basic_layout
 from conan.tools.microsoft import is_msvc
-from conan.tools.scm import Version
 from conan.tools import scm
 import os
 import re
@@ -28,7 +32,9 @@ required_conan_version = ">=1.53.0"
 
 class SonicCppConan(ConanFile):
     name = "sonic-cpp"
-    description = "A fast JSON serializing & deserializing library, accelerated by SIMD."
+    description = (
+        "A fast JSON serializing & deserializing library, accelerated by SIMD."
+    )
     license = "Apache-2.0"
     url = "https://github.com/conan-io/conan-center-index"
     homepage = "https://github.com/bytedance/sonic-cpp"
@@ -77,18 +83,23 @@ class SonicCppConan(ConanFile):
         sonic_version_pattern = r"0\.\d\.\d+"
         if re.findall(sonic_version_pattern, self.version):
             git = scm.Git(self, folder="..")
-            git.clone(self.conan_data["sources"][self.version]["url"], target='src')
+            git.clone(self.conan_data["sources"][self.version]["url"], target="src")
             git = scm.Git(self, folder=self.source_folder)
-            commit = self.conan_data['sources'][self.version]['revision']
+            commit = self.conan_data["sources"][self.version]["revision"]
             git.checkout(commit)
         else:
-           get(self, **self.conan_data["sources"][self.version], strip_root=True)
+            get(self, **self.conan_data["sources"][self.version], strip_root=True)
 
     def build(self):
         apply_conandata_patches(self)
 
     def package(self):
-        copy(self, pattern="LICENSE", dst=os.path.join(self.package_folder, "licenses"), src=self.source_folder)
+        copy(
+            self,
+            pattern="LICENSE",
+            dst=os.path.join(self.package_folder, "licenses"),
+            src=self.source_folder,
+        )
         copy(
             self,
             pattern="*.h",

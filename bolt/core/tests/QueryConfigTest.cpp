@@ -49,6 +49,14 @@ TEST_F(QueryConfigTest, emptyConfig) {
   ASSERT_FALSE(config.isLegacyCast());
 }
 
+TEST_F(QueryConfigTest, parquetReaderImplicitCastMask) {
+  QueryConfig defaultConfig{{}};
+  EXPECT_EQ(defaultConfig.parquetReaderImplicitCastMask(), 0);
+
+  QueryConfig configured{{{QueryConfig::kParquetReaderImplicitCastMask, "-1"}}};
+  EXPECT_EQ(configured.parquetReaderImplicitCastMask(), -1);
+}
+
 TEST_F(QueryConfigTest, setConfig) {
   std::string path = "/tmp/setConfig";
   std::unordered_map<std::string, std::string> configData(
@@ -57,6 +65,28 @@ TEST_F(QueryConfigTest, setConfig) {
   const QueryConfig& config = queryCtx->queryConfig();
 
   ASSERT_TRUE(config.isLegacyCast());
+}
+
+TEST_F(QueryConfigTest, parquetRepDefStreamingWindowSize) {
+  auto queryCtx = QueryCtx::create(nullptr, QueryConfig{{}});
+  EXPECT_EQ(queryCtx->queryConfig().parquetRepDefStreamingWindowSize(), 2'048);
+
+  std::unordered_map<std::string, std::string> configData(
+      {{QueryConfig::kParquetRepDefStreamingWindowSize, "0"}});
+  queryCtx = QueryCtx::create(nullptr, QueryConfig{std::move(configData)});
+  EXPECT_EQ(queryCtx->queryConfig().parquetRepDefStreamingWindowSize(), 0);
+}
+
+TEST_F(QueryConfigTest, hashBuildProbeAdmissionUnderMemoryPressureConfig) {
+  auto queryCtx = QueryCtx::create(nullptr, QueryConfig{{}});
+  ASSERT_TRUE(queryCtx->queryConfig()
+                  .hashBuildProbeAdmissionUnderMemoryPressureEnabled());
+
+  std::unordered_map<std::string, std::string> configData(
+      {{QueryConfig::kHashBuildProbeAdmissionUnderMemoryPressure, "false"}});
+  queryCtx = QueryCtx::create(nullptr, QueryConfig{std::move(configData)});
+  ASSERT_FALSE(queryCtx->queryConfig()
+                   .hashBuildProbeAdmissionUnderMemoryPressureEnabled());
 }
 
 TEST_F(QueryConfigTest, taskWriterCountConfig) {

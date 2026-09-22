@@ -35,6 +35,8 @@
 #include "bolt/functions/prestosql/types/TimestampWithTimeZoneType.h"
 using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::functions::aggregate::test;
+using bytedance::bolt::test::emptyArray;
+
 namespace bytedance::bolt::aggregate::test {
 
 static constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -300,7 +302,7 @@ TEST_F(ChecksumAggregateTest, arrays) {
   assertChecksum(arrayVector, "Nlzernkj88A=");
 
   arrayVector =
-      makeNullableArrayVector<int64_t>({{{1, 2}}, std::nullopt, {{}}});
+      makeNullableArrayVector<int64_t>({{{1, 2}}, std::nullopt, emptyArray});
   assertChecksum(arrayVector, "Nlzernkj88A=");
 
   // Array of arrays.

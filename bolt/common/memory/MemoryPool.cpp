@@ -40,6 +40,7 @@
 #include "bolt/common/base/GlobalParameters.h"
 #include "bolt/common/base/StatsReporter.h"
 #include "bolt/common/base/SuccinctPrinter.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/MemoryUtils.h"
 #include "bolt/common/memory/sparksql/OomPrinter.h"
@@ -47,13 +48,6 @@
 #include "bolt/common/testutil/TestValue.h"
 
 #include <re2/re2.h>
-
-DEFINE_bool(
-    bolt_memory_pool_capacity_transfer_across_tasks,
-    false,
-    "Whether allow to memory capacity transfer between memory pools from different tasks, which might happen in use case like Spark-Gluten");
-
-DECLARE_bool(bolt_suppress_memory_capacity_exceeding_error_message);
 
 using bytedance::bolt::common::testutil::TestValue;
 namespace bytedance::bolt::memory {
@@ -377,7 +371,7 @@ std::shared_ptr<MemoryPool> MemoryPool::addLeafChild(
     std::unique_ptr<MemoryReclaimer> _reclaimer) {
   CHECK_POOL_MANAGEMENT_OP(addLeafChild);
   // NOTE: we shall only set reclaimer in a child pool if its parent has also
-  // set. Otherwise it should be mis-configured.
+  // set. Otherwise it should be miss-configured.
   BOLT_CHECK(
       reclaimer() != nullptr || _reclaimer == nullptr,
       "Child memory pool {} shall only set memory reclaimer if its parent {} has also set",
@@ -407,7 +401,7 @@ std::shared_ptr<MemoryPool> MemoryPool::addAggregateChild(
     std::unique_ptr<MemoryReclaimer> _reclaimer) {
   CHECK_POOL_MANAGEMENT_OP(addAggregateChild);
   // NOTE: we shall only set reclaimer in a child pool if its parent has also
-  // set. Otherwise it should be mis-configured.
+  // set. Otherwise it should be miss-configured.
   BOLT_CHECK(
       reclaimer() != nullptr || _reclaimer == nullptr,
       "Child memory pool {} shall only set memory reclaimer if its parent {} has also set",
@@ -729,7 +723,7 @@ void MemoryPoolImpl::allocateNonContiguous(
     INC_MEM_OP_STATS(Frees);
   }
   BOLT_CHECK_GT(numPages, 0);
-  TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::common::memory::MemoryPoolImpl::allocateNonContiguous",
       this);
   RECORD_FREE(out);
@@ -915,7 +909,7 @@ std::shared_ptr<MemoryPool> MemoryPoolImpl::genChild(
 
 bool MemoryPoolImpl::maybeReserve(uint64_t increment) {
   CHECK_AND_INC_MEM_OP_STATS(this, Reserves);
-  TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::common::memory::MemoryPoolImpl::maybeReserve", this);
   // TODO: make this a configurable memory pool option.
   constexpr int32_t kGrowthQuantum = 8 << 20;
@@ -998,7 +992,7 @@ void MemoryPoolImpl::reserveThreadSafe(uint64_t size, bool reserveOnly) {
         break;
       }
     }
-    TestValue::adjust(
+    BOLT_TEST_ADJUST(
         "bytedance::bolt::memory::MemoryPoolImpl::reserveThreadSafe", this);
     try {
       incrementReservationThreadSafe(this, increment);
@@ -1041,7 +1035,7 @@ void MemoryPoolImpl::incrementReservationThreadSafe(
   BOLT_CHECK_NULL(parent_);
 
   if (growCapacity(requestor, size)) {
-    TestValue::adjust(
+    BOLT_TEST_ADJUST(
         "bytedance::bolt::memory::MemoryPoolImpl::incrementReservationThreadSafe::AfterGrowCallback",
         this);
     return;

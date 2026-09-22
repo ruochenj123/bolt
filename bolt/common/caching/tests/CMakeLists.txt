@@ -25,35 +25,17 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_executable(simple_lru_cache_test SimpleLRUCacheTest.cpp)
-add_test(simple_lru_cache_test simple_lru_cache_test)
-target_link_libraries(
-  simple_lru_cache_test
-  PRIVATE ${FOLLY_WITH_DEPENDENCIES} glog::glog $<LINK_LIBRARY:WHOLE_ARCHIVE,bolt_process>
-          GTest::gtest GTest::gtest_main
-)
-
 add_executable(
-  bolt_cache_test AsyncDataCacheTest.cpp CacheTTLControllerTest.cpp SsdFileTest.cpp
-                  SsdFileTrackerTest.cpp StringIdMapTest.cpp
-)
-add_test(bolt_cache_test bolt_cache_test)
-target_link_libraries(
   bolt_cache_test
-  PRIVATE bolt_caching
-          bolt_file
-          bolt_memory
-          bolt_temp_path
-          ${FOLLY_WITH_DEPENDENCIES}
-          bolt_process
-          glog::glog
-          GTest::gtest
-          GTest::gtest_main
+  AsyncDataCacheTest.cpp
+  CacheTTLControllerTest.cpp
+  SsdFileTest.cpp
+  SsdFileTrackerTest.cpp
+  StringIdMapTest.cpp
+  CachedFactoryTest.cpp
+  SimpleLRUCacheTest.cpp
 )
 
-add_executable(cached_factory_test CachedFactoryTest.cpp)
-add_test(cached_factory_test cached_factory_test)
-target_link_libraries(
-  cached_factory_test PRIVATE ${FOLLY_WITH_DEPENDENCIES} bolt_process glog::glog GTest::gtest
-                              GTest::gtest_main
-)
+add_test(bolt_cache_test bolt_cache_test)
+
+target_link_libraries(bolt_cache_test PRIVATE bolt_gtest_main)

@@ -28,7 +28,6 @@
  * --------------------------------------------------------------------------
  */
 
-#include <folly/init/Init.h>
 #include "gtest/gtest.h"
 
 #include "bolt/tpch/gen/TpchGen.h"
@@ -183,7 +182,7 @@ TEST_F(TpchGenTestRegionTest, lastBatch) {
   auto rowVector = genTpchRegion(pool_.get(), 100);
   EXPECT_EQ(5, rowVector->size());
 
-  // Scale factor doens't affect it.
+  // Scale factor doesn't affect it.
   rowVector = genTpchRegion(pool_.get(), 100, 0, 2);
   EXPECT_EQ(5, rowVector->size());
 
@@ -860,10 +859,3 @@ TEST_F(TpchGenTestCustomerTest, reproducible) {
 }
 
 } // namespace
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  // todo: use folly::Init init after upgrade folly lib
-  folly::init(&argc, &argv, false);
-  return RUN_ALL_TESTS();
-}

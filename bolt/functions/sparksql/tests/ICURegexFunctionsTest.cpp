@@ -525,7 +525,7 @@ TEST_F(ICURegexFunctionsTest, regexExtractAll) {
       {{"100", "300", "500"}},
       {{"200", "400", "600"}},
       {{"100"}},
-      {{}},
+      emptyArray,
       std::nullopt,
       std::nullopt,
       std::nullopt,
@@ -576,10 +576,10 @@ TEST_F(ICURegexFunctionsTest, regexExtractAllConstant) {
       {{"100", "300", "500"}},
       {{"100", "300", "500"}},
       {{"100"}},
-      {{}},
+      emptyArray,
       std::nullopt,
       std::nullopt,
-      {{}}};
+      emptyArray};
 
   const std::vector<std::optional<std::vector<std::string>>> bothConsOutput = {
       {{"100", "300", "500"}},
@@ -611,7 +611,7 @@ TEST_F(ICURegexFunctionsTest, regexExtractAllNoGroup) {
   const std::vector<std::optional<int32_t>> intGroupIds = {};
   const std::vector<std::optional<int64_t>> bigGroupIds = {};
   const std::vector<std::optional<std::vector<std::string>>> expectedOutputs = {
-      {{"100", "300", "500"}}, {{"100"}}, {{}}};
+      {{"100", "300", "500"}}, {{"100"}}, emptyArray};
 
   size_t size = inputs.size();
 }

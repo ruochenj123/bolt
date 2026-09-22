@@ -30,8 +30,10 @@
 
 #pragma once
 
+#include <limits>
 #include "bolt/common/config/Config.h"
 #include "bolt/core/Config.h"
+#include "bolt/vector/TypeAliases.h"
 namespace bytedance::bolt::core {
 /// A simple wrapper around bolt::Config. Defines constants for query
 /// config properties and accessor methods.
@@ -77,6 +79,11 @@ class QueryConfig {
   static constexpr const char* kExprEvalSimplified =
       "expression.eval_simplified";
 
+  /// Whether to enable the FlatNoNulls fast path for expression evaluation.
+  /// True by default.
+  static constexpr const char* kExprEvalFlatNoNulls =
+      "expression.eval_flat_no_nulls";
+
   /// Whether to track CPU usage for individual expressions (supported by call
   /// and cast expressions). False by default. Can be expensive when processing
   /// small batches, e.g. < 10K rows.
@@ -104,6 +111,12 @@ class QueryConfig {
   /// If set, cast from float/double/decimal/string to integer truncates the
   /// decimal part, otherwise rounds.
   static constexpr const char* kCastToIntByTruncate = "cast_to_int_by_truncate";
+
+  /// If set, cast from string to REAL or DOUBLE trims leading and trailing
+  /// ASCII bytes in the inclusive range 0x00 through 0x20 before conversion.
+  static constexpr const char* kCastStringToFloatingPointTrimControlChars =
+      "cast_string_to_floating_point_trim_control_chars";
+
   static constexpr const char* kSpecTimezone = "spec_timezone";
 
   /// If set, cast from string to date allows only ISO 8601 formatted strings:
@@ -125,6 +138,11 @@ class QueryConfig {
   /// exchange buffer reaches or exceeds this size.
   static constexpr const char* kMaxLocalExchangeBufferSize =
       "max_local_exchange_buffer_size";
+
+  /// Maximum number of vectors buffered in each local merge source before
+  /// blocking to wait for consumers.
+  static constexpr const char* kLocalMergeSourceQueueSize =
+      "local_merge_source_queue_size";
 
   /// Maximum size in bytes to accumulate in ExchangeQueue. Enforced
   /// approximately, not strictly.
@@ -207,6 +225,9 @@ class QueryConfig {
 
   static constexpr const char* kMinOutputBatchRows = "min_output_batch_rows";
 
+  static constexpr const char* kTableScanReusableOutputCount =
+      "table_scan_reusable_output_count";
+
   /// TableScan operator will exit getOutput() method after this many
   /// milliseconds even if it has no data to return yet. Zero means 'no time
   /// limit'.
@@ -241,12 +262,29 @@ class QueryConfig {
   /// OrderBy spilling flag, only applies if "spill_enabled" flag is set.
   static constexpr const char* kOrderBySpillEnabled = "order_by_spill_enabled";
 
+  static constexpr const char* kOrderByRadixSortEnabled =
+      "order_by_radix_sort_enabled";
+
+  /// If true, use the legacy SortBuffer when an OrderBy sorting key is REAL or
+  /// DOUBLE, or contains either type in an ARRAY, MAP, or ROW.
+  static constexpr const char*
+      kOrderByRadixSortFallbackForFloatingPointKeysEnabled =
+          "order_by_radix_sort_fallback_for_floating_point_keys_enabled";
+
   /// Support orderBy spilling in output stage
   static constexpr const char* kOrderBySpillInOutputStageEnabled =
       "order_by_spill_output_stage_enabled";
 
   /// Window spilling flag, only applies if "spill_enabled" flag is set.
   static constexpr const char* kWindowSpillEnabled = "window_spill_enabled";
+
+  /// LocalMerge spilling flag, only applies if "spill_enabled" flag is set.
+  static constexpr const char* kLocalMergeSpillEnabled =
+      "local_merge_spill_enabled";
+
+  /// Maximum number of merge sources to merge in memory before spilling.
+  static constexpr const char* kLocalMergeMaxNumMergeSources =
+      "local_merge_max_num_merge_sources";
 
   /// If true, the memory arbitrator will reclaim memory from table writer by
   /// flushing its buffered data to disk.
@@ -352,6 +390,10 @@ class QueryConfig {
   static constexpr const char* kSpillFileCreateConfig =
       "spill_file_create_config";
 
+  /// Vector serde used for row-vector spill when single partition is used.
+  static constexpr const char* kSinglePartitionSpillSerdeKind =
+      "spill_single_partition_serde_kind";
+
   static constexpr const char* kSpillStartPartitionBit =
       "spiller_start_partition_bit";
 
@@ -381,6 +423,13 @@ class QueryConfig {
   /// If true, array_agg() aggregation function will ignore nulls in the input.
   static constexpr const char* kPrestoArrayAggIgnoreNulls =
       "presto.array_agg.ignore_nulls";
+
+  /// If false, size function returns null for null input.
+  static constexpr const char* kSparkLegacySizeOfNull =
+      "spark.sql.legacy.sizeOfNull";
+
+  /// If true, Spark SQL ANSI mode is enabled.
+  static constexpr const char* kSparkAnsiEnabled = "spark.sql.ansi.enabled";
 
   /// If true, array_agg() aggregation function will ignore nulls in the input.
   static constexpr const char* kPrestoSetAggIgnoreNulls =
@@ -420,6 +469,21 @@ class QueryConfig {
   /// of hash joins.
   static constexpr const char* kHashProbeFinishEarlyOnEmptyBuild =
       "hash_probe_finish_early_on_empty_build";
+
+  /// If true, reserve extra hash build memory for probe admission when the task
+  /// is under memory pressure.
+  static constexpr const char* kHashBuildProbeAdmissionUnderMemoryPressure =
+      "hash_build_probe_admission_under_memory_pressure_enabled";
+
+  /// The multiple of preferred output batch size used to reserve enough memory
+  /// for output.
+  static constexpr const char* kOutputBatchMemoryReservationMultiple =
+      "output_batch_memory_reservation_multiple";
+
+  /// The ratio used to decide whether current memory usage is close enough to
+  /// the memory pressure watermark.
+  static constexpr const char* kMemoryPressureWatermarkRatio =
+      "memory_pressure_watermark_ratio";
 
   /// The minimum number of table rows that can trigger the parallel hash join
   /// table build.
@@ -501,6 +565,15 @@ class QueryConfig {
   static constexpr const char* kTimeParserPolicy =
       "spark.legacy_time_parser_policy";
 
+  /// If true, base64() chunks its output into 76-character lines separated by
+  /// CRLF; if false, it returns a single unchunked string. Mirrors
+  /// spark.sql.chunkBase64String.enabled (added in Spark 3.5.2, default true
+  /// there). Spark <= 3.2 always returns unchunked output and Spark
+  /// 3.3.0-3.5.1 always chunks. Bolt defaults to false, matching
+  /// Spark <= 3.2.
+  static constexpr const char* kSparkChunkBase64StringEnabled =
+      "spark.chunk_base64_string_enabled";
+
   static constexpr const char* kThrowExceptionWhenEncounterBadJson =
       "throw_exception_when_encounter_bad_json";
 
@@ -578,7 +651,15 @@ class QueryConfig {
   static constexpr const char* kParquetRepDefMemoryLimit =
       "parquet_repdef_memory_limit";
 
+  static constexpr const char* kParquetReaderImplicitCastMask =
+      "parquet_reader_implicit_cast_mask";
+
   static constexpr const char* kHybridJoinEnabled = "hybrid_join_enabled";
+
+  /// Number of levels per Parquet rep/def streaming window. Zero disables
+  /// streaming and uses the legacy preload path.
+  static constexpr const char* kParquetRepDefStreamingWindowSize =
+      "parquet_repdef_streaming_window_size";
 
   /// If true, reorder rows by containerId during hybrid join extraction for
   /// better cache locality. Can be disabled for testing to get deterministic
@@ -588,11 +669,18 @@ class QueryConfig {
 
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
-  /// If true, use scattered (non-coalesced) mode for hybrid join payload extraction.
-  /// In scattered mode, payload batches are kept separate instead of being
-  /// merged into one large batch. Row IDs encode (batchId, rowInBatch) instead
-  /// of global row index. This avoids the coalesceBatches() overhead but may
-  /// have worse cache locality during extraction.
+  /// If true, use scattered (non-coalesced) mode for hybrid sort payload
+  /// extraction. In scattered mode, payload batches are kept separate instead
+  /// of being merged into one large batch. This avoids the coalesceBatches()
+  /// overhead.
+  static constexpr const char* kHybridSortScatteredModeEnabled =
+      "hybrid_sort_scattered_mode_enabled";
+
+  /// If true, use scattered (non-coalesced) mode for hybrid join payload
+  /// extraction. In scattered mode, payload batches are kept separate instead
+  /// of being merged into one large batch. Row IDs encode (batchId, rowInBatch)
+  /// instead of global row index. This avoids the coalesceBatches() overhead
+  /// but may have worse cache locality during extraction.
   static constexpr const char* kHybridJoinScatteredModeEnabled =
       "hybrid_join_scattered_mode_enabled";
 
@@ -679,7 +767,7 @@ class QueryConfig {
   static constexpr const char* kExceptionTraceLevel = "exception_trace_level";
 
   // enable to print exceptions whose prefix is in the white list, default
-  // "std::,folly::arrow::", each is a namespace of exceptioins.
+  // "std::,folly::arrow::", each is a namespace of exceptions.
   static constexpr const char* kExceptionTraceWhitelist =
       "exception_trace_whitelist";
 
@@ -703,6 +791,10 @@ class QueryConfig {
   static constexpr const char* kEnableSonicJsonParse = "sonic.json_parse";
 
   static constexpr const char* kEnableSonicJsonToMap = "sonic.json_to_map";
+
+  /// Whether json_to_map escapes raw control chars and retries parse.
+  static constexpr const char* kJsonToMapEscapeControlChars =
+      "json_to_map_escape_control_chars";
 
   static constexpr const char* kEnableSonicIsJsonScalar =
       "sonic.is_json_scalar";
@@ -760,6 +852,11 @@ class QueryConfig {
   /// returns null.
   static constexpr const char* kSparkLegacyStatisticalAggregate =
       "spark_legacy_statistical_aggregate";
+
+  /// If true, ignore null fields when generating JSON string.
+  /// If false, null fields are included with a null value.
+  static constexpr const char* kSparkJsonIgnoreNullFields =
+      "spark.json_ignore_null_fields";
 
   bool operatorTrackExpressionStats() const {
     return get<bool>(kOperatorTrackExpressionStats, false);
@@ -854,14 +951,7 @@ class QueryConfig {
     return get<uint64_t>(kMaxSpillRunRows, kDefault);
   }
 
-  uint64_t maxSpillBytes() const {
-#ifdef SPARK_COMPATIBLE
-    static constexpr uint64_t kDefault = 0UL;
-#else
-    static constexpr uint64_t kDefault = 100UL << 30;
-#endif
-    return get<uint64_t>(kMaxSpillBytes, kDefault);
-  }
+  uint64_t maxSpillBytes() const;
 
   /// Returns the maximum number of bytes to buffer in PartitionedOutput
   /// operator to avoid creating tiny SerializedPages.
@@ -894,6 +984,10 @@ class QueryConfig {
     return get<uint64_t>(kMaxLocalExchangeBufferSize, kDefault);
   }
 
+  uint32_t localMergeSourceQueueSize() const {
+    return get<uint32_t>(kLocalMergeSourceQueueSize, 2);
+  }
+
   uint64_t maxExchangeBufferSize() const {
     static constexpr uint64_t kDefault = 32UL << 20;
     return get<uint64_t>(kMaxExchangeBufferSize, kDefault);
@@ -909,16 +1003,24 @@ class QueryConfig {
     return get<uint64_t>(kPreferredOutputBatchBytes, kDefault);
   }
 
-  uint32_t preferredOutputBatchRows() const {
-    return get<uint32_t>(kPreferredOutputBatchRows, 1024);
+  vector_size_t preferredOutputBatchRows() const {
+    const uint32_t batchRows = get<uint32_t>(kPreferredOutputBatchRows, 1024);
+    BOLT_USER_CHECK_LE(batchRows, std::numeric_limits<vector_size_t>::max());
+    return batchRows;
   }
 
-  uint32_t maxOutputBatchRows() const {
-    return get<uint32_t>(kMaxOutputBatchRows, 10'000);
+  vector_size_t maxOutputBatchRows() const {
+    const uint32_t batchRows = get<uint32_t>(kMaxOutputBatchRows, 10'000);
+    BOLT_USER_CHECK_LE(batchRows, std::numeric_limits<vector_size_t>::max());
+    return batchRows;
   }
 
   uint32_t minOutputBatchRows() const {
     return get<uint32_t>(kMinOutputBatchRows, 1);
+  }
+
+  uint32_t tableScanReusableOutputCount() const {
+    return get<uint32_t>(kTableScanReusableOutputCount, 0);
   }
 
   uint32_t tableScanGetOutputTimeLimitMs() const {
@@ -960,6 +1062,14 @@ class QueryConfig {
     return get<bool>(kCastToIntByTruncate, false);
   }
 
+  bool castStringToFloatingPointTrimControlChars() const {
+#ifdef SPARK_COMPATIBLE
+    return get<bool>(kCastStringToFloatingPointTrimControlChars, true);
+#else
+    return get<bool>(kCastStringToFloatingPointTrimControlChars, false);
+#endif
+  }
+
   std::string specTimeZone() const {
     return get<std::string>(kSpecTimezone, "America/Los_Angeles");
   }
@@ -990,6 +1100,10 @@ class QueryConfig {
 
   bool exprEvalSimplified() const {
     return get<bool>(kExprEvalSimplified, false);
+  }
+
+  bool exprEvalFlatNoNulls() const {
+    return get<bool>(kExprEvalFlatNoNulls, true);
   }
 
   /// Returns true if spilling is enabled.
@@ -1027,9 +1141,16 @@ class QueryConfig {
     return get<bool>(kHybridSortEnabled, false);
   }
 
+  /// Returns whether scattered (non-coalesced) mode is enabled for hybrid sort.
+  /// When enabled, payload batches are kept separate instead of being merged,
+  /// avoiding coalesceBatches() overhead. Default true.
+  bool hybridSortScatteredModeEnabled() const {
+    return get<bool>(kHybridSortScatteredModeEnabled, true);
+  }
+
   /// Returns whether scattered (non-coalesced) mode is enabled for hybrid join.
   /// When enabled, payload batches are kept separate instead of being merged,
-  /// avoiding coalesceBatches() overhead. Default false (use coalesced mode).
+  /// avoiding coalesceBatches() overhead. Default true (use scattered mode).
   bool hybridJoinScatteredModeEnabled() const {
     return get<bool>(kHybridJoinScatteredModeEnabled, true);
   }
@@ -1089,6 +1210,15 @@ class QueryConfig {
     return get<bool>(kOrderBySpillEnabled, true);
   }
 
+  bool orderByRadixSortEnabled() const {
+    return get<bool>(kOrderByRadixSortEnabled, false);
+  }
+
+  bool orderByRadixSortFallbackForFloatingPointKeysEnabled() const {
+    return get<bool>(
+        kOrderByRadixSortFallbackForFloatingPointKeysEnabled, false);
+  }
+
   bool orderBySpillInOutputStageEnabled() const {
     return get<bool>(kOrderBySpillInOutputStageEnabled, true);
   }
@@ -1097,6 +1227,20 @@ class QueryConfig {
   /// check the spillEnabled()!
   bool windowSpillEnabled() const {
     return get<bool>(kWindowSpillEnabled, true);
+  }
+
+  /// Returns true if spilling is enabled for LocalMerge operator.
+  bool localMergeSpillEnabled() const {
+    return get<bool>(kLocalMergeSpillEnabled, false);
+  }
+
+  /// Returns the maximum number of merge sources to merge in memory before
+  /// spilling.
+  uint32_t localMergeMaxNumMergeSources() const {
+    const auto maxNumMergeSources = get<uint32_t>(
+        kLocalMergeMaxNumMergeSources, std::numeric_limits<uint32_t>::max());
+    BOLT_CHECK_GT(maxNumMergeSources, 0);
+    return maxNumMergeSources;
   }
 
   /// Returns 'is writer spilling enabled' flag. Must also check the
@@ -1158,6 +1302,17 @@ class QueryConfig {
   // otherwise disable row based spill
   std::string rowBasedSpillMode() const {
     return get<std::string>(kRowBasedSpillMode, kDefaultRowBasedSpillMode);
+  }
+
+  /// Returns the vector serde kind used for single partition spill.
+  /// Options are:
+  ///   "Presto"      : use PrestoVectorSerde
+  ///   "UnsafeRow"   : use UnsafeRowVectorSerde
+  ///   "CompactRow"  : use CompactRowVectorSerde
+  ///   "Arrow"       : use ArrowVectorSerde
+  ///   "" (default)  : use system default serde (PrestoVectorSerde as of now)
+  std::string singlePartitionSpillSerdeKind() const {
+    return get<std::string>(kSinglePartitionSpillSerdeKind, "");
   }
 
   /// Returns the timestamp unit used in Bolt-Arrow conversion.
@@ -1260,6 +1415,8 @@ class QueryConfig {
   bool prestoArrayAggIgnoreNulls() const {
     return get<bool>(kPrestoArrayAggIgnoreNulls, false);
   }
+
+  bool sparkLegacySizeOfNull() const;
 
   bool prestoSetAggIgnoreNulls() const {
     return get<bool>(kPrestoSetAggIgnoreNulls, false);
@@ -1370,6 +1527,18 @@ class QueryConfig {
 
   bool hashProbeFinishEarlyOnEmptyBuild() const {
     return get<bool>(kHashProbeFinishEarlyOnEmptyBuild, true);
+  }
+
+  bool hashBuildProbeAdmissionUnderMemoryPressureEnabled() const {
+    return get<bool>(kHashBuildProbeAdmissionUnderMemoryPressure, true);
+  }
+
+  uint64_t outputBatchMemoryReservationMultiple() const {
+    return get<uint64_t>(kOutputBatchMemoryReservationMultiple, 8);
+  }
+
+  double memoryPressureWatermarkRatio() const {
+    return get<double>(kMemoryPressureWatermarkRatio, 0.7);
   }
 
   uint32_t minTableRowsForParallelJoinBuild() const {
@@ -1571,7 +1740,7 @@ class QueryConfig {
     return config::toDuration(get<std::string>(kColocateRpcTimeout, "30s"));
   }
 
-  // metrics used for abtesting splitted by comma, e.g., "metric1,metric2"
+  // metrics used for abtesting split by comma, e.g., "metric1,metric2"
   std::unordered_set<std::string> getAbtestMetrics() const {
     return config::splitToStrSet(get<std::string>(kAbtestMetrics, ""));
   }
@@ -1598,6 +1767,10 @@ class QueryConfig {
 
   bool enableSonicJsonToMap() const {
     return get<bool>(kEnableSonicJsonToMap, true);
+  }
+
+  bool jsonToMapEscapeControlChars() const {
+    return get<bool>(kJsonToMapEscapeControlChars, true);
   }
 
   bool enableSonicIsJsonScalar() const {
@@ -1630,6 +1803,14 @@ class QueryConfig {
 
   int32_t parquetRepDefMemoryLimit() const {
     return get<int32_t>(kParquetRepDefMemoryLimit, 128UL << 20);
+  }
+
+  int64_t parquetReaderImplicitCastMask() const {
+    return get<int64_t>(kParquetReaderImplicitCastMask, 0);
+  }
+
+  int32_t parquetRepDefStreamingWindowSize() const {
+    return get<int32_t>(kParquetRepDefStreamingWindowSize, 2 * 1024);
   }
 
   bool enableDynamicConcurrencyAdjustment() const {
@@ -1668,6 +1849,10 @@ class QueryConfig {
     return get<bool>(kSparkLegacyStatisticalAggregate, false);
   }
 
+  bool sparkChunkBase64StringEnabled() const {
+    return get<bool>(kSparkChunkBase64StringEnabled, false);
+  }
+
   /// Test-only method to override the current query config properties.
   /// It is not thread safe.
   void testingOverrideConfigUnsafe(
@@ -1683,7 +1868,12 @@ class QueryConfig {
     return get<bool>(kDecryptionEnabled, false);
   }
 
+  bool sparkJsonIgnoreNullFields() const {
+    return get<bool>(kSparkJsonIgnoreNullFields, true);
+  }
+
  private:
   std::unique_ptr<bolt::config::ConfigBase> config_;
 };
+
 } // namespace bytedance::bolt::core

@@ -66,6 +66,11 @@ class CelebornPartitionWriter final : public RemotePartitionWriter {
       std::vector<std::vector<uint8_t*>>& rows,
       std::vector<int64_t>& partitionBytes,
       const bool isCompositeVector) override;
+  arrow::Status writeFinal(
+      uint32_t partitionId,
+      std::vector<uint8_t*>& rows,
+      int64_t rawSize,
+      bool isCompositeVector) override;
 
  private:
   void init();
@@ -76,6 +81,6 @@ class CelebornPartitionWriter final : public RemotePartitionWriter {
   std::vector<int64_t> rawPartitionLengths_;
 
   // for BoltRowBasedSortShuffleWriter
-  std::shared_ptr<ZstdStreamCodec> zstdCodec_;
+  std::shared_ptr<AdaptiveParallelZstdCodec> zstdCodec_;
 };
 } // namespace bytedance::bolt::shuffle::sparksql

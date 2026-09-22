@@ -453,10 +453,12 @@ TEST_F(MapFromEntriesTest, unknownInputs) {
   test("try(map_from_entries(array_constructor(row_constructor(null, null))))");
   test("try(map_from_entries(array_constructor(null)))");
   test("try(map_from_entries(null))");
+  // Empty array of unknown type should produce an empty map without error.
+  test("map_from_entries(array_constructor())");
 }
 
 TEST_F(MapFromEntriesTest, nullRowEntriesWithSmallerChildren) {
-  // Row vector is of size 3, childrens are of size 2 since row 2 is null.
+  // Row vector is of size 3, children are of size 2 since row 2 is null.
   auto rowVector = makeRowVector(
       {makeNullableFlatVector<int32_t>({std::nullopt, 2}),
        makeFlatVector<int32_t>({1, 2})});

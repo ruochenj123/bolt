@@ -38,10 +38,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <random>
 #include <string>
 #include <vector>
 
-#include "arrow/testing/gtest_compat.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/bitmap.h"
 #include "arrow/util/ubsan.h"
@@ -407,6 +407,777 @@ TYPED_TEST(NestedListTest, TestOverflow) {
   test_data.def_levels = std::vector<int16_t>{0};
   test_data.rep_levels = std::vector<int16_t>{0};
   this->Run(test_data, level_info);
+}
+
+TEST(NestedListTest, DirectLengthsMatchesOffsets) {
+  auto check = [](const MultiLevelTestData& test_data,
+                  LevelInfo level_info,
+                  int32_t expectedValuesRead) {
+    std::vector<uint8_t> offsetsValidity(expectedValuesRead, 0);
+    ValidityBitmapInputOutput offsetsIo;
+    offsetsIo.valid_bits = offsetsValidity.data();
+    offsetsIo.values_read_upper_bound = expectedValuesRead;
+    std::vector<int32_t> offsets(expectedValuesRead + 1, 0);
+    DefRepLevelsToList(
+        test_data.def_levels.data(),
+        test_data.rep_levels.data(),
+        test_data.def_levels.size(),
+        level_info,
+        &offsetsIo,
+        offsets.data());
+
+    std::vector<uint8_t> lengthsValidity(expectedValuesRead, 0);
+    ValidityBitmapInputOutput lengthsIo;
+    lengthsIo.valid_bits = lengthsValidity.data();
+    lengthsIo.values_read_upper_bound = expectedValuesRead;
+    std::vector<int32_t> lengths(expectedValuesRead, -1);
+    DefRepLevelsToListLengths(
+        test_data.def_levels.data(),
+        test_data.rep_levels.data(),
+        test_data.def_levels.size(),
+        level_info,
+        &lengthsIo,
+        lengths.data());
+
+    ASSERT_EQ(lengthsIo.values_read, offsetsIo.values_read);
+    ASSERT_EQ(lengthsIo.null_count, offsetsIo.null_count);
+    ASSERT_EQ(
+        BitmapToString(lengthsValidity, expectedValuesRead),
+        BitmapToString(offsetsValidity, expectedValuesRead));
+    for (auto i = 0; i < offsetsIo.values_read; ++i) {
+      EXPECT_EQ(lengths[i], offsets[i + 1] - offsets[i]) << "index=" << i;
+    }
+  };
+
+  LevelInfo outer;
+  outer.rep_level = 1;
+  outer.def_level = 2;
+  check(TriplyNestedList(), outer, 4);
+
+  LevelInfo middle;
+  middle.rep_level = 2;
+  middle.def_level = 4;
+  middle.repeated_ancestor_def_level = 2;
+  check(TriplyNestedList(), middle, 7);
+
+  LevelInfo inner;
+  inner.rep_level = 3;
+  inner.def_level = 6;
+  inner.repeated_ancestor_def_level = 4;
+  check(TriplyNestedList(), inner, 6);
+
+  MultiLevelTestData nullableElements;
+  nullableElements.def_levels = std::vector<int16_t>{2, 1, 2, 0, 1, 1};
+  nullableElements.rep_levels = std::vector<int16_t>{0, 1, 1, 0, 0, 1};
+  check(nullableElements, outer, 3);
+}
+
+TEST(NestedListTest, DirectLengthsUpperBound) {
+  LevelInfo level_info;
+  level_info.rep_level = 1;
+  level_info.def_level = 2;
+  level_info.repeated_ancestor_def_level = 0;
+
+  std::vector<int16_t> def_levels = {2, 2};
+  std::vector<int16_t> rep_levels = {0, 0};
+  ValidityBitmapInputOutput io;
+  io.values_read_upper_bound = 1;
+  std::vector<int32_t> lengths(2, -1);
+
+  ASSERT_THROW(
+      DefRepLevelsToListLengths(
+          def_levels.data(),
+          rep_levels.data(),
+          def_levels.size(),
+          level_info,
+          &io,
+          lengths.data()),
+      ParquetException);
+  EXPECT_EQ(lengths[1], -1);
+}
+
+TEST(NestedListTest, DirectLengthsExactUpperBound) {
+  LevelInfo level_info;
+  level_info.rep_level = 1;
+  level_info.def_level = 2;
+  level_info.repeated_ancestor_def_level = 0;
+
+  std::vector<int16_t> def_levels = {2, 2};
+  std::vector<int16_t> rep_levels = {0, 0};
+  ValidityBitmapInputOutput io;
+  io.values_read_upper_bound = 2;
+  std::vector<int32_t> lengths(2, -1);
+
+  DefRepLevelsToListLengths(
+      def_levels.data(),
+      rep_levels.data(),
+      def_levels.size(),
+      level_info,
+      &io,
+      lengths.data());
+
+  EXPECT_EQ(io.values_read, 2);
+  EXPECT_THAT(lengths, testing::ElementsAre(1, 1));
+}
+
+TEST(NestedListTest, DirectLengthsCountNullableContinuationRun) {
+  LevelInfo levelInfo;
+  levelInfo.rep_level = 1;
+  levelInfo.def_level = 3;
+  levelInfo.repeated_ancestor_def_level = 1;
+
+  constexpr int32_t kNumContinuations = 65;
+  std::vector<int16_t> defLevels(kNumContinuations + 1, 1);
+  std::vector<int16_t> repLevels(kNumContinuations + 1, 1);
+  defLevels.front() = levelInfo.def_level;
+  repLevels.front() = 0;
+
+  ValidityBitmapInputOutput output;
+  output.values_read_upper_bound = 1;
+  std::vector<int32_t> lengths(1, -1);
+  DefRepLevelsToListLengths(
+      defLevels.data(),
+      repLevels.data(),
+      defLevels.size(),
+      levelInfo,
+      &output,
+      lengths.data());
+
+  EXPECT_EQ(output.values_read, 1);
+  EXPECT_EQ(lengths.front(), kNumContinuations + 1);
+}
+
+TEST(NestedListTest, IncrementalLengthsMatchOneShot) {
+  const auto testData = TriplyNestedList();
+  const auto check = [&](LevelInfo levelInfo, int32_t chunkSize) {
+    const auto maxValues = testData.def_levels.size();
+
+    std::vector<uint8_t> expectedValidity(maxValues, 0);
+    ValidityBitmapInputOutput expectedIo;
+    expectedIo.valid_bits = expectedValidity.data();
+    expectedIo.values_read_upper_bound = maxValues;
+    std::vector<int32_t> expectedLengths(maxValues, -1);
+    DefRepLevelsToListLengths(
+        testData.def_levels.data(),
+        testData.rep_levels.data(),
+        maxValues,
+        levelInfo,
+        &expectedIo,
+        expectedLengths.data());
+
+    std::vector<uint8_t> actualValidity(maxValues, 0);
+    std::vector<int32_t> actualLengths(maxValues, -1);
+    ListLengthsState state;
+    int64_t valuesRead = 0;
+    int64_t nullCount = 0;
+    for (int32_t begin = 0; begin < maxValues; begin += chunkSize) {
+      const auto size = std::min<int32_t>(chunkSize, maxValues - begin);
+      ValidityBitmapInputOutput io;
+      io.valid_bits = actualValidity.data();
+      io.valid_bits_offset = valuesRead;
+      io.values_read_upper_bound = maxValues - valuesRead;
+      io.null_count = nullCount;
+      DefRepLevelsToListLengths(
+          testData.def_levels.data() + begin,
+          testData.rep_levels.data() + begin,
+          size,
+          levelInfo,
+          &io,
+          actualLengths.data() + valuesRead,
+          &state,
+          false);
+      valuesRead += io.values_read;
+      nullCount = io.null_count;
+    }
+
+    ValidityBitmapInputOutput finalIo;
+    finalIo.valid_bits = actualValidity.data();
+    finalIo.valid_bits_offset = valuesRead;
+    finalIo.values_read_upper_bound = maxValues - valuesRead;
+    finalIo.null_count = nullCount;
+    DefRepLevelsToListLengths(
+        testData.def_levels.data() + maxValues,
+        testData.rep_levels.data() + maxValues,
+        0,
+        levelInfo,
+        &finalIo,
+        actualLengths.data() + valuesRead,
+        &state,
+        true);
+    valuesRead += finalIo.values_read;
+    nullCount = finalIo.null_count;
+
+    SCOPED_TRACE(
+        testing::Message() << "def=" << levelInfo.def_level << ", rep="
+                           << levelInfo.rep_level << ", ancestorDef="
+                           << levelInfo.repeated_ancestor_def_level
+                           << ", chunk=" << chunkSize);
+    ASSERT_EQ(valuesRead, expectedIo.values_read);
+    EXPECT_EQ(nullCount, expectedIo.null_count);
+    EXPECT_FALSE(state.has_open_list);
+    EXPECT_THAT(
+        std::vector<int32_t>(
+            actualLengths.begin(), actualLengths.begin() + valuesRead),
+        testing::ElementsAreArray(
+            expectedLengths.begin(),
+            expectedLengths.begin() + expectedIo.values_read));
+    EXPECT_EQ(
+        BitmapToString(actualValidity, expectedIo.values_read),
+        BitmapToString(expectedValidity, expectedIo.values_read));
+  };
+
+  LevelInfo outer;
+  outer.rep_level = 1;
+  outer.def_level = 2;
+
+  LevelInfo middle;
+  middle.rep_level = 2;
+  middle.def_level = 4;
+  middle.repeated_ancestor_def_level = 2;
+
+  LevelInfo inner;
+  inner.rep_level = 3;
+  inner.def_level = 6;
+  inner.repeated_ancestor_def_level = 4;
+
+  for (const auto chunkSize : {1, 2, 3, 7, 16, 64}) {
+    check(outer, chunkSize);
+    check(middle, chunkSize);
+    check(inner, chunkSize);
+  }
+}
+
+TEST(NestedListTest, FusedDirectStructListMatchesSeparateConversions) {
+  MultiLevelTestData test_data;
+  test_data.def_levels = std::vector<int16_t>{
+      0, // null struct and therefore null list.
+      1, // present struct, null list.
+      2, // present struct, empty list.
+      3, // present struct, list with null element.
+      4, // present struct, list with first non-null element.
+      4, // same list, second non-null element.
+      2, // present struct, another empty list.
+      0 // null struct.
+  };
+  test_data.rep_levels = std::vector<int16_t>{0, 0, 0, 0, 0, 1, 0, 0};
+
+  LevelInfo structInfo;
+  structInfo.rep_level = 0;
+  structInfo.def_level = 1;
+  structInfo.repeated_ancestor_def_level = 0;
+
+  LevelInfo listInfo;
+  listInfo.rep_level = 1;
+  listInfo.def_level = 3;
+  listInfo.repeated_ancestor_def_level = 0;
+
+  constexpr int32_t expectedValuesRead = 7;
+
+  std::vector<uint8_t> separateListValidity(expectedValuesRead, 0);
+  ValidityBitmapInputOutput separateListIo;
+  separateListIo.valid_bits = separateListValidity.data();
+  separateListIo.values_read_upper_bound = expectedValuesRead;
+  std::vector<int32_t> separateLengths(expectedValuesRead, -1);
+  DefRepLevelsToListLengths(
+      test_data.def_levels.data(),
+      test_data.rep_levels.data(),
+      test_data.def_levels.size(),
+      listInfo,
+      &separateListIo,
+      separateLengths.data());
+
+  std::vector<uint8_t> separateStructValidity(expectedValuesRead, 0);
+  ValidityBitmapInputOutput separateStructIo;
+  separateStructIo.valid_bits = separateStructValidity.data();
+  separateStructIo.values_read_upper_bound = expectedValuesRead;
+  DefRepLevelsToBitmap(
+      test_data.def_levels.data(),
+      test_data.rep_levels.data(),
+      test_data.def_levels.size(),
+      structInfo,
+      &separateStructIo);
+
+  std::vector<uint8_t> fusedListValidity(expectedValuesRead, 0);
+  ValidityBitmapInputOutput fusedListIo;
+  fusedListIo.valid_bits = fusedListValidity.data();
+  fusedListIo.values_read_upper_bound = expectedValuesRead;
+  std::vector<int32_t> fusedLengths(expectedValuesRead, -1);
+
+  std::vector<uint8_t> fusedStructValidity(expectedValuesRead, 0);
+  ValidityBitmapInputOutput fusedStructIo;
+  fusedStructIo.valid_bits = fusedStructValidity.data();
+  fusedStructIo.values_read_upper_bound = expectedValuesRead;
+
+  ASSERT_TRUE(DefRepLevelsToListLengthsAndStructBitmap(
+      test_data.def_levels.data(),
+      test_data.rep_levels.data(),
+      test_data.def_levels.size(),
+      listInfo,
+      structInfo,
+      &fusedListIo,
+      fusedLengths.data(),
+      &fusedStructIo));
+
+  EXPECT_EQ(fusedListIo.values_read, separateListIo.values_read);
+  EXPECT_EQ(fusedListIo.null_count, separateListIo.null_count);
+  EXPECT_EQ(fusedStructIo.values_read, separateStructIo.values_read);
+  EXPECT_EQ(fusedStructIo.null_count, separateStructIo.null_count);
+  EXPECT_THAT(fusedLengths, testing::ElementsAreArray(separateLengths));
+  EXPECT_EQ(
+      BitmapToString(fusedListValidity, expectedValuesRead),
+      BitmapToString(separateListValidity, expectedValuesRead));
+  EXPECT_EQ(
+      BitmapToString(fusedStructValidity, expectedValuesRead),
+      BitmapToString(separateStructValidity, expectedValuesRead));
+}
+
+TEST(NestedListTest, FusedDirectStructListMatchesSeparateConversionOptions) {
+  MultiLevelTestData testData;
+  testData.def_levels = std::vector<int16_t>{
+      0, // Null repeated ancestor, ignored.
+      1, // Empty repeated ancestor, ignored.
+      2, // Null struct and therefore null list.
+      3, // Present struct, null list.
+      4, // Present struct, empty list.
+      5, // Present struct, list with a null element.
+      6, // Present struct, list with a non-null element.
+      6, // Same list, second non-null element.
+      6, // Deeper repeated descendant, ignored.
+      2 // Null struct.
+  };
+  testData.rep_levels = std::vector<int16_t>{0, 0, 1, 1, 1, 1, 1, 2, 3, 1};
+
+  LevelInfo structInfo;
+  structInfo.rep_level = 1;
+  structInfo.def_level = 3;
+  structInfo.repeated_ancestor_def_level = 2;
+  LevelInfo listInfo;
+  listInfo.rep_level = 2;
+  listInfo.def_level = 5;
+  listInfo.repeated_ancestor_def_level = 2;
+
+  constexpr int32_t kNumLists = 6;
+  constexpr int32_t kBitmapOffset = 3;
+  auto makeOutput = [](std::vector<uint8_t>* validity) {
+    ValidityBitmapInputOutput output;
+    output.valid_bits = validity ? validity->data() : nullptr;
+    output.valid_bits_offset = kBitmapOffset;
+    output.values_read_upper_bound = kNumLists;
+    output.null_count = 4;
+    return output;
+  };
+
+  std::vector<uint8_t> separateListValidity(2, 0xa5);
+  auto separateListIo = makeOutput(&separateListValidity);
+  std::vector<int32_t> separateLengths(kNumLists, -1);
+  DefRepLevelsToListLengths(
+      testData.def_levels.data(),
+      testData.rep_levels.data(),
+      testData.def_levels.size(),
+      listInfo,
+      &separateListIo,
+      separateLengths.data());
+
+  std::vector<uint8_t> separateStructValidity(2, 0xa5);
+  auto separateStructIo = makeOutput(&separateStructValidity);
+  DefRepLevelsToBitmap(
+      testData.def_levels.data(),
+      testData.rep_levels.data(),
+      testData.def_levels.size(),
+      structInfo,
+      &separateStructIo);
+
+  std::vector<uint8_t> fusedListValidity(2, 0xa5);
+  auto fusedListIo = makeOutput(&fusedListValidity);
+  std::vector<int32_t> fusedLengths(kNumLists, -1);
+  std::vector<uint8_t> fusedStructValidity(2, 0xa5);
+  auto fusedStructIo = makeOutput(&fusedStructValidity);
+
+  ASSERT_TRUE(DefRepLevelsToListLengthsAndStructBitmap(
+      testData.def_levels.data(),
+      testData.rep_levels.data(),
+      testData.def_levels.size(),
+      listInfo,
+      structInfo,
+      &fusedListIo,
+      fusedLengths.data(),
+      &fusedStructIo));
+  EXPECT_EQ(fusedListIo.values_read, separateListIo.values_read);
+  EXPECT_EQ(fusedStructIo.values_read, separateStructIo.values_read);
+  EXPECT_EQ(fusedListIo.null_count, separateListIo.null_count);
+  EXPECT_EQ(fusedStructIo.null_count, separateStructIo.null_count);
+  EXPECT_THAT(fusedLengths, testing::ElementsAreArray(separateLengths));
+  EXPECT_EQ(fusedListValidity, separateListValidity);
+  EXPECT_EQ(fusedStructValidity, separateStructValidity);
+
+  auto separateLengthsOnlyIo = makeOutput(nullptr);
+  std::vector<int32_t> separateLengthsOnly(kNumLists, -1);
+  DefRepLevelsToListLengths(
+      testData.def_levels.data(),
+      testData.rep_levels.data(),
+      testData.def_levels.size(),
+      listInfo,
+      &separateLengthsOnlyIo,
+      separateLengthsOnly.data());
+
+  auto fusedLengthsOnlyIo = makeOutput(nullptr);
+  std::vector<int32_t> fusedLengthsOnly(kNumLists, -1);
+  std::vector<uint8_t> fusedStructOnlyValidity(2, 0xa5);
+  auto fusedStructOnlyIo = makeOutput(&fusedStructOnlyValidity);
+  ASSERT_TRUE(DefRepLevelsToListLengthsAndStructBitmap(
+      testData.def_levels.data(),
+      testData.rep_levels.data(),
+      testData.def_levels.size(),
+      listInfo,
+      structInfo,
+      &fusedLengthsOnlyIo,
+      fusedLengthsOnly.data(),
+      &fusedStructOnlyIo));
+  EXPECT_EQ(fusedLengthsOnlyIo.values_read, separateLengthsOnlyIo.values_read);
+  EXPECT_EQ(fusedLengthsOnlyIo.null_count, separateLengthsOnlyIo.null_count);
+  EXPECT_THAT(fusedLengthsOnly, testing::ElementsAreArray(separateLengthsOnly));
+}
+
+TEST(NestedListTest, FusedDirectStructListRandomizedMatchesSeparate) {
+  constexpr uint32_t kSeed = 20260730;
+  std::mt19937 rng(kSeed);
+  std::uniform_int_distribution<int32_t> percent(0, 99);
+  std::uniform_int_distribution<int32_t> mixedLength(0, 12);
+  std::uniform_int_distribution<int32_t> longLength(32, 128);
+
+  LevelInfo structInfo;
+  structInfo.rep_level = 0;
+  structInfo.def_level = 1;
+  LevelInfo listInfo;
+  listInfo.rep_level = 1;
+  listInfo.def_level = 3;
+
+  for (const int32_t numLists : {1, 17, 1024, 65536}) {
+    for (const int32_t shape : {0, 1, 2}) {
+      MultiLevelTestData testData;
+      for (int32_t list = 0; list < numLists; ++list) {
+        const auto state = percent(rng);
+        if (state < 5) {
+          testData.def_levels.push_back(0);
+          testData.rep_levels.push_back(0);
+          continue;
+        }
+        if (state < 10) {
+          testData.def_levels.push_back(1);
+          testData.rep_levels.push_back(0);
+          continue;
+        }
+        if (state < 15) {
+          testData.def_levels.push_back(2);
+          testData.rep_levels.push_back(0);
+          continue;
+        }
+        int32_t length = shape == 0 ? 1
+            : shape == 1            ? mixedLength(rng)
+                                    : longLength(rng);
+        if (length == 0) {
+          testData.def_levels.push_back(2);
+          testData.rep_levels.push_back(0);
+          continue;
+        }
+        for (int32_t index = 0; index < length; ++index) {
+          testData.def_levels.push_back(percent(rng) < 10 ? 3 : 4);
+          testData.rep_levels.push_back(index == 0 ? 0 : 1);
+        }
+      }
+
+      std::vector<uint8_t> separateListValidity(numLists, 0);
+      ValidityBitmapInputOutput separateListIo;
+      separateListIo.valid_bits = separateListValidity.data();
+      separateListIo.values_read_upper_bound = numLists;
+      std::vector<int32_t> separateLengths(numLists, -1);
+      DefRepLevelsToListLengths(
+          testData.def_levels.data(),
+          testData.rep_levels.data(),
+          testData.def_levels.size(),
+          listInfo,
+          &separateListIo,
+          separateLengths.data());
+
+      std::vector<uint8_t> separateStructValidity(numLists, 0);
+      ValidityBitmapInputOutput separateStructIo;
+      separateStructIo.valid_bits = separateStructValidity.data();
+      separateStructIo.values_read_upper_bound = numLists;
+      DefRepLevelsToBitmap(
+          testData.def_levels.data(),
+          testData.rep_levels.data(),
+          testData.def_levels.size(),
+          structInfo,
+          &separateStructIo);
+
+      std::vector<uint8_t> fusedListValidity(numLists, 0);
+      ValidityBitmapInputOutput fusedListIo;
+      fusedListIo.valid_bits = fusedListValidity.data();
+      fusedListIo.values_read_upper_bound = numLists;
+      std::vector<int32_t> fusedLengths(numLists, -1);
+      std::vector<uint8_t> fusedStructValidity(numLists, 0);
+      ValidityBitmapInputOutput fusedStructIo;
+      fusedStructIo.valid_bits = fusedStructValidity.data();
+      fusedStructIo.values_read_upper_bound = numLists;
+
+      ASSERT_TRUE(DefRepLevelsToListLengthsAndStructBitmap(
+          testData.def_levels.data(),
+          testData.rep_levels.data(),
+          testData.def_levels.size(),
+          listInfo,
+          structInfo,
+          &fusedListIo,
+          fusedLengths.data(),
+          &fusedStructIo));
+      ASSERT_EQ(fusedListIo.values_read, separateListIo.values_read);
+      ASSERT_EQ(fusedStructIo.values_read, separateStructIo.values_read);
+      EXPECT_EQ(fusedListIo.null_count, separateListIo.null_count);
+      EXPECT_EQ(fusedStructIo.null_count, separateStructIo.null_count);
+      EXPECT_THAT(fusedLengths, testing::ElementsAreArray(separateLengths));
+      EXPECT_EQ(
+          BitmapToString(fusedListValidity, numLists),
+          BitmapToString(separateListValidity, numLists));
+      EXPECT_EQ(
+          BitmapToString(fusedStructValidity, numLists),
+          BitmapToString(separateStructValidity, numLists));
+    }
+  }
+}
+
+TEST(NestedListTest, FusedDirectStructListRejectsUnsupportedLevels) {
+  LevelInfo structInfo;
+  structInfo.rep_level = 0;
+  structInfo.def_level = 1;
+  LevelInfo listInfo;
+  listInfo.rep_level = 2;
+  listInfo.def_level = 3;
+  std::vector<int16_t> definitions = {0};
+  std::vector<int16_t> repetitions = {0};
+  std::vector<int32_t> lengths(1);
+  ValidityBitmapInputOutput listOutput;
+  listOutput.values_read_upper_bound = 1;
+  ValidityBitmapInputOutput structOutput;
+  structOutput.values_read_upper_bound = 1;
+
+  EXPECT_FALSE(DefRepLevelsToListLengthsAndStructBitmap(
+      definitions.data(),
+      repetitions.data(),
+      definitions.size(),
+      listInfo,
+      structInfo,
+      &listOutput,
+      lengths.data(),
+      &structOutput));
+}
+
+TEST(NestedListTest, FusedDirectStructListUpperBound) {
+  LevelInfo structInfo;
+  structInfo.rep_level = 0;
+  structInfo.def_level = 1;
+  LevelInfo listInfo;
+  listInfo.rep_level = 1;
+  listInfo.def_level = 3;
+  std::vector<int16_t> definitions = {4, 4};
+  std::vector<int16_t> repetitions = {0, 0};
+  std::vector<int32_t> lengths(2, -1);
+  ValidityBitmapInputOutput listOutput;
+  listOutput.values_read_upper_bound = 1;
+  ValidityBitmapInputOutput structOutput;
+  structOutput.values_read_upper_bound = 1;
+
+  EXPECT_THROW(
+      DefRepLevelsToListLengthsAndStructBitmap(
+          definitions.data(),
+          repetitions.data(),
+          definitions.size(),
+          listInfo,
+          structInfo,
+          &listOutput,
+          lengths.data(),
+          &structOutput),
+      ParquetException);
+  EXPECT_EQ(lengths[1], -1);
+}
+
+TEST(NestedListTest, IncrementalFusedDirectStructListMatchesOneShot) {
+  MultiLevelTestData testData;
+  testData.def_levels = std::vector<int16_t>{0, 1, 2, 3, 4, 4, 2, 0};
+  testData.rep_levels = std::vector<int16_t>{0, 0, 0, 0, 0, 1, 0, 0};
+
+  LevelInfo structInfo;
+  structInfo.rep_level = 0;
+  structInfo.def_level = 1;
+  structInfo.repeated_ancestor_def_level = 0;
+
+  LevelInfo listInfo;
+  listInfo.rep_level = 1;
+  listInfo.def_level = 3;
+  listInfo.repeated_ancestor_def_level = 0;
+
+  const auto maxValues = testData.def_levels.size();
+  std::vector<uint8_t> expectedListValidity(maxValues, 0);
+  ValidityBitmapInputOutput expectedListIo;
+  expectedListIo.valid_bits = expectedListValidity.data();
+  expectedListIo.values_read_upper_bound = maxValues;
+  std::vector<int32_t> expectedLengths(maxValues, -1);
+  std::vector<uint8_t> expectedStructValidity(maxValues, 0);
+  ValidityBitmapInputOutput expectedStructIo;
+  expectedStructIo.valid_bits = expectedStructValidity.data();
+  expectedStructIo.values_read_upper_bound = maxValues;
+  ASSERT_TRUE(DefRepLevelsToListLengthsAndStructBitmap(
+      testData.def_levels.data(),
+      testData.rep_levels.data(),
+      maxValues,
+      listInfo,
+      structInfo,
+      &expectedListIo,
+      expectedLengths.data(),
+      &expectedStructIo));
+
+  for (const auto chunkSize : {1, 2, 3, 7, 16}) {
+    std::vector<uint8_t> actualListValidity(maxValues, 0);
+    std::vector<uint8_t> actualStructValidity(maxValues, 0);
+    std::vector<int32_t> actualLengths(maxValues, -1);
+    ListLengthsState state;
+    int64_t valuesRead = 0;
+    int64_t listNullCount = 0;
+    int64_t structNullCount = 0;
+
+    for (int32_t begin = 0; begin < maxValues; begin += chunkSize) {
+      const auto size = std::min<int32_t>(chunkSize, maxValues - begin);
+      ValidityBitmapInputOutput listIo;
+      listIo.valid_bits = actualListValidity.data();
+      listIo.valid_bits_offset = valuesRead;
+      listIo.values_read_upper_bound = maxValues - valuesRead;
+      listIo.null_count = listNullCount;
+      ValidityBitmapInputOutput structIo;
+      structIo.valid_bits = actualStructValidity.data();
+      structIo.valid_bits_offset = valuesRead;
+      structIo.values_read_upper_bound = maxValues - valuesRead;
+      structIo.null_count = structNullCount;
+      ASSERT_TRUE(DefRepLevelsToListLengthsAndStructBitmap(
+          testData.def_levels.data() + begin,
+          testData.rep_levels.data() + begin,
+          size,
+          listInfo,
+          structInfo,
+          &listIo,
+          actualLengths.data() + valuesRead,
+          &structIo,
+          &state,
+          false));
+      ASSERT_EQ(listIo.values_read, structIo.values_read);
+      valuesRead += listIo.values_read;
+      listNullCount = listIo.null_count;
+      structNullCount = structIo.null_count;
+    }
+
+    ValidityBitmapInputOutput finalListIo;
+    finalListIo.valid_bits = actualListValidity.data();
+    finalListIo.valid_bits_offset = valuesRead;
+    finalListIo.values_read_upper_bound = maxValues - valuesRead;
+    finalListIo.null_count = listNullCount;
+    ValidityBitmapInputOutput finalStructIo;
+    finalStructIo.valid_bits = actualStructValidity.data();
+    finalStructIo.valid_bits_offset = valuesRead;
+    finalStructIo.values_read_upper_bound = maxValues - valuesRead;
+    finalStructIo.null_count = structNullCount;
+    ASSERT_TRUE(DefRepLevelsToListLengthsAndStructBitmap(
+        testData.def_levels.data() + maxValues,
+        testData.rep_levels.data() + maxValues,
+        0,
+        listInfo,
+        structInfo,
+        &finalListIo,
+        actualLengths.data() + valuesRead,
+        &finalStructIo,
+        &state,
+        true));
+    ASSERT_EQ(finalListIo.values_read, finalStructIo.values_read);
+    valuesRead += finalListIo.values_read;
+    listNullCount = finalListIo.null_count;
+    structNullCount = finalStructIo.null_count;
+
+    SCOPED_TRACE(testing::Message() << "chunk=" << chunkSize);
+    ASSERT_EQ(valuesRead, expectedListIo.values_read);
+    EXPECT_EQ(valuesRead, expectedStructIo.values_read);
+    EXPECT_EQ(listNullCount, expectedListIo.null_count);
+    EXPECT_EQ(structNullCount, expectedStructIo.null_count);
+    EXPECT_FALSE(state.has_open_list);
+    EXPECT_THAT(
+        std::vector<int32_t>(
+            actualLengths.begin(), actualLengths.begin() + valuesRead),
+        testing::ElementsAreArray(
+            expectedLengths.begin(),
+            expectedLengths.begin() + expectedListIo.values_read));
+    EXPECT_EQ(
+        BitmapToString(actualListValidity, valuesRead),
+        BitmapToString(expectedListValidity, valuesRead));
+    EXPECT_EQ(
+        BitmapToString(actualStructValidity, valuesRead),
+        BitmapToString(expectedStructValidity, valuesRead));
+  }
+}
+
+TEST(LevelConversionTest, DefLevelsAreAllValid) {
+  {
+    std::vector<int16_t> def_levels = {3, 3, 3, 3, 3, 3, 3, 3, 3};
+    LevelInfo level_info;
+    level_info.def_level = 3;
+    int64_t values_read = -1;
+    EXPECT_TRUE(DefLevelsAreAllValid(
+        def_levels.data(),
+        def_levels.size(),
+        level_info,
+        def_levels.size(),
+        &values_read));
+    EXPECT_EQ(values_read, def_levels.size());
+  }
+  {
+    std::vector<int16_t> def_levels = {3, 3, 3, 2, 3};
+    LevelInfo level_info;
+    level_info.def_level = 3;
+    int64_t values_read = -1;
+    EXPECT_FALSE(DefLevelsAreAllValid(
+        def_levels.data(),
+        def_levels.size(),
+        level_info,
+        def_levels.size(),
+        &values_read));
+    EXPECT_EQ(values_read, def_levels.size());
+  }
+  {
+    std::vector<int16_t> def_levels = {0, 0, 2, 2, 2, 2, 2, 2, 0, 2};
+    LevelInfo level_info;
+    level_info.rep_level = 1;
+    level_info.repeated_ancestor_def_level = 1;
+    level_info.def_level = 2;
+    int64_t values_read = -1;
+    EXPECT_TRUE(DefLevelsAreAllValid(
+        def_levels.data(), def_levels.size(), level_info, 7, &values_read));
+    EXPECT_EQ(values_read, 7);
+  }
+  {
+    std::vector<int16_t> def_levels = {0, 0, 2, 1, 2, 2, 2, 2};
+    LevelInfo level_info;
+    level_info.rep_level = 1;
+    level_info.repeated_ancestor_def_level = 1;
+    level_info.def_level = 2;
+    int64_t values_read = -1;
+    EXPECT_FALSE(DefLevelsAreAllValid(
+        def_levels.data(), def_levels.size(), level_info, 6, &values_read));
+    EXPECT_EQ(values_read, 6);
+  }
+  {
+    std::vector<int16_t> def_levels = {3, 3, 3};
+    LevelInfo level_info;
+    level_info.def_level = 3;
+    int64_t values_read = -1;
+    EXPECT_THROW(
+        DefLevelsAreAllValid(
+            def_levels.data(), def_levels.size(), level_info, 2, &values_read),
+        ParquetException);
+  }
 }
 
 TEST(TestOnlyExtractBitsSoftware, BasicTest) {

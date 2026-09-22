@@ -28,6 +28,8 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include "bolt/type/Timestamp.h"
 
 #include <date/tz.h>
@@ -59,16 +61,27 @@ Timestamp Timestamp::now() {
   return fromMillis(epochMs);
 }
 
-void Timestamp::toGMT(const tz::TimeZone& zone, bool* hasError) {
+std::string Timestamp::toString(
+    const TimestampToStringOptions::Precision& precision,
+    const tz::TimeZone* tz) const {
+  return toString<::bytedance::bolt::kSparkCompatible>(precision, tz);
+}
+
+namespace {
+FOLLY_ALWAYS_INLINE void toGMTImpl(
+    const tz::TimeZone& zone,
+    tz::TimeZone::TChoose choose,
+    int64_t& seconds,
+    bool* hasError) {
   std::chrono::seconds sysSeconds;
 
   try {
-    sysSeconds = zone.to_sys(std::chrono::seconds(seconds_));
+    sysSeconds = zone.to_sys(std::chrono::seconds(seconds), choose);
   } catch (const ::date::ambiguous_local_time&) {
     // If the time is ambiguous, pick the earlier possibility to be consistent
     // with Presto.
     sysSeconds = zone.to_sys(
-        std::chrono::seconds(seconds_), tz::TimeZone::TChoose::kEarliest);
+        std::chrono::seconds(seconds), tz::TimeZone::TChoose::kEarliest);
   } catch (const ::date::nonexistent_local_time& error) {
     if (hasError) {
       *hasError = true;
@@ -86,16 +99,34 @@ void Timestamp::toGMT(const tz::TimeZone& zone, bool* hasError) {
     // not suppress it.
     BOLT_FAIL_UNSUPPORTED_INPUT_UNCATCHABLE(e.what());
   }
-  seconds_ = sysSeconds.count();
+  seconds = sysSeconds.count();
   if (hasError) {
     *hasError = false;
   }
+}
+} // namespace
+
+void Timestamp::toGMT(const tz::TimeZone& zone, bool* hasError) {
+  toGMTImpl(zone, tz::TimeZone::TChoose::kFail, seconds_, hasError);
+}
+
+void Timestamp::toGMT(
+    const tz::TimeZone& zone,
+    TimestampGapPolicy gapPolicy,
+    bool* hasError) {
+  auto choose = tz::TimeZone::TChoose::kFail;
+  if (gapPolicy == TimestampGapPolicy::kShiftForward) {
+    choose = tz::TimeZone::TChoose::kEarliestOrShiftForward;
+  } else if (gapPolicy == TimestampGapPolicy::kNextValidSecond) {
+    choose = tz::TimeZone::TChoose::kEarliest;
+  }
+  toGMTImpl(zone, choose, seconds_, hasError);
 }
 
 void Timestamp::toGMT(int16_t tzID, bool* hasError) {
   if (tzID == 0) {
     // No conversion required for time zone id 0, as it is '+00:00'.
-  } else if (tzID <= 1680) {
+  } else if (tzID <= tz::kMaxFixedOffsetTimeZoneId) {
     seconds_ -= getPrestoTZOffsetInSeconds(tzID);
   } else {
     // Other ids go this path.
@@ -117,7 +148,7 @@ void Timestamp::toTimezone(const tz::TimeZone& zone) {
 void Timestamp::toTimezone(int16_t tzID) {
   if (tzID == 0) {
     // No conversion required for time zone id 0, as it is '+00:00'.
-  } else if (tzID <= 1680) {
+  } else if (tzID <= tz::kMaxFixedOffsetTimeZoneId) {
     seconds_ += getPrestoTZOffsetInSeconds(tzID);
   } else {
     // Other ids go this path.
@@ -278,7 +309,7 @@ StringView Timestamp::tmToStringView(
                                char* const position) {
     const auto numDigits = countDigits(value);
     uint32_t offset = 0;
-    // Append leading zeros when there is the requirement for minumum width.
+    // Append leading zeros when there is the requirement for minimum width.
     if (minWidth.has_value() && numDigits < minWidth.value()) {
       const auto leadingZeros = minWidth.value() - numDigits;
       std::memset(position, '0', leadingZeros);

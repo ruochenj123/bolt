@@ -73,7 +73,7 @@ class ArrayIntersectTest : public FunctionBaseTest {
         {{3, 8, std::nullopt}},
         std::nullopt,
         {{1, 1, -2, -2, -2, 4, 8}},
-        {{}},
+        emptyArray,
     });
     auto array2 = makeNullableArrayVector<T>({
         {1, -2, 4},
@@ -86,10 +86,10 @@ class ArrayIntersectTest : public FunctionBaseTest {
     auto expected = makeNullableArrayVector<T>({
         {{1, -2, 4}},
         {{1, -2}},
-        {{}},
+        emptyArray,
         std::nullopt,
         {{1, -2, 4}},
-        {{}},
+        emptyArray,
     });
     testExpr(expected, "array_intersect(C0, C1)", {array1, array2});
     testExpr(expected, "array_intersect(C1, C0)", {array1, array2});
@@ -104,12 +104,12 @@ class ArrayIntersectTest : public FunctionBaseTest {
         {{1, std::nullopt}},
     });
     expected = makeNullableArrayVector<T>({
-        {{}},
+        emptyArray,
         {{2, -2}},
         {std::vector<std::optional<T>>{std::nullopt}},
         std::nullopt,
         {{1, 8}},
-        {{}},
+        emptyArray,
     });
     testExpr(expected, "array_intersect(C0, C1)", {array1, array2});
   }

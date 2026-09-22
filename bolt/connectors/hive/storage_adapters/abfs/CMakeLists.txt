@@ -27,20 +27,35 @@
 
 # for generated headers
 
-add_library(bolt_abfs RegisterAbfsFileSystem.cpp)
+bolt_add_library(bolt_abfs RegisterAbfsFileSystem.cpp)
 
 if(BOLT_ENABLE_ABFS)
-  target_sources(bolt_abfs PRIVATE AbfsFileSystem.cpp AbfsUtils.cpp)
+  target_sources(
+    bolt_abfs
+    PRIVATE
+      AbfsFileSystem.cpp
+      AbfsPath.cpp
+      AbfsReadFile.cpp
+      AbfsUtil.cpp
+      AbfsWriteFile.cpp
+      AzureClientProviderFactories.cpp
+      AzureClientProviderImpl.cpp
+      DynamicSasTokenClientProvider.cpp
+  )
+
   target_link_libraries(
     bolt_abfs
-    PUBLIC bolt_file
-           bolt_core
-           bolt_hive_config
-           bolt_dwio_common_exception
-           Azure::azure-storage-blobs
-           Folly::folly
-           glog::glog
-           fmt::fmt
+    PUBLIC
+      bolt_file
+      bolt_core
+      bolt_hive_config
+      bolt_dwio_common_exception
+      Azure::azure-storage-files-datalake
+      Azure::azure-storage-blobs
+      Azure::azure-identity
+      Folly::folly
+      glog::glog
+      fmt::fmt
   )
 
   if(${BOLT_BUILD_TESTING})

@@ -587,12 +587,21 @@ struct RuntimeStatistics {
   // Number of strides (row groups) skipped based on statistics.
   int64_t skippedStrides{0};
 
-  // Number of strides (row groups) processed based on statitics.
+  // Number of strides (row groups) processed based on statistics.
   int64_t processedStrides{0};
 
   uint64_t decompressDataTimeNs{0};
 
   uint64_t decodeTimeNs{0};
+
+  // Total parquet data pages considered by this column reader, including
+  // pages actually decoded and pages skipped before decode.
+  uint64_t totalPages{0};
+
+  // Number of pages that did not contribute any output for this column.
+  // This includes pages skipped before decode and pages decoded by a filtered
+  // column that produced no output rows.
+  uint64_t filteredOutPages{0};
 
   ColumnReaderStatistics columnReaderStatistics;
 
@@ -605,6 +614,8 @@ struct RuntimeStatistics {
     processedStrides += other.processedStrides;
     decompressDataTimeNs += other.decompressDataTimeNs;
     decodeTimeNs += other.decodeTimeNs;
+    totalPages += other.totalPages;
+    filteredOutPages += other.filteredOutPages;
     columnReaderStatistics.flattenStringDictionaryValues =
         other.columnReaderStatistics.flattenStringDictionaryValues;
   }
@@ -619,6 +630,8 @@ struct RuntimeStatistics {
          RuntimeCounter(decompressDataTimeNs, RuntimeCounter::Unit::kNanos)},
         {"decodeTime",
          RuntimeCounter(decodeTimeNs, RuntimeCounter::Unit::kNanos)},
+        {"totalPages", RuntimeCounter(totalPages)},
+        {"filteredOutPages", RuntimeCounter(filteredOutPages)},
         {"flattenStringDictionaryValues",
          RuntimeCounter(columnReaderStatistics.flattenStringDictionaryValues)},
         {"processedStrides", RuntimeCounter(processedStrides)},

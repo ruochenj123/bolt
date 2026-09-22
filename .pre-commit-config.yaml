@@ -17,40 +17,94 @@ repos:
     rev: 'v14.0.6'
     hooks:
       - id: clang-format
-        name: clang-format C++ files
+        name: Format C++ files
         types_or: [c++, c]
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.0
     hooks:
       - id: gitleaks
+        entry: python3 scripts/run-gitleaks.py
 
   - repo: https://github.com/BlankSpruce/gersemi
     rev: 0.25.1
     hooks:
     - id: gersemi
-      name: Check CMake files
-      args: ["--no-warn-about-unknown-commands"]
+      name: Format CMake files
+      args: ["-i", "--no-warn-about-unknown-commands"]
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        name: Remove trailing whitespace
         args: [--markdown-linebreak-ext=md]
         exclude: \.(patch|diff)$
       - id: end-of-file-fixer
+        name: Fix end of file
       - id: check-yaml
+        name: Check YAML files
       - id: mixed-line-ending
+        name: Check mixed line ending
         args: [--fix=lf]
       - id: check-toml
-      - id: check-yaml
+        name: Check TOML files
       - id: check-xml
+        name: Check XML files
 
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.11
+    hooks:
+      - id: ruff-check
+        name: Check Python files
+        types_or: [ python, pyi ]
+        args: [ --fix ]
+      - id: ruff-format
+        name: Format Python files
+        types_or: [ python, pyi ]
+
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.12.0-2
+    hooks:
+      - id: shfmt
+        name: Format shell scripts
+        args: ["-w", "-i", "2", "-bn", "-ci", "-sr"]
   - repo: local
     hooks:
-      -   id: license-header-check
-          name: Check for license headers
-          entry: license-eye header check
-          pass_filenames: false
-          language: golang
-          additional_dependencies: ['github.com/apache/skywalking-eyes/cmd/license-eye@v0.8.0']
+      - id: normalize-blog-posts
+        name: Normalize blog posts
+        entry: python3 scripts/normalize_blog_posts.py
+        language: system
+        files: ^doc/blog/_posts/.*\.md$
+      - id: markdownlint-blog
+        name: Lint and fix blog Markdown
+        entry: npx markdownlint-cli2@0.17.2 --fix
+        language: system
+        files: ^doc/blog/.*\.md$
+        exclude: ^doc/blog/vendor/
+        require_serial: true
+      - id: license-header-check
+        name: Check for license headers
+        entry: go run -C .github/license_check .
+        language: golang
+        pass_filenames: true
+        require_serial: true
+      - id: clang-tidy
+        name: Lint C++ files
+        description: >-
+          Run clang-tidy on only changed lines so existing warnings don't block.
+          Locally it checks staged diffs; in GitHub Actions it diffs against the
+          PR base / merge queue base
+        stages: [pre-commit]
+        entry: ./scripts/run-clang-tidy.py
+        args: [--diff, auto]
+        language: python
+        files: \.(c|cc|cpp|cxx|h|hpp|hxx)$
+        pass_filenames: false
+        additional_dependencies: [clang-tidy==18.1.8]
+        require_serial: true
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+    - id: codespell
+      name: Spell Check

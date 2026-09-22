@@ -75,7 +75,7 @@ TEST_F(RepeatTest, repeat) {
       {{0.0}},
       {{-2.0, -2.0}},
       {{3.333333, 3.333333, 3.333333}},
-      {{}},
+      emptyArray,
       {{std::nullopt, std::nullopt, std::nullopt, std::nullopt}},
       std::nullopt,
   });

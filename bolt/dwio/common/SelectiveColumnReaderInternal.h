@@ -47,18 +47,6 @@ namespace bytedance::bolt::dwio::common {
 
 bolt::common::AlwaysTrue& alwaysTrue();
 
-class Timer {
- public:
-  Timer() : startClocks_{folly::hardware_timestamp()} {}
-
-  uint64_t elapsedClocks() const {
-    return folly::hardware_timestamp() - startClocks_;
-  }
-
- private:
-  const uint64_t startClocks_;
-};
-
 template <typename T>
 void SelectiveColumnReader::ensureValuesCapacity(vector_size_t numRows) {
   if (values_ && values_->unique() &&
@@ -79,7 +67,7 @@ void SelectiveColumnReader::prepareRead(
   seekTo(offset, scanSpec_->readsNullsOnly());
   const vector_size_t numRows = rows.back() + 1;
 
-  // Do not re-use unless singly-referenced.
+  // Do not reuse unless singly-referenced.
   if (nullsInReadRange_ && !nullsInReadRange_->unique()) {
     nullsInReadRange_.reset();
   }
@@ -114,7 +102,7 @@ void SelectiveColumnReader::prepareRead(
   ensureValuesCapacity<T>(rows.size());
   if (scanSpec_->keepValues() && !scanSpec_->valueHook()) {
     valueRows_.clear();
-    prepareNulls(rows, nullsInReadRange_ != nullptr);
+    prepareOutputNulls(rows, nullsInReadRange_ != nullptr);
   }
 }
 

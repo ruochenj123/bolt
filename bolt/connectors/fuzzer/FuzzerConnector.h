@@ -32,9 +32,11 @@
 
 #include "bolt/common/config/Config.h"
 #include "bolt/connectors/Connector.h"
+#include "bolt/connectors/ConnectorNames.h"
 #include "bolt/connectors/fuzzer/FuzzerConnectorSplit.h"
 #include "bolt/core/Config.h"
 #include "bolt/vector/fuzzer/VectorFuzzer.h"
+
 namespace bytedance::bolt::connector::fuzzer {
 
 /// `FuzzerConnector` is a connector that generates data on-the-fly using
@@ -58,6 +60,11 @@ class FuzzerTableHandle : public ConnectorTableHandle {
         fuzzerSeed(fuzzerSeed) {}
 
   ~FuzzerTableHandle() override {}
+
+  const std::string& name() const override {
+    static const std::string kName = "fuzzer-mock-table";
+    return kName;
+  }
 
   std::string toString() const override {
     return "fuzzer-mock-table";
@@ -148,8 +155,6 @@ class FuzzerConnector final : public Connector {
 
 class FuzzerConnectorFactory : public ConnectorFactory {
  public:
-  static constexpr const char* FOLLY_NONNULL kFuzzerConnectorName{"fuzzer"};
-
   FuzzerConnectorFactory() : ConnectorFactory(kFuzzerConnectorName) {}
 
   explicit FuzzerConnectorFactory(const char* FOLLY_NONNULL connectorName)

@@ -39,6 +39,9 @@
 
 namespace bytedance::bolt::common {
 
+inline constexpr const char* kBigintRangeTestBytesRangeErrorPrefix =
+    "BigintRange::testBytesRange() is not supported.";
+
 enum class FilterKind {
   kAlwaysFalse,
   kAlwaysTrue,
@@ -140,6 +143,18 @@ class Filter : public bolt::ISerializable {
 
   FilterKind kind() const {
     return kind_;
+  }
+
+  bool isValueIndependent() const {
+    switch (kind_) {
+      case FilterKind::kIsNull:
+      case FilterKind::kIsNotNull:
+      case FilterKind::kAlwaysTrue:
+      case FilterKind::kAlwaysFalse:
+        return true;
+      default:
+        return false;
+    }
   }
 
   bool nullAllowed() const {
@@ -382,6 +397,10 @@ class AlwaysFalse final : public Filter {
   }
 
   bool testNonNull() const final {
+    return false;
+  }
+
+  bool testNull() const final {
     return false;
   }
 
@@ -892,6 +911,14 @@ class BigintRange final : public Filter {
     }
 
     return !(min > upper_ || max < lower_);
+  }
+
+  bool testBytesRange(
+      std::optional<std::string_view> /*min*/,
+      std::optional<std::string_view> /*max*/,
+      bool /*hasNull*/) const final {
+    BOLT_UNSUPPORTED(
+        "{} Filter: {}", kBigintRangeTestBytesRangeErrorPrefix, toString());
   }
 
   int64_t lower() const {
@@ -1964,6 +1991,32 @@ class BytesValues final : public Filter, public IFilterWithValues<StringView> {
   bool testingEquals(const Filter& other) const final;
   bool isNegateFilter() const final {
     return false;
+  }
+
+  std::string toString() const final {
+    std::string str = fmt::format(
+        "BytesValues isSingleValue {} lower {}, upper {}",
+        isSingleValue_,
+        lower_,
+        upper_);
+    str += ", set is:<";
+    // folly::F14FastSet is unordered, so let's sort it at the beginning
+    std::vector<std::string> sortedVector(set_.begin(), set_.end());
+    std::sort(sortedVector.begin(), sortedVector.end());
+    for (const auto& s : sortedVector) {
+      str += s + ",";
+    }
+    str += ">, value is:<";
+    sortedVector.clear();
+    for (const auto& v : value_) {
+      sortedVector.emplace_back(std::string(v));
+    }
+    std::sort(sortedVector.begin(), sortedVector.end());
+    for (const auto& v : sortedVector) {
+      str += v + ",";
+    }
+    str += ">";
+    return str;
   }
 
  private:

@@ -32,10 +32,101 @@
 #pragma once
 
 #include "bolt/shuffle/sparksql/Payload.h"
+#include "bolt/shuffle/sparksql/ReaderStreamIterator.h"
 #include "bolt/shuffle/sparksql/ShuffleRowToColumnarConverter.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/ComplexVector.h"
 namespace bytedance::bolt::shuffle::sparksql {
+
+// Chains the streams produced by a ReaderStreamIterator into a single logically
+// continuous InputStream. When the current sub-stream reaches EOF, it
+// transparently advances to the next one, so that a single BufferedInputStream
+// (and BoltColumnarBatchDeserializer) can be reused across all streams instead
+// of being recreated per stream.
+class ChainedReaderStream final : public arrow::io::InputStream {
+ public:
+  ChainedReaderStream(
+      std::shared_ptr<ReaderStreamIterator> iterator,
+      arrow::MemoryPool* pool)
+      : iterator_(std::move(iterator)), pool_(pool) {}
+
+  arrow::Status Close() override {
+    if (closed_) {
+      return arrow::Status::OK();
+    }
+    closed_ = true;
+    eos_ = true;
+    if (current_) {
+      auto status = current_->Close();
+      current_.reset();
+      return status;
+    }
+    return arrow::Status::OK();
+  }
+
+  bool closed() const override {
+    return closed_;
+  }
+
+  arrow::Result<int64_t> Tell() const override {
+    return position_;
+  }
+
+  arrow::Result<int64_t> Read(int64_t nbytes, void* out) override {
+    if (closed_) {
+      return arrow::Status::IOError("ChainedReaderStream is closed");
+    }
+    if (nbytes < 0) {
+      return arrow::Status::Invalid("Read length must be non-negative");
+    }
+    if (nbytes == 0 || eos_) {
+      return 0;
+    }
+    auto* outBytes = reinterpret_cast<uint8_t*>(out);
+    int64_t total = 0;
+    while (total < nbytes) {
+      if (!current_ && !advance()) {
+        break;
+      }
+      ARROW_ASSIGN_OR_RAISE(
+          auto bytesRead, current_->Read(nbytes - total, outBytes + total));
+      if (bytesRead == 0) {
+        // Current sub-stream is exhausted, move to the next one.
+        current_.reset();
+        continue;
+      }
+      total += bytesRead;
+    }
+    position_ += total;
+    return total;
+  }
+
+  arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override {
+    ARROW_ASSIGN_OR_RAISE(
+        auto buffer, arrow::AllocateResizableBuffer(nbytes, pool_));
+    ARROW_ASSIGN_OR_RAISE(auto bytesRead, Read(nbytes, buffer->mutable_data()));
+    RETURN_NOT_OK(buffer->Resize(bytesRead, /*shrink_to_fit=*/true));
+    return std::shared_ptr<arrow::Buffer>(std::move(buffer));
+  }
+
+ private:
+  // Fetches the next sub-stream. Returns false when no more streams remain.
+  bool advance() {
+    current_ = iterator_->nextStream(pool_);
+    if (!current_) {
+      eos_ = true;
+      return false;
+    }
+    return true;
+  }
+
+  std::shared_ptr<ReaderStreamIterator> iterator_;
+  arrow::MemoryPool* pool_{nullptr};
+  std::shared_ptr<arrow::io::InputStream> current_;
+  int64_t position_{0};
+  bool eos_{false};
+  bool closed_{false};
+};
 
 class RowBufferPool final {
  public:
@@ -100,30 +191,35 @@ class BoltColumnarBatchDeserializer {
   BoltColumnarBatchDeserializer(
       std::shared_ptr<arrow::io::InputStream> in,
       const std::shared_ptr<arrow::Schema>& schema,
-      const std::shared_ptr<arrow::util::Codec>& codec,
+      const std::shared_ptr<Codec>& codec,
       const bytedance::bolt::RowTypePtr& rowType,
       int32_t batchSize,
       int32_t shuffleBatchByteSize,
+      int32_t shuffleBufferSize,
       arrow::MemoryPool* memoryPool,
       bytedance::bolt::memory::MemoryPool* boltPool,
       std::vector<bool>* isValidityBuffer,
       bool hasComplexType,
       uint64_t& deserializeTime,
       uint64_t& decompressTime,
+      uint64_t& mergeTime,
       bool isRowFormat = false,
-      ZstdStreamCodec* zstdCodec = nullptr,
+      AdaptiveParallelZstdCodec* zstdCodec = nullptr,
       RowBufferPool* rowBufferPool = nullptr,
-      ShuffleRowToColumnarConverter* row2ColConverter = nullptr);
+      ShuffleRowToColumnarConverter* row2ColConverter = nullptr,
+      ColumnBufferPool* columnBufferPool = nullptr);
 
   bytedance::bolt::RowVectorPtr next();
 
  private:
   bytedance::bolt::RowVectorPtr nextFromRows();
   FLATTEN bool isCompositeRowVectorLayout(int64_t& bytes);
+  // merge the saved payloads into a single InMemoryPayload and clear saved.
+  std::unique_ptr<InMemoryPayload> drainSaved();
 
   std::shared_ptr<arrow::io::BufferedInputStream> in_;
   std::shared_ptr<arrow::Schema> schema_;
-  std::shared_ptr<arrow::util::Codec> codec_;
+  std::shared_ptr<Codec> codec_;
   bytedance::bolt::RowTypePtr rowType_;
   int32_t batchSize_;
   int32_t shuffleBatchByteSize_;
@@ -134,18 +230,32 @@ class BoltColumnarBatchDeserializer {
 
   uint64_t& deserializeTime_;
   uint64_t& decompressTime_;
+  uint64_t& mergeTime_;
 
-  std::unique_ptr<InMemoryPayload> merged_{nullptr};
+  struct SavedPayload {
+    uint64_t size{0};
+    uint64_t rowCount{0};
+    std::vector<std::unique_ptr<InMemoryPayload>> payloads;
+
+    void save(std::unique_ptr<InMemoryPayload> payload) {
+      size += payload->getBufferSize();
+      rowCount += payload->numRows();
+      payloads.emplace_back(std::move(payload));
+    }
+  } savedPayloads_;
+
   bool reachEos_{false};
 
   // for row format shuffle read
   const bool isRowFormat_{false};
-  ZstdStreamCodec* zstdCodec_{nullptr};
+  AdaptiveParallelZstdCodec* zstdCodec_{nullptr};
   RowBufferPool* rowBufferPool_{nullptr};
   uint8_t* partialRow_{nullptr};
   int32_t partialRowSize_{0};
   ShuffleRowToColumnarConverter* row2ColConverter_{nullptr};
   std::unique_ptr<arrow::ResizableBuffer> tailBuffer_{nullptr};
+
+  ColumnBufferPool* columnBufferPool_{nullptr};
 
   // for CompositeRowVector shuffle reader
   RowVectorLayout vectorLayout_{RowVectorLayout::kInvalid};
@@ -157,12 +267,13 @@ class BoltColumnarBatchDeserializerFactory {
  public:
   BoltColumnarBatchDeserializerFactory(
       const std::shared_ptr<arrow::Schema>& schema,
-      const std::shared_ptr<arrow::util::Codec>& codec,
+      const std::shared_ptr<Codec>& codec,
       const bytedance::bolt::RowTypePtr& rowType,
       int32_t batchSize,
       int32_t shuffleBatchByteSize,
       arrow::MemoryPool* memoryPool,
-      bytedance::bolt::memory::MemoryPool* boltPool);
+      bytedance::bolt::memory::MemoryPool* boltPool,
+      bool checksumEnabled = true);
 
   std::unique_ptr<BoltColumnarBatchDeserializer> createDeserializer(
       std::shared_ptr<arrow::io::InputStream> in);
@@ -172,6 +283,8 @@ class BoltColumnarBatchDeserializerFactory {
   int64_t getDecompressTime();
 
   int64_t getDeserializeTime();
+
+  int64_t getMergeTime();
 
   void setNumPartitions(int32_t numPartitions) {
     numPartitions_ = numPartitions;
@@ -203,15 +316,31 @@ class BoltColumnarBatchDeserializerFactory {
     partitioningShortName_ = name;
   }
 
+  void setShuffleBufferSize(int32_t shuffleBufferSize) {
+    shuffleBufferSize_ = shuffleBufferSize;
+  }
+
+  void setRowFormat(bytedance::bolt::row::RowFormat rowFormat) {
+    rowFormat_ = rowFormat;
+  }
+
+  void setRowBasedShuffleThreshold(int64_t threshold) {
+    rowBasedShuffleThreshold_ = threshold;
+  }
+
  private:
   std::shared_ptr<arrow::Schema> schema_;
-  std::shared_ptr<arrow::util::Codec> codec_;
+  std::shared_ptr<Codec> codec_;
   bytedance::bolt::RowTypePtr rowType_;
   int32_t batchSize_;
   int32_t shuffleBatchByteSize_;
+  int32_t shuffleBufferSize_{kDefaultShuffleBufferSize};
   int32_t numPartitions_{0};
   ShuffleWriterType shuffleWriterType_{ShuffleWriterType::V1};
   std::string partitioningShortName_;
+  bytedance::bolt::row::RowFormat rowFormat_{
+      bytedance::bolt::row::RowFormat::DENSE};
+  int64_t rowBasedShuffleThreshold_{kDefaultRowBasedShuffleThreshold};
   arrow::MemoryPool* memoryPool_;
   bytedance::bolt::memory::MemoryPool* boltPool_;
 
@@ -220,12 +349,14 @@ class BoltColumnarBatchDeserializerFactory {
 
   uint64_t deserializeTime_{0};
   uint64_t decompressTime_{0};
+  uint64_t mergeTime_{0};
 
   void initFromSchema();
   // for rowbased shuffle
-  std::shared_ptr<ZstdStreamCodec> zstdCodec_{nullptr};
+  std::shared_ptr<AdaptiveParallelZstdCodec> zstdCodec_{nullptr};
   std::shared_ptr<RowBufferPool> rowBufferPool_{nullptr};
   std::shared_ptr<ShuffleRowToColumnarConverter> row2ColConverter_{nullptr};
+  bool checksumEnabled_{true};
 };
 
 class BoltShuffleReader {
@@ -258,6 +389,10 @@ class BoltShuffleReader {
 
   int64_t getDeserializeTime() const {
     return factory_->getDeserializeTime();
+  }
+
+  int64_t getMergeTime() const {
+    return factory_->getMergeTime();
   }
 
   arrow::MemoryPool* getPool() const {

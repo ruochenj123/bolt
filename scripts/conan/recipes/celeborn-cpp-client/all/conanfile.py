@@ -13,14 +13,10 @@
 # limitations under the License.
 
 from conan import ConanFile
-from conan.errors import ConanInvalidConfiguration
-from conan.tools.apple import is_apple_os
-from conan.tools.build import check_min_cppstd, cross_building
 from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
-from conan.tools.files import apply_conandata_patches, export_conandata_patches, get, copy, rmdir, replace_in_file, save, rm
-from conan.tools.microsoft import is_msvc, is_msvc_static_runtime
-from conan.tools.env import Environment, VirtualBuildEnv, VirtualRunEnv
-from conan.tools.scm import Version, Git
+from conan.tools.files import apply_conandata_patches, export_conandata_patches, copy
+from conan.tools.env import VirtualBuildEnv, VirtualRunEnv
+from conan.tools.scm import Git
 import os
 
 
@@ -40,20 +36,20 @@ class CelebornCppClientConan(ConanFile):
     options = {
         "shared": [True, False],
         "fPIC": [True, False],
-
         "no_exception_tracer": [True, False],
     }
-    default_options = {
-        "shared": False,
-        "fPIC": True,
-
-        "no_exception_tracer": False
-    }
+    default_options = {"shared": False, "fPIC": True, "no_exception_tracer": False}
 
     def requirements(self):
-        self.requires("folly/2022.10.31.00", transitive_headers=True, transitive_libs=True)
-        self.requires("fizz/2022.10.31.00", transitive_headers=True, transitive_libs=True)
-        self.requires("wangle/2022.10.31.00", transitive_headers=True, transitive_libs=True)
+        self.requires(
+            "folly/2022.10.31.00", transitive_headers=True, transitive_libs=True
+        )
+        self.requires(
+            "fizz/2022.10.31.00", transitive_headers=True, transitive_libs=True
+        )
+        self.requires(
+            "wangle/2022.10.31.00", transitive_headers=True, transitive_libs=True
+        )
         self.requires("re2/20230301", transitive_headers=True, transitive_libs=True)
         self.requires("xxhash/0.8.1", transitive_headers=True, transitive_libs=True)
         self.requires("protobuf/3.21.4", transitive_headers=True, transitive_libs=True)
@@ -64,9 +60,9 @@ class CelebornCppClientConan(ConanFile):
 
     def source(self):
         git = Git(self, folder="..")
-        git.clone('https://github.com/apache/celeborn', target='src')
+        git.clone("https://github.com/apache/celeborn", target="src")
         git = Git(self, folder=self.source_folder)
-        git.checkout("0f663d0")
+        git.checkout("81d89f3")
         apply_conandata_patches(self)
 
     def export_sources(self):
@@ -105,31 +101,43 @@ class CelebornCppClientConan(ConanFile):
         deps.generate()
 
     def package(self):
-        copy(self, "LICENSE*", src=self.source_folder,
-             dst=os.path.join(self.package_folder, "licenses"))
+        copy(
+            self,
+            "LICENSE*",
+            src=self.source_folder,
+            dst=os.path.join(self.package_folder, "licenses"),
+        )
 
         lib_dst = os.path.join(self.package_folder, "lib")
         inc_dst = os.path.join(self.package_folder, "include")
 
         # libraries
-        copy(self, pattern="**/lib*.a", src=self.build_folder, dst=lib_dst, keep_path=False)
+        copy(
+            self,
+            pattern="**/lib*.a",
+            src=self.build_folder,
+            dst=lib_dst,
+            keep_path=False,
+        )
 
         # headers
-        copy(self, pattern="**/*.h",
-             src=os.path.join(self.source_folder, "cpp"),
-             dst=inc_dst,
-             keep_path=True,
-             excludes=("**/tests/**", "**/test/**", "**/benchmark/**", "**/bench/**"))
+        copy(
+            self,
+            pattern="**/*.h",
+            src=os.path.join(self.source_folder, "cpp"),
+            dst=inc_dst,
+            keep_path=True,
+            excludes=("**/tests/**", "**/test/**", "**/benchmark/**", "**/bench/**"),
+        )
 
         # proto
-        copy(self, pattern="*.pb.h",
-             src=self.build_folder,
-             dst=inc_dst,
-             keep_path=True)
+        copy(self, pattern="*.pb.h", src=self.build_folder, dst=inc_dst, keep_path=True)
 
     def package_info(self):
         self.cpp_info.set_property("cmake_file_name", "celeborn-cpp-client")
-        self.cpp_info.set_property("cmake_target_name", "celeborn-cpp-client::celeborn-cpp-client")
+        self.cpp_info.set_property(
+            "cmake_target_name", "celeborn-cpp-client::celeborn-cpp-client"
+        )
 
         self.cpp_info.libs = [
             "client",

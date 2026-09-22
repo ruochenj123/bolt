@@ -16,6 +16,7 @@
 
 #include <folly/Random.h>
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -79,6 +80,38 @@ class TestMemoryUsageRecorder final : public MemoryUsageRecorder {
   }
 };
 
+class TestingMemoryTarget final : public MemoryTarget {
+ public:
+  explicit TestingMemoryTarget(bool failBorrow = false)
+      : failBorrow_(failBorrow) {}
+
+  int64_t borrow(int64_t size) override {
+    if (failBorrow_) {
+      BOLT_UNSUPPORTED("original over-target failure");
+    }
+    usedBytes_ += size;
+    return size;
+  }
+
+  int64_t repay(int64_t size) override {
+    const auto freed = std::min(size, usedBytes_);
+    usedBytes_ -= freed;
+    return freed;
+  }
+
+  int64_t usedBytes() override {
+    return usedBytes_;
+  }
+
+  std::string toString() override {
+    return "TestingMemoryTarget";
+  }
+
+ private:
+  const bool failBorrow_;
+  int64_t usedBytes_{0};
+};
+
 TEST_F(MemoryTargetTest, basic) {
   const int64_t capacity = 1 * 1024 * 1024 * 1024;
   const int64_t taskAttemptId = 996;
@@ -139,6 +172,23 @@ TEST_F(MemoryTargetTest, basic) {
   }
 }
 
+TEST_F(MemoryTargetTest, overAcquirePreservesException) {
+  MemoryTargetPtr target = std::make_shared<TestingMemoryTarget>();
+  MemoryTargetPtr overTarget = std::make_shared<TestingMemoryTarget>(true);
+  auto overAcquireTarget =
+      MemoryTargetBuilder::overAcquire(target, overTarget, 1.0);
+
+  try {
+    overAcquireTarget->borrow(1);
+    FAIL() << "Expected BoltUserError";
+  } catch (const BoltUserError& e) {
+    EXPECT_EQ(e.message(), "original over-target failure");
+    EXPECT_EQ(e.errorCode(), error_code::kUnsupported.c_str());
+  } catch (const BoltException& e) {
+    FAIL() << "Expected BoltUserError, got " << e.exceptionName();
+  }
+}
+
 TEST_F(MemoryTargetTest, toString) {
   const int64_t capacity = 1 * 1024 * 1024 * 1024;
   const int64_t taskAttemptId = 996;
@@ -171,7 +221,7 @@ TEST_F(MemoryTargetTest, toString) {
   AllocationListenerPtr listener = std::make_shared<ManagedAllocationListener>(
       "test", overAccquireTarget, recorder);
   std::string expect =
-      "OverAcquireMemoryTarget(target=TreeMemoryTargetNode(name=WholeStageCodeGen.1, capacity=9223372036854775807, childrenNum=0, children=(), parent=TreeMemoryTargetNode(name=SpillTrigger.root.1, capacity=9223372036854775807, childrenNum=2, children=([seq=0, childName=OverAcquire.DummyTarget.1],[seq=1, childName=WholeStageCodeGen.1],), parent=ConsumerTargetBridge(name=Gluten.Tree.1, taskMemoryManager=TaskMemoryManager(taskAttemptId=996, pool=ExecutionMemoryPool(poolSize=1073741824, memoryForTask={}}), overTarget=TreeMemoryTargetNode(name=OverAcquire.DummyTarget.1, capacity=9223372036854775807, childrenNum=0, children=(), parent=TreeMemoryTargetNode(name=SpillTrigger.root.1, capacity=9223372036854775807, childrenNum=2, children=([seq=0, childName=OverAcquire.DummyTarget.1],[seq=1, childName=WholeStageCodeGen.1],), parent=ConsumerTargetBridge(name=Gluten.Tree.1, taskMemoryManager=TaskMemoryManager(taskAttemptId=996, pool=ExecutionMemoryPool(poolSize=1073741824, memoryForTask={}}))";
+      "OverAcquireMemoryTarget(target=TreeMemoryTargetNode(name=WholeStageCodeGen.1, capacity=9223372036854775807, childrenNum=0, children=(), parent=TreeMemoryTargetNode(name=SpillTriggerLayer.root.1, capacity=9223372036854775807, childrenNum=2, children=([seq=0, childName=OverAcquire.DummyTarget.1],[seq=1, childName=WholeStageCodeGen.1],), parent=ConsumerTargetBridge(name=Gluten.Tree.1, taskMemoryManager=TaskMemoryManager(taskAttemptId=996, pool=ExecutionMemoryPool(poolSize=1073741824, poolExtendSize=0, memIncreaseSize=0 memoryForTask={, DynamicMemoryQuotaManagerOption=enable=false, quotaTriggerRatio=0, rssMinRatio=0, rssMaxRatio=0, extendMaxRatio=0, extendMinRatio=0, extendScaleRatio=0, sampleRatio=0, sampleSize=0B, changeThresholdRatio=0, logPrintFreq=0}}), overTarget=TreeMemoryTargetNode(name=OverAcquire.DummyTarget.1, capacity=9223372036854775807, childrenNum=0, children=(), parent=TreeMemoryTargetNode(name=SpillTriggerLayer.root.1, capacity=9223372036854775807, childrenNum=2, children=([seq=0, childName=OverAcquire.DummyTarget.1],[seq=1, childName=WholeStageCodeGen.1],), parent=ConsumerTargetBridge(name=Gluten.Tree.1, taskMemoryManager=TaskMemoryManager(taskAttemptId=996, pool=ExecutionMemoryPool(poolSize=1073741824, poolExtendSize=0, memIncreaseSize=0 memoryForTask={, DynamicMemoryQuotaManagerOption=enable=false, quotaTriggerRatio=0, rssMinRatio=0, rssMaxRatio=0, extendMaxRatio=0, extendMinRatio=0, extendScaleRatio=0, sampleRatio=0, sampleSize=0B, changeThresholdRatio=0, logPrintFreq=0}}))";
   BOLT_CHECK(
       expect == ans->toString(),
       "Expect {}, but got {}",
@@ -227,10 +277,6 @@ TEST_F(MemoryTargetTest, expectSpill) {
   BOLT_CHECK(first == capacity / 2);
   int64_t second = listener->allocationChanged(capacity / 2 + 1);
   BOLT_CHECK(second == capacity / 2);
-}
-
-TEST_F(MemoryTargetTest, stats) {
-  BOLT_FAIL("Please test stats");
 }
 
 } // namespace bytedance::bolt::memory::sparksql

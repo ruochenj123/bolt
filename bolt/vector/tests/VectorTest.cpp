@@ -49,6 +49,9 @@
 #include "bolt/vector/TypeAliases.h"
 #include "bolt/vector/VectorTypeUtils.h"
 #include "bolt/vector/tests/utils/VectorTestBase.h"
+
+using bytedance::bolt::test::emptyArray;
+
 namespace bytedance::bolt {
 namespace {
 
@@ -1058,6 +1061,13 @@ TEST_F(VectorTest, createOpaque) {
   EXPECT_EQ(NonPOD::alive, 0);
 }
 
+TEST_F(VectorTest, makeFlatVectorSingleElementInitializerList) {
+  auto vector = makeFlatVector<int64_t>({0});
+
+  ASSERT_EQ(vector->size(), 1);
+  EXPECT_EQ(vector->valueAt(0), 0);
+}
+
 TEST_F(VectorTest, getOrCreateEmpty) {
   auto empty = BaseVector::getOrCreateEmpty(nullptr, VARCHAR(), pool());
   EXPECT_NE(empty, nullptr);
@@ -1766,7 +1776,7 @@ TEST_F(VectorTest, resizeAtConstruction) {
 }
 
 TEST_F(VectorTest, resizeStringAsciiness) {
-  std::vector<std::string> stringInput = {"hellow", "how", "are"};
+  std::vector<std::string> stringInput = {"hello", "how", "are"};
   auto flatVector = makeFlatVector(stringInput);
   auto stringVector = flatVector->as<SimpleVector<StringView>>();
   SelectivityVector rows(stringInput.size());
@@ -2090,7 +2100,7 @@ TEST_F(VectorTest, valueHook) {
   // accept nulls.  In this way, for the use case of aggregation, the
   // row number is directly usable as an index into an array of groups
   // to update. The caller will compose the RowSet based on what rows
-  // have been filtered out beteen creating the LazyVector and the
+  // have been filtered out between creating the LazyVector and the
   // point of loading. The hook itself is concerned with the loaded
   // subset of rows and the position of each row within this set.
   lazy->load(rows, &hook);
@@ -2290,6 +2300,20 @@ TEST_F(VectorTest, nestedLazy) {
   // level vector.
   EXPECT_NO_THROW(BaseVector::wrapInDictionary(
       nullptr, makeIndices(size, indexAt), size, dict));
+
+  // Verify that if the original dictionary layer is destroyed without loading
+  // the underlying vector then the lazy vector can be wrapped in a new encoding
+  // layer.
+  dict.reset();
+  EXPECT_NO_THROW(
+      dict = BaseVector::wrapInDictionary(
+          nullptr, makeIndices(size, indexAt), size, lazy));
+
+  auto replacement = makeLazy();
+  auto* rawDict = dict->as<DictionaryVector<int32_t>>();
+  EXPECT_NO_THROW(rawDict->setDictionaryValues(replacement));
+  EXPECT_NO_THROW(BaseVector::wrapInDictionary(
+      nullptr, makeIndices(size, indexAt), size, lazy));
 
   // Limitation: Current checks cannot prevent existing references of the lazy
   // vector to load rows. For example, the following would succeed even though
@@ -2783,24 +2807,44 @@ TEST_F(VectorTest, flattenVector) {
 
   VectorPtr lazy = std::make_shared<LazyVector>(
       pool(), INTEGER(), flat->size(), std::make_unique<TestingLoader>(flat));
-  test(lazy, true);
+  test(lazy, false);
 
-  // Constant
+  // Constant.
   VectorPtr constant = BaseVector::wrapInConstant(100, 1, flat);
   test(constant, false);
   EXPECT_TRUE(constant->isFlatEncoding());
 
-  // Dictionary
+  // Dictionary.
   VectorPtr dictionary = BaseVector::wrapInDictionary(
       nullptr, makeIndices(100, [](auto row) { return row % 2; }), 100, flat);
   test(dictionary, false);
   EXPECT_TRUE(dictionary->isFlatEncoding());
 
+  // Lazy dictionary.
   VectorPtr lazyDictionary =
       wrapInLazyDictionary(makeFlatVector<int32_t>({1, 2, 3}));
-  test(lazyDictionary, true);
-  EXPECT_TRUE(lazyDictionary->isLazy());
-  EXPECT_TRUE(lazyDictionary->loadedVector()->isFlatEncoding());
+  test(lazyDictionary, false);
+  EXPECT_TRUE(lazyDictionary->isFlatEncoding());
+
+  // Lazy dictionary row, where children are also lazy dictionaries.
+  VectorPtr rowWithLazyDictionaryChildren = wrapInLazyDictionary(makeRowVector({
+      wrapInLazyDictionary(makeFlatVector<int32_t>({1, 2, 3})),
+      wrapInLazyDictionary(array),
+      wrapInLazyDictionary(map),
+  }));
+  test(rowWithLazyDictionaryChildren, false);
+  EXPECT_EQ(
+      rowWithLazyDictionaryChildren->encoding(), VectorEncoding::Simple::ROW);
+  auto* rowWithLazyDictionaryChildrenRowVector =
+      rowWithLazyDictionaryChildren->as<RowVector>();
+  EXPECT_TRUE(
+      rowWithLazyDictionaryChildrenRowVector->childAt(0)->isFlatEncoding());
+  EXPECT_EQ(
+      rowWithLazyDictionaryChildrenRowVector->childAt(1)->encoding(),
+      VectorEncoding::Simple::ARRAY);
+  EXPECT_EQ(
+      rowWithLazyDictionaryChildrenRowVector->childAt(2)->encoding(),
+      VectorEncoding::Simple::MAP);
 
   // Array with constant elements.
   auto* arrayVector = array->as<ArrayVector>();
@@ -3186,7 +3230,7 @@ TEST_F(VectorTest, containsNullAtArrays) {
   auto data = makeNullableArrayVector<int32_t>({
       {{1, 2}},
       {{1, 2, std::nullopt, 3}},
-      {{}},
+      emptyArray,
       std::nullopt,
       {{1, 2, 3, 4}},
   });
@@ -3203,7 +3247,7 @@ TEST_F(VectorTest, containsNullAtMaps) {
       {{{1, 10}, {2, 20}}},
       {{{3, 30}}},
       {{{1, 10}, {2, 20}, {3, std::nullopt}, {4, 40}}},
-      {{}},
+      emptyArray,
       std::nullopt,
       {{{1, 10}, {2, 20}, {3, 30}, {4, 40}}},
   });
@@ -3239,7 +3283,7 @@ TEST_F(VectorTest, containsNullAtStructs) {
           makeNullableArrayVector<int64_t>({
               {{1, 2}},
               {{1, 2, std::nullopt, 3}},
-              {{}},
+              emptyArray,
               {{1, 2, 3}},
               std::nullopt,
               {{1, 2, 3, 4, 5}},

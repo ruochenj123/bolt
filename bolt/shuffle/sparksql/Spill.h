@@ -60,11 +60,13 @@ class Spill final {
       const std::vector<bool>* isValidityBuffer,
       uint64_t rawSize,
       arrow::MemoryPool* pool,
-      arrow::util::Codec* codec);
+      Codec* codec);
 
   const std::string& spillFile() const;
 
   void insertPayload(uint32_t partitionId, uint32_t numRows, uint64_t rawSize);
+
+  uint64_t bytesWritten() const;
 
  private:
   struct PartitionPayload {
@@ -78,6 +80,7 @@ class Spill final {
   std::list<PartitionPayload> partitionPayloads_{};
   std::shared_ptr<arrow::io::MemoryMappedFile> inputStream_{};
   std::string spillFile_;
+  uint64_t bytesWritten_{0};
 
   arrow::io::InputStream* rawIs_;
 

@@ -478,25 +478,26 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
   if (shouldAbandon && adaptiveAdjustment_) {
     uint64_t totalRowCnt{0}, processedRowCnt{0};
     operatorCtx_->traverseOpToGetRowCount(totalRowCnt, processedRowCnt);
-    // left unprocessed rows * (input->output expansion/filter ratio) * size
-    auto calculatedSkippedSize = avgRowSize_ * (totalRowCnt - processedRowCnt) *
-        totalInputRows_ / processedRowCnt;
-    if (processedRowCnt && calculatedSkippedSize >= skippedDataSizeThreshold_) {
-      *const_cast<int32_t*>(&abandonPartialAggregationMinPct_) =
-          std::max((int32_t)abandonPartialAggregationMinPct_, 95);
-      *const_cast<int32_t*>(&abandonPartialAggregationMinFinalPct_) =
-          std::max((int32_t)abandonPartialAggregationMinFinalPct_, 90);
-      *const_cast<int32_t*>(&partialAggregationSpillMaxPct_) =
-          std::max((int32_t)partialAggregationSpillMaxPct_, 85);
-      adaptiveAdjustment_ = false;
-      // recalculate abandon or not
-      shouldAbandon = calShouldAbandon();
+    if (totalRowCnt > 0 && processedRowCnt > 0) {
+      // left unprocessed rows * (input->output expansion/filter ratio) * size
+      auto calculatedSkippedSize = avgRowSize_ *
+          (totalRowCnt - processedRowCnt) * totalInputRows_ / processedRowCnt;
+      if (calculatedSkippedSize >= skippedDataSizeThreshold_) {
+        *const_cast<int32_t*>(&abandonPartialAggregationMinPct_) =
+            std::max((int32_t)abandonPartialAggregationMinPct_, 95);
+        *const_cast<int32_t*>(&abandonPartialAggregationMinFinalPct_) =
+            std::max((int32_t)abandonPartialAggregationMinFinalPct_, 90);
+        *const_cast<int32_t*>(&partialAggregationSpillMaxPct_) =
+            std::max((int32_t)partialAggregationSpillMaxPct_, 85);
+        adaptiveAdjustment_ = false;
+        // recalculate abandon or not
+        shouldAbandon = calShouldAbandon();
+      }
     }
   }
   if (shouldAbandon) {
     groupingSet_->abandonPartialAggregation();
     pool()->release();
-    addRuntimeStat("abandonedPartialAggregation", RuntimeCounter(1));
     abandonedPartialAggregation_ = true;
     LOG(INFO) << __FUNCTION__ << " numInputRows_ = " << numInputRows_
               << ", numOutputRows_ = " << numOutputRows_
@@ -540,9 +541,9 @@ void triggerSegfault() {
 }
 
 RowVectorPtr HashAggregation::getOutput() {
-  if (bytedance::bolt::common::testutil::TestValue::enabled()) {
+  if (BOLT_TEST_VALUE_ENABLED()) {
     bool injectSegfault = false;
-    bytedance::bolt::common::testutil::TestValue::adjust(
+    BOLT_TEST_ADJUST(
         "bytedance::bolt::exec::HashAggregation::getOutput", &injectSegfault);
     if (injectSegfault) {
       triggerSegfault();
@@ -561,6 +562,9 @@ RowVectorPtr HashAggregation::getOutput() {
     }
     prepareOutput(input_->size(), false);
     groupingSet_->toIntermediate(input_, output_);
+    addRuntimeStat(
+        std::string(HashAggregation::kAbandonedPartialAggregationRows),
+        RuntimeCounter(input_->size()));
     numOutputRows_ += input_->size();
     input_ = nullptr;
     return output_;
@@ -594,9 +598,9 @@ RowVectorPtr HashAggregation::getOutput() {
     // Handle accumulated output when no more input or memory pressure
     if (accumulatedOutput_ &&
         (finished_ || partialFull_ ||
-         accumulatedOutput_->size() >= minOutputRows_)) {
+         accumulatedOutput_->size() >= minOutputRows_ ||
+         abandonedPartialAggregation_)) {
       auto result = std::move(accumulatedOutput_);
-      accumulatedOutput_ = nullptr;
       resetPartialOutputIfNeed();
       return result;
     }
@@ -728,6 +732,9 @@ void HashAggregation::noMoreInput() {
 }
 
 bool HashAggregation::isFinished() {
+  if (finished_) {
+    BOLT_CHECK_NULL(accumulatedOutput_);
+  }
   return finished_;
 }
 

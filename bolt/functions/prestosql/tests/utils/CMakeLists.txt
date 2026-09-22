@@ -25,10 +25,14 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_functions_test_lib FunctionBaseTest.cpp)
+bolt_add_library(bolt_functions_test_lib FunctionBaseTest.cpp)
 
 target_link_libraries(
-  bolt_functions_test_lib bolt_exec bolt_exec_test_lib bolt_vector_test_lib bolt_parse_parser
+  bolt_functions_test_lib
+  bolt_exec
+  bolt_exec_test_lib
+  bolt_vector_test_lib
+  bolt_parse_parser
 )
 
 # WHOLE_ARCHIVE consistency: bolt_process appears both plain and feature'd in this

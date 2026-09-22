@@ -28,6 +28,8 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include "bolt/functions/lib/DateTimeFormatter.h"
 
 #include <bolt/common/base/Exceptions.h>
@@ -41,6 +43,12 @@
 #include "bolt/functions/lib/DateTimeFormatterBuilder.h"
 #include "bolt/type/TimestampConversion.h"
 #include "bolt/type/tz/TimeZoneMap.h"
+
+namespace bytedance::bolt::tz {
+// Defined in TimeZoneLinks.cpp
+extern const std::unordered_map<std::string, std::string>& getTimeZoneLinks();
+} // namespace bytedance::bolt::tz
+
 namespace bytedance::bolt::functions {
 
 static thread_local std::string timezoneBuffer = "+00:00";
@@ -97,6 +105,19 @@ constexpr std::string_view weekdaysFull[] = {
     "Saturday"};
 constexpr std::string_view weekdaysShort[] =
     {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+constexpr bool isSparkOnlyFormatSpecifier(DateTimeFormatSpecifier specifier) {
+  switch (specifier) {
+    case DateTimeFormatSpecifier::WEEK_YEAR:
+    case DateTimeFormatSpecifier::WEEK_OF_WEEK_YEAR:
+    case DateTimeFormatSpecifier::WEEK_OF_MONTH:
+    case DateTimeFormatSpecifier::DAY_OF_WEEK_IN_MONTH:
+      return true;
+    default:
+      return false;
+  }
+}
+
 static std::
     unordered_map<std::string_view, std::pair<std::string_view, int64_t>>
         dayOfWeekMap{
@@ -343,28 +364,27 @@ int64_t parseTimezone(
           {"PDT", tz::getTimeZoneID("America/Los_Angeles")},
       };
       std::string_view zone(cur, 3);
-#ifdef SPARK_COMPATIBLE
-      // spark accept timezone in lower case
-      std::string upper;
-      for (auto& c : zone) {
-        upper.push_back(toupper(c));
-      }
-      zone = upper;
-#endif
       auto it = defaultTzNames.find(zone);
+      if (::bytedance::bolt::kSparkCompatible && it == defaultTzNames.end()) {
+        // spark accept timezone in lower case
+        std::string upper;
+        for (auto& c : zone) {
+          upper.push_back(toupper(c));
+        }
+        it = defaultTzNames.find(upper);
+      }
       if (it != defaultTzNames.end()) {
         date.timezoneId = it->second;
         return 3;
       }
     }
-#ifndef SPARK_COMPATIBLE
     // The format 'UT' is also accepted for UTC.
-    else if ((end - cur == 2) && (*cur == 'U') && (*(cur + 1) == 'T')) {
+    if (!::bytedance::bolt::kSparkCompatible && end - cur == 2 && *cur == 'U' &&
+        *(cur + 1) == 'T') {
       date.timezoneId = 0;
       return 2;
     }
-#else
-    if ((*cur == '+') || (*cur == '-')) {
+    if (::bytedance::bolt::kSparkCompatible && (*cur == '+' || *cur == '-')) {
       int64_t timezoneId = -1;
       int64_t length = 0;
       if (legacySpark && (end - cur) >= 5) {
@@ -382,7 +402,6 @@ int64_t parseTimezone(
         return length;
       }
     }
-#endif
   }
   return -1;
 }
@@ -536,6 +555,56 @@ std::string formatFractionOfSecond(
   // Adding KBase can align the prefix 0
   auto subsecondsStr = std::to_string(subseconds + KBase);
   return subsecondsStr.substr(1, minRepresentDigits);
+}
+
+int32_t appendTimezoneOffset(int64_t offset, char* result, bool includeColon) {
+  int pos = 0;
+  if (offset >= 0) {
+    result[pos++] = '+';
+  } else {
+    result[pos++] = '-';
+    offset = -offset;
+  }
+
+  const auto hours = offset / 60 / 60;
+  if (hours < 10) {
+    result[pos++] = '0';
+    result[pos++] = char(hours + '0');
+  } else {
+    result[pos++] = char(hours / 10 + '0');
+    result[pos++] = char(hours % 10 + '0');
+  }
+
+  if (includeColon) {
+    result[pos++] = ':';
+  }
+
+  const auto minutes = (offset / 60) % 60;
+  if LIKELY (minutes == 0) {
+    result[pos++] = '0';
+    result[pos++] = '0';
+  } else if (minutes < 10) {
+    result[pos++] = '0';
+    result[pos++] = char(minutes + '0');
+  } else {
+    result[pos++] = char(minutes / 10 + '0');
+    result[pos++] = char(minutes % 10 + '0');
+  }
+
+  const auto seconds = offset % 60;
+  if (seconds > 0) {
+    result[pos++] = ':';
+
+    if (seconds < 10) {
+      result[pos++] = '0';
+      result[pos++] = char(seconds + '0');
+    } else {
+      result[pos++] = char(seconds / 10 + '0');
+      result[pos++] = char(seconds % 10 + '0');
+    }
+  }
+
+  return pos;
 }
 
 // According to DateTimeFormatSpecifier enum class
@@ -694,9 +763,9 @@ ErrorCode parseFromPattern(
     if (size == -1) {
       return ErrorCode::PARSE_HALFDAY_ERROR;
     }
-#ifdef SPARK_COMPATIBLE
-    date.isHourOfHalfDay = true; // for get_timestamp("PM", "a") case
-#endif
+    if (::bytedance::bolt::kSparkCompatible) {
+      date.isHourOfHalfDay = true; // for get_timestamp("PM", "a") case
+    }
     cur += size;
   } else if (
       curPattern.specifier == DateTimeFormatSpecifier::DAY_OF_WEEK_TEXT) {
@@ -750,32 +819,32 @@ ErrorCode parseFromPattern(
           return ErrorCode::PARSE_FRACTION_ERROR;
         }
       }
-#ifdef SPARK_COMPATIBLE
-      // .8 + S => .8 CORRECTED
-      // .8 + SS => .8 CORRECTED
-      // .8 + SSS => .8 CORRECTED
-      // .8 + SSSS => .8 CORRECTED
-      // .80 + SSS => .8 CORRECTED
-      // .800 + SSS => .8 CORRECTED
-      // .1234 + SSSS => .1234 CORRECTED
-      // .1234 + SSSSS => .1234 CORRECTED
+      if constexpr (::bytedance::bolt::kSparkCompatible) {
+        // .8 + S => .8 CORRECTED
+        // .8 + SS => .8 CORRECTED
+        // .8 + SSS => .8 CORRECTED
+        // .8 + SSSS => .8 CORRECTED
+        // .80 + SSS => .8 CORRECTED
+        // .800 + SSS => .8 CORRECTED
+        // .1234 + SSSS => .1234 CORRECTED
+        // .1234 + SSSSS => .1234 CORRECTED
 
-      // .8 + S => .008 LEGACY
-      // .8 + SS => .008 LEGACY
-      // .8 + SSS => .008 LEGACY
-      // .8 + SSSS => .008 LEGACY
-      // .80 + SSS => .08 LEGACY
-      // .800 + SSS => .8 LEGACY
-      // .1234 + SSSS => null LEGACY
-      // .1234 + SSSSS => null LEGACY
-      if (!legacySpark) {
-        number *= std::pow(10, 9 - count) / 1000;
+        // .8 + S => .008 LEGACY
+        // .8 + SS => .008 LEGACY
+        // .8 + SSS => .008 LEGACY
+        // .8 + SSSS => .008 LEGACY
+        // .80 + SSS => .08 LEGACY
+        // .800 + SSS => .8 LEGACY
+        // .1234 + SSSS => null LEGACY
+        // .1234 + SSSSS => null LEGACY
+        if (!legacySpark) {
+          number *= std::pow(10, 9 - count) / 1000;
+        } else {
+          number *= 1000;
+        }
       } else {
-        number *= 1000;
+        number *= std::pow(10, 3 - count);
       }
-#else
-      number *= std::pow(10, 3 - count);
-#endif
     } else if (
         (curPattern.specifier == DateTimeFormatSpecifier::YEAR ||
          curPattern.specifier == DateTimeFormatSpecifier::YEAR_OF_ERA ||
@@ -814,10 +883,38 @@ ErrorCode parseFromPattern(
         }
       }
     } else {
-      while (cur < end && cur < startPos + maxDigitConsume &&
-             characterIsDigit(*cur)) {
-        number = number * 10 + (*cur - '0');
-        ++cur;
+      if (legacySpark && !specifierNext &&
+          (curPattern.specifier == DateTimeFormatSpecifier::DAY_OF_MONTH ||
+           curPattern.specifier == DateTimeFormatSpecifier::HOUR_OF_DAY ||
+           curPattern.specifier == DateTimeFormatSpecifier::MINUTE_OF_HOUR ||
+           curPattern.specifier == DateTimeFormatSpecifier::SECOND_OF_MINUTE)) {
+        // Spark LEGACY tolerance: for width-2 numeric fields followed by a
+        // literal, allow exactly one extra leading '0'. Consume 3 digits when
+        // present and use the last two digits as the value.
+        const char* p = cur;
+        int len = 0;
+        while (p < end && characterIsDigit(*p)) {
+          ++p;
+          ++len;
+        }
+        if (len == 1) {
+          number = cur[0] - '0';
+          cur += 1;
+        } else if (len == 2) {
+          number = (cur[0] - '0') * 10 + (cur[1] - '0');
+          cur += 2;
+        } else if (len == 3 && cur[0] == '0') {
+          number = (cur[1] - '0') * 10 + (cur[2] - '0');
+          cur += 3;
+        } else {
+          return ErrorCode::PARSE_DIGIT_ERROR;
+        }
+      } else {
+        while (cur < end && cur < startPos + maxDigitConsume &&
+               characterIsDigit(*cur)) {
+          number = number * 10 + (*cur - '0');
+          ++cur;
+        }
       }
     }
 
@@ -953,11 +1050,9 @@ ErrorCode parseFromPattern(
         break;
 
       case DateTimeFormatSpecifier::FRACTION_OF_SECOND:
-#ifdef SPARK_COMPATIBLE
-        date.microsecond = number;
-#else
-        date.microsecond = number * util::kMicrosPerMsec;
-#endif
+        date.microsecond = ::bytedance::bolt::kSparkCompatible
+            ? number
+            : number * util::kMicrosPerMsec;
         break;
 
       case DateTimeFormatSpecifier::WEEK_YEAR:
@@ -985,8 +1080,12 @@ ErrorCode parseFromPattern(
         }
         break;
 
-#ifdef SPARK_COMPATIBLE
       case DateTimeFormatSpecifier::WEEK_OF_MONTH:
+        if (!::bytedance::bolt::kSparkCompatible) {
+          BOLT_NYI(
+              "Numeric Joda specifier DateTimeFormatSpecifier::" +
+              getSpecifierName(curPattern.specifier) + " not implemented yet.");
+        }
         if (number < 1 || number > 5) {
           return ErrorCode::WEEK_OUT_OF_RANGE;
         }
@@ -996,6 +1095,11 @@ ErrorCode parseFromPattern(
         break;
 
       case DateTimeFormatSpecifier::DAY_OF_WEEK_IN_MONTH:
+        if (!::bytedance::bolt::kSparkCompatible) {
+          BOLT_NYI(
+              "Numeric Joda specifier DateTimeFormatSpecifier::" +
+              getSpecifierName(curPattern.specifier) + " not implemented yet.");
+        }
         if (number < 1 || number > 5) {
           return ErrorCode::WEEK_OUT_OF_RANGE;
         }
@@ -1003,7 +1107,6 @@ ErrorCode parseFromPattern(
         date.weekDateFormat = true;
         date.dayOfYearFormat = false;
         break;
-#endif
 
       case DateTimeFormatSpecifier::DAY_OF_WEEK_1_BASED:
         if (number < 1 || number > 7) {
@@ -1036,6 +1139,11 @@ uint32_t DateTimeFormatter::maxResultSize(const tz::TimeZone* timezone) const {
       size += token.literal.size();
       continue;
     }
+    if (!::bytedance::bolt::kSparkCompatible &&
+        isSparkOnlyFormatSpecifier(token.pattern.specifier)) {
+      BOLT_UNSUPPORTED(
+          "format is not supported for specifier {}", token.pattern.specifier);
+    }
     switch (token.pattern.specifier) {
       case DateTimeFormatSpecifier::ERA:
       case DateTimeFormatSpecifier::HALFDAY_OF_DAY:
@@ -1043,8 +1151,9 @@ uint32_t DateTimeFormatter::maxResultSize(const tz::TimeZone* timezone) const {
         size += 2;
         break;
       case DateTimeFormatSpecifier::YEAR_OF_ERA:
-        // Timestamp is in [-32767-01-01, 32767-12-31] range.
-        size += std::max((int)token.pattern.minRepresentDigits, 6);
+        // Timestamp covers years up to +/-292278994 (9 digits), plus one
+        // char for a leading sign.
+        size += std::max((int)token.pattern.minRepresentDigits, 9) + 1;
         break;
       case DateTimeFormatSpecifier::DAY_OF_WEEK_0_BASED:
       case DateTimeFormatSpecifier::DAY_OF_WEEK_1_BASED:
@@ -1055,16 +1164,19 @@ uint32_t DateTimeFormatter::maxResultSize(const tz::TimeZone* timezone) const {
         // 9 is the max size of elements in weekdaysFull or monthsFull.
         size += token.pattern.minRepresentDigits <= 3 ? 3 : 9;
         break;
-      case DateTimeFormatSpecifier::YEAR:
-#ifdef SPARK_COMPATIBLE
       case DateTimeFormatSpecifier::WEEK_YEAR:
-#endif
-        // Timestamp is in [-32767-01-01, 32767-12-31] range.
+        [[fallthrough]];
+      case DateTimeFormatSpecifier::YEAR:
+        // Timestamp covers years up to +/-292278994 (9 digits), plus one
+        // char for a leading sign.
         size += token.pattern.minRepresentDigits == 2
             ? 2
-            : std::max((int)token.pattern.minRepresentDigits, 6);
+            : std::max((int)token.pattern.minRepresentDigits, 9) + 1;
         break;
       case DateTimeFormatSpecifier::CENTURY_OF_ERA:
+        // Century of +/-292278994 has up to 7 digits.
+        size += std::max((int)token.pattern.minRepresentDigits, 7);
+        break;
       case DateTimeFormatSpecifier::DAY_OF_YEAR:
         size += std::max((int)token.pattern.minRepresentDigits, 3);
         break;
@@ -1076,11 +1188,9 @@ uint32_t DateTimeFormatter::maxResultSize(const tz::TimeZone* timezone) const {
       case DateTimeFormatSpecifier::CLOCK_HOUR_OF_DAY:
       case DateTimeFormatSpecifier::MINUTE_OF_HOUR:
       case DateTimeFormatSpecifier::SECOND_OF_MINUTE:
-#ifdef SPARK_COMPATIBLE
       case DateTimeFormatSpecifier::WEEK_OF_MONTH:
       case DateTimeFormatSpecifier::DAY_OF_WEEK_IN_MONTH:
       case DateTimeFormatSpecifier::WEEK_OF_WEEK_YEAR:
-#endif
         size += std::max((int)token.pattern.minRepresentDigits, 2);
         break;
       case DateTimeFormatSpecifier::FRACTION_OF_SECOND:
@@ -1128,10 +1238,15 @@ int32_t DateTimeFormatter::format(
     char* result,
     bool allowOverflow,
     TimePolicy timePolicy,
-    bool isPrecision) const {
+    bool isPrecision,
+    const std::optional<std::string>& zeroOffsetText) const {
   Timestamp t = timestamp;
+  int64_t offset = 0;
   if (timezone != nullptr) {
+    const auto utcSeconds = timestamp.getSeconds();
     t.toTimezone(*timezone);
+
+    offset = t.getSeconds() - utcSeconds;
   }
   const auto civilDateTime =
       util::toCivilDateTime(t, allowOverflow, isPrecision);
@@ -1140,12 +1255,10 @@ int32_t DateTimeFormatter::format(
   const auto weekdayNum = civilDateTime.weekday;
   const auto dayOfYear = civilDateTime.dayOfYear;
   const auto daysSinceEpoch = civilDateTime.daysSinceEpoch;
-#ifdef SPARK_COMPATIBLE
   auto weekdayFromDays = [](int64_t daysSinceEpochInput) {
     auto weekday = static_cast<int32_t>((daysSinceEpochInput + 4) % 7);
     return weekday < 0 ? weekday + 7 : weekday;
   };
-#endif
 
   const char* resultStart = result;
   char* maxResultEnd = result + maxResultSize;
@@ -1154,6 +1267,12 @@ int32_t DateTimeFormatter::format(
       std::memcpy(result, token.literal.data(), token.literal.size());
       result += token.literal.size();
     } else {
+      if (!::bytedance::bolt::kSparkCompatible &&
+          isSparkOnlyFormatSpecifier(token.pattern.specifier)) {
+        BOLT_UNSUPPORTED(
+            "format is not supported for specifier {}",
+            token.pattern.specifier);
+      }
       switch (token.pattern.specifier) {
         case DateTimeFormatSpecifier::ERA: {
           const std::string_view piece = calDate.year > 0 ? "AD" : "BC";
@@ -1179,12 +1298,18 @@ int32_t DateTimeFormatter::format(
                 padContent(std::abs(year) % 100, '0', 2, maxResultEnd, result);
           } else {
             year = year <= 0 ? std::abs(year - 1) : year;
-#ifdef SPARK_COMPATIBLE
-            // spark compatibility: year should contain sign if > 9999
-            if (year > 9999 && token.pattern.minRepresentDigits >= 4) {
+            // spark compatibility: Java DateTimeFormatter uses
+            // SignStyle.EXCEEDS_PAD for 4+ pattern letters, printing '+'
+            // when the year has more digits than the pattern width; legacy
+            // SimpleDateFormat never prints '+'. Like Java, the decision is
+            // based on the local (timezone-adjusted) year only.
+            bool addPlus = ::bytedance::bolt::kSparkCompatible &&
+                timePolicy != TimePolicy::LEGACY &&
+                token.pattern.minRepresentDigits >= 4 && year > 0 &&
+                countDigits(year) > token.pattern.minRepresentDigits;
+            if (addPlus) {
               *result++ = '+';
             }
-#endif
             result += padContent(
                 year,
                 '0',
@@ -1221,13 +1346,12 @@ int32_t DateTimeFormatter::format(
           result += piece.length();
         } break;
 
-#ifdef SPARK_COMPATIBLE
         case DateTimeFormatSpecifier::WEEK_YEAR:
-#endif
+          [[fallthrough]];
         case DateTimeFormatSpecifier::YEAR: {
           auto year = calDate.year;
-#ifdef SPARK_COMPATIBLE
-          if (token.pattern.specifier == DateTimeFormatSpecifier::WEEK_YEAR) {
+          if (::bytedance::bolt::kSparkCompatible &&
+              token.pattern.specifier == DateTimeFormatSpecifier::WEEK_YEAR) {
             BOLT_USER_CHECK_EQ(
                 timePolicy,
                 TimePolicy::LEGACY,
@@ -1242,12 +1366,13 @@ int32_t DateTimeFormatter::format(
             }
             year = weekYear;
           }
-          if (year < 0 && (hasEra_ || timePolicy == TimePolicy::LEGACY)) {
-            // for spark compatibility, year should be positive for LEGACY
-            // policy or has Era
+          if (::bytedance::bolt::kSparkCompatible && year <= 0 &&
+              (hasEra_ || timePolicy == TimePolicy::LEGACY)) {
+            // for spark compatibility, year should be the positive
+            // year-of-era for LEGACY policy or when the pattern has an Era:
+            // proleptic year 0 is 1 BC, -1 is 2 BC, etc.
             year = abs(year) + 1;
           }
-#endif
           if (token.pattern.minRepresentDigits == 2) {
             year = std::abs(year);
             auto twoDigitYear = year % 100;
@@ -1258,12 +1383,18 @@ int32_t DateTimeFormatter::format(
                 maxResultEnd,
                 result);
           } else {
-#ifdef SPARK_COMPATIBLE
-            // spark compatibility: year should contain sign if > 9999
-            if (year > 9999 && token.pattern.minRepresentDigits >= 4) {
+            // spark compatibility: Java DateTimeFormatter uses
+            // SignStyle.EXCEEDS_PAD for 4+ pattern letters, printing '+'
+            // when the year has more digits than the pattern width; legacy
+            // SimpleDateFormat never prints '+'. Like Java, the decision is
+            // based on the local (timezone-adjusted) year only.
+            bool addPlus = ::bytedance::bolt::kSparkCompatible &&
+                timePolicy != TimePolicy::LEGACY &&
+                token.pattern.minRepresentDigits >= 4 && year > 0 &&
+                countDigits(year) > token.pattern.minRepresentDigits;
+            if (addPlus) {
               *result++ = '+';
             }
-#endif
             result += padContent(
                 year,
                 '0',
@@ -1273,7 +1404,6 @@ int32_t DateTimeFormatter::format(
           }
         } break;
 
-#ifdef SPARK_COMPATIBLE
         case DateTimeFormatSpecifier::WEEK_OF_WEEK_YEAR: {
           // Calculate week of week year based on Java SimpleDateFormat
 
@@ -1309,7 +1439,8 @@ int32_t DateTimeFormatter::format(
         case DateTimeFormatSpecifier::WEEK_OF_MONTH: {
           // Calculate week of month based on Java SimpleDateFormat
 
-          // like WEEK_OF_WEEK_YEAR, but calculate from the first day of month
+          // like WEEK_OF_WEEK_YEAR, but calculate from the first day of
+          // month
           auto firstDayOfMonth =
               util::daysSinceEpochFromDate(calDate.year, calDate.month, 1);
 
@@ -1334,8 +1465,8 @@ int32_t DateTimeFormatter::format(
         case DateTimeFormatSpecifier::DAY_OF_WEEK_IN_MONTH: {
           // Calculate day of week in month based on Java SimpleDateFormat
 
-          // like WEEK_OF_MONTH, but calculates which occurrence of this weekday
-          // in the month
+          // like WEEK_OF_MONTH, but calculates which occurrence of this
+          // weekday in the month
           auto currentDayOfWeek = weekdayNum; // 0=Sunday, 6=Saturday
           auto dayOfMonth = calDate.day;
 
@@ -1343,8 +1474,8 @@ int32_t DateTimeFormatter::format(
               util::daysSinceEpochFromDate(calDate.year, calDate.month, 1);
           auto firstDayOfMonthWeekday = weekdayFromDays(firstDayOfMonth);
 
-          // Calculate the first occurrence of the current day of week in the
-          // month
+          // Calculate the first occurrence of the current day of week in
+          // the month
           int firstOccurrence =
               (currentDayOfWeek - firstDayOfMonthWeekday + 7) % 7 + 1;
 
@@ -1358,7 +1489,6 @@ int32_t DateTimeFormatter::format(
               maxResultEnd,
               result);
         } break;
-#endif
 
         case DateTimeFormatSpecifier::DAY_OF_YEAR: {
           result += padContent(
@@ -1469,9 +1599,41 @@ int32_t DateTimeFormatter::format(
           result += piece.length();
         } break;
 
-        case DateTimeFormatSpecifier::TIMEZONE_OFFSET_ID:
-          // TODO: implement timezone offset id formatting, need a map from full
-          // name to offset time
+        case DateTimeFormatSpecifier::TIMEZONE_OFFSET_ID: {
+          // Zone: 'Z' outputs offset without a colon, 'ZZ' outputs the offset
+          // with a colon, 'ZZZ' or more outputs the zone id.
+          if (offset == 0 && zeroOffsetText.has_value()) {
+            std::memcpy(result, zeroOffsetText->data(), zeroOffsetText->size());
+            result += zeroOffsetText->size();
+            break;
+          }
+
+          if (timezone == nullptr) {
+            BOLT_USER_FAIL("Timezone unknown");
+          }
+
+          if (token.pattern.minRepresentDigits >= 3) {
+            // Append the time zone ID.
+            const auto& piece = timezone->name();
+
+            static const auto& timeZoneLinks = tz::getTimeZoneLinks();
+            auto timeZoneLinksIter = timeZoneLinks.find(piece);
+            if (timeZoneLinksIter != timeZoneLinks.end()) {
+              const auto& timeZoneLink = timeZoneLinksIter->second;
+              std::memcpy(result, timeZoneLink.data(), timeZoneLink.length());
+              result += timeZoneLink.length();
+              break;
+            }
+
+            std::memcpy(result, piece.data(), piece.length());
+            result += piece.length();
+            break;
+          }
+
+          result += appendTimezoneOffset(
+              offset, result, token.pattern.minRepresentDigits == 2);
+          break;
+        }
         default:
           BOLT_UNSUPPORTED(
               "format is not supported for specifier {}",
@@ -1581,13 +1743,31 @@ DateTimeResult DateTimeFormatter::parse(
     auto& tok = tokens_[i];
     switch (tok.type) {
       case DateTimeToken::Type::kLiteral:
-        if (tok.literal.size() > end - cur ||
-            std::memcmp(cur, tok.literal.data(), tok.literal.size()) != 0) {
-          return DateTimeResult::ErrorCode::PARSE_LITERAL_ERROR;
+        if (tok.literal.size() == 1 && tok.literal[0] == ' ' && isLegacy) {
+          // Spark LEGACY: tolerate multiple spaces where a single space is
+          // specified. Require at least one space to be present.
+          if (cur >= end || *cur != ' ') {
+            return DateTimeResult::ErrorCode::PARSE_LITERAL_ERROR;
+          }
+          while (cur < end && *cur == ' ') {
+            ++cur;
+          }
+        } else {
+          if (tok.literal.size() > end - cur ||
+              std::memcmp(cur, tok.literal.data(), tok.literal.size()) != 0) {
+            return DateTimeResult::ErrorCode::PARSE_LITERAL_ERROR;
+          }
+          cur += tok.literal.size();
         }
-        cur += tok.literal.size();
         break;
       case DateTimeToken::Type::kPattern:
+        // Spark LEGACY: skip leading whitespace before numeric tokens
+        if (isLegacy) {
+          // Tolerate multiple spaces only; tabs are not accepted.
+          while (cur < end && (*cur == ' ')) {
+            ++cur;
+          }
+        }
         if (i + 1 < tokens_.size() &&
             tokens_[i + 1].type == DateTimeToken::Type::kPattern) {
           auto errorCode = parseFromPattern(
@@ -1988,11 +2168,9 @@ std::shared_ptr<DateTimeFormatter> buildJodaDateTimeFormatter(
           builder.appendDayOfMonth(count);
           break;
         case 'a':
-#ifdef SPARK_COMPATIBLE
-          if (count > 1) {
+          if (::bytedance::bolt::kSparkCompatible && count > 1) {
             BOLT_USER_FAIL("The am-pm-of-day pattern letter count must be 1.");
           }
-#endif
           builder.appendHalfDayOfDay();
           break;
         case 'K':
@@ -2022,10 +2200,12 @@ std::shared_ptr<DateTimeFormatter> buildJodaDateTimeFormatter(
         case 'z':
           builder.appendTimeZone(count);
           break;
-        case 'Z':
-#ifdef SPARK_COMPATIBLE
         case 'X':
-#endif
+          if (!::bytedance::bolt::kSparkCompatible) {
+            BOLT_UNSUPPORTED("Specifier X is not supported.");
+          }
+          [[fallthrough]];
+        case 'Z':
           builder.appendTimeZoneOffsetId(count);
           break;
         default:
@@ -2233,11 +2413,9 @@ std::shared_ptr<DateTimeFormatter> buildLegacySparkDateTimeFormatter(
           builder.appendDayOfMonth(count);
           break;
         case 'a':
-#ifdef SPARK_COMPATIBLE
-          if (count > 1) {
+          if (::bytedance::bolt::kSparkCompatible && count > 1) {
             BOLT_USER_FAIL("The am-pm-of-day pattern letter count must be 1.");
           }
-#endif
           builder.appendHalfDayOfDay();
           break;
         case 'K':
@@ -2273,10 +2451,12 @@ std::shared_ptr<DateTimeFormatter> buildLegacySparkDateTimeFormatter(
         case 'z':
           builder.appendTimeZone(count);
           break;
-        case 'Z':
-#ifdef SPARK_COMPATIBLE
         case 'X':
-#endif
+          if (!::bytedance::bolt::kSparkCompatible) {
+            BOLT_UNSUPPORTED("Specifier X is not supported.");
+          }
+          [[fallthrough]];
+        case 'Z':
           builder.appendTimeZoneOffsetId(count);
           break;
         default:

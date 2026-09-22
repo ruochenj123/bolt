@@ -30,6 +30,7 @@
 
 #include "bolt/exec/OperatorUtils.h"
 #include <gtest/gtest.h>
+#include <array>
 #include "bolt/dwio/common/tests/utils/BatchMaker.h"
 #include "bolt/exec/Operator.h"
 #include "bolt/exec/tests/utils/OperatorTestBase.h"
@@ -455,6 +456,109 @@ TEST_F(OperatorUtilsTest, projectChildren) {
           srcRowVector->childAt(projection.inputChannel).get());
     }
   }
+}
+
+TEST_F(OperatorUtilsTest, projectDuplicateChildren) {
+  // Test wrapping an unloaded lazy vector in dictionary vector multiple
+  // times.
+  auto flatVector = makeNullableFlatVector<int64_t>(
+      std::vector<std::optional<int64_t>>{1, std::nullopt, 3, 4, 5});
+  const auto size = flatVector->size();
+
+  auto lazyVector = std::make_shared<LazyVector>(
+      pool(),
+      BIGINT(),
+      size,
+      std::make_unique<SimpleVectorLoader>([&](RowSet /*rows*/) {
+        return makeFlatVector<int64_t>(
+            size,
+            [&](vector_size_t row) { return flatVector->valueAt(row); },
+            [&](vector_size_t row) { return flatVector->isNullAt(row); });
+      }));
+
+  std::vector<VectorPtr> children = {lazyVector};
+  auto rowVector = makeRowVector(std::move(children));
+
+  std::vector<IdentityProjection> identityProjections;
+  identityProjections.emplace_back(0, 0);
+  identityProjections.emplace_back(0, 1);
+
+  auto mapping = makeIndices(size, [](auto row) { return row % 3; });
+
+  std::vector<VectorPtr> projectedChildren(2);
+  projectChildren(
+      projectedChildren, rowVector, identityProjections, size, mapping);
+
+  for (const auto& projection : identityProjections) {
+    auto* result = projectedChildren[projection.outputChannel].get();
+    result->loadedVector();
+    auto* source = rowVector->childAt(projection.inputChannel).get();
+    for (auto i = 0; i < size; ++i) {
+      auto srcIndex = mapping->as<vector_size_t>()[i];
+      if (result->isNullAt(i)) {
+        ASSERT_TRUE(source->isNullAt(srcIndex));
+      } else {
+        ASSERT_TRUE(result->equalValueAt(source, i, srcIndex));
+      }
+    }
+  }
+}
+
+TEST_F(OperatorUtilsTest, projectDictionaryOverLazyKeepsExistingLazyWrapper) {
+  auto flatVector =
+      makeFlatVector<int64_t>(5, [](vector_size_t row) { return 10 + row; });
+  const auto size = flatVector->size();
+  auto lazyVector = makeLazyFlatVector<int64_t>(
+      size,
+      [&](vector_size_t row) { return flatVector->valueAt(row); },
+      [](vector_size_t /*row*/) { return false; },
+      3,
+      [](vector_size_t index) {
+        static constexpr std::array<vector_size_t, 3> kExpectedRows{1, 3, 4};
+        return kExpectedRows[index];
+      });
+
+  auto innerMapping = makeIndices(size, [](vector_size_t row) {
+    return static_cast<vector_size_t>(4 - row);
+  });
+  auto dictionaryOverLazy =
+      BaseVector::wrapInDictionary(nullptr, innerMapping, size, lazyVector);
+  ASSERT_TRUE(lazyVector->containingLazyAndWrapped());
+  auto rowVector = makeRowVector({dictionaryOverLazy});
+
+  auto outerMapping = makeIndices(size, [](vector_size_t row) {
+    return static_cast<vector_size_t>((row + 1) % 5);
+  });
+  std::vector<VectorPtr> projectedChildren(1);
+  projectChildren(
+      projectedChildren,
+      rowVector,
+      std::vector<IdentityProjection>{{0, 0}},
+      size,
+      outerMapping);
+
+  ASSERT_EQ(
+      projectedChildren[0]->encoding(), VectorEncoding::Simple::DICTIONARY);
+  ASSERT_EQ(
+      projectedChildren[0]->valueVector().get(), dictionaryOverLazy.get());
+  ASSERT_TRUE(lazyVector->containingLazyAndWrapped());
+  ASSERT_TRUE(isLazyNotLoaded(*dictionaryOverLazy));
+
+  SelectivityVector rows(size, false);
+  rows.setValid(0, true);
+  rows.setValid(2, true);
+  rows.setValid(4, true);
+  rows.updateBounds();
+  LazyVector::ensureLoadedRows(projectedChildren[0], rows);
+  ASSERT_TRUE(lazyVector->isLoaded());
+
+  auto expected = makeFlatVector<int64_t>(size, [&](vector_size_t row) {
+    auto outer = outerMapping->as<vector_size_t>()[row];
+    auto inner = innerMapping->as<vector_size_t>()[outer];
+    return flatVector->valueAt(inner);
+  });
+  bytedance::bolt::test::assertEqualVectors(
+      expected, projectedChildren[0], rows);
 }
 
 TEST_F(OperatorUtilsTest, reclaimableSectionGuard) {

@@ -33,11 +33,7 @@
 #include "bolt/common/caching/AsyncDataCache.h"
 #include "bolt/common/caching/SsdFileTracker.h"
 #include "bolt/common/file/File.h"
-
-#include <gflags/gflags.h>
-
-DECLARE_bool(ssd_odirect);
-DECLARE_bool(ssd_verify_write);
+#include "bolt/common/flags/BoltFlags.h"
 namespace bytedance::bolt::cache {
 
 // A 64 bit word describing a SSD cache entry in an SsdFile. The low
@@ -335,7 +331,7 @@ class SsdFile {
   void checkpointError(int32_t rc, const std::string& error);
 
   // Looks for a checkpointed state and sets the state of 'this' by
-  // the checkpointed state iif the state is complete and
+  // the checkpointed state if the state is complete and
   // readable. Does not modify 'this' if the state is corrupt,
   // e.g. there was a crash during writing the checkpoint. Initializes
   // the files for making new checkpoints.

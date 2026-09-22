@@ -43,6 +43,99 @@
 namespace bytedance::bolt::shuffle::sparksql {
 class ByteBuffer;
 
+class ColumnBufferPool final {
+ public:
+  explicit ColumnBufferPool(arrow::MemoryPool* pool) : pool_(pool) {}
+
+  // Returns a resizable buffer whose logical size is `size` and whose capacity
+  // is at least `size + padding` (padding reserves SIMD over-read space,
+  // mirroring the non-pooled arrow::AllocateResizableBuffer path). Reuses a
+  // free buffer with sufficient capacity when available, otherwise allocates a
+  // new one and tracks it for future reuse.
+  arrow::Result<std::shared_ptr<arrow::ResizableBuffer>> allocate(
+      int64_t size,
+      int64_t padding) {
+    const int64_t capacity = size + padding;
+    if (freeList_.empty()) {
+      // Rebuild the set of solely-owned buffers. This is the only O(M) step and
+      // is amortized across a whole batch's worth of allocate() calls.
+      refillFreeList();
+    }
+    while (!freeList_.empty()) {
+      const size_t idx = freeList_.back();
+      auto& buffer = buffers_[idx];
+      // refillFreeList() only records buffers with use_count() == 1, and the
+      // pool is single-threaded, so a buffer stays solely-owned until we hand
+      // it out here.
+      if (buffer->capacity() >= capacity) {
+        // Fits within existing capacity: just adjust the logical size. Passing
+        // shrink_to_fit=false guarantees no reallocation happens here, and the
+        // [size, capacity) tail keeps at least `padding` bytes for SIMD.
+        auto status = buffer->Resize(size, /*shrink_to_fit=*/false);
+        if (!status.ok()) {
+          return status;
+        }
+        freeList_.pop_back();
+        return buffer;
+      }
+      // Capacity too small for this request; drop it from the free list for the
+      // current batch rather than reallocating, preserving the original
+      // no-realloc-on-reuse behavior.
+      freeList_.pop_back();
+    }
+    auto result = arrow::AllocateResizableBuffer(capacity, pool_);
+    if (!result.ok()) {
+      return result.status();
+    }
+    std::shared_ptr<arrow::ResizableBuffer> buffer =
+        std::move(result).ValueUnsafe();
+    if (padding > 0) {
+      auto status = buffer->Resize(size, /*shrink_to_fit=*/false);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    if (buffers_.size() < kMaxPooledBuffers) {
+      buffers_.push_back(buffer);
+    }
+    return buffer;
+  }
+
+  // Number of buffers currently tracked by the pool. Exposed for tests/metrics.
+  size_t numBuffers() const {
+    return buffers_.size();
+  }
+
+  // Drops all cached buffers and frees their memory back to `pool_`. Buffers
+  // that still escaped into a live payload or RowVector (use_count() > 1) stay
+  // alive until their last owner releases them. Call at close() to return
+  // memory eagerly instead of waiting for the pool's own destruction.
+  void release() {
+    buffers_.clear();
+    freeList_.clear();
+  }
+
+ private:
+  // Recomputes freeList_ as the indices of buffers currently owned only by the
+  // pool (use_count() == 1). Buffers still referenced elsewhere are skipped.
+  void refillFreeList() {
+    freeList_.clear();
+    freeList_.reserve(buffers_.size());
+    for (size_t i = 0; i < buffers_.size(); ++i) {
+      if (buffers_[i].use_count() == 1) {
+        freeList_.push_back(i);
+      }
+    }
+  }
+
+  std::vector<std::shared_ptr<arrow::ResizableBuffer>> buffers_;
+  static constexpr size_t kMaxPooledBuffers = 5000;
+  // Indices into buffers_ that are known to be solely owned by the pool and
+  // thus reusable. Refilled lazily by refillFreeList() when exhausted.
+  std::vector<size_t> freeList_;
+  arrow::MemoryPool* pool_;
+};
+
 class Payload {
  public:
   enum Type : uint8_t {
@@ -116,28 +209,30 @@ class BlockPayload : public Payload {
       std::vector<std::shared_ptr<arrow::Buffer>> buffers,
       const std::vector<bool>* isValidityBuffer,
       arrow::MemoryPool* pool,
-      arrow::util::Codec* codec,
+      Codec* codec,
       Payload::Mode mode,
       bool hasComplexType);
 
   static arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>> deserialize(
       arrow::io::InputStream* inputStream,
       const std::shared_ptr<arrow::Schema>& schema,
-      const std::shared_ptr<arrow::util::Codec>& codec,
+      const std::shared_ptr<Codec>& codec,
       arrow::MemoryPool* pool,
       uint32_t& numRows,
       uint64_t& decompressTime,
       std::optional<uint8_t>& payloadType,
-      ByteBuffer* readAheadBuffer);
+      ByteBuffer* readAheadBuffer,
+      ColumnBufferPool* bufferPool = nullptr);
 
   static arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>>
   deserializeRowVectorModeBuffers(
       arrow::io::InputStream* inputStream,
-      const std::shared_ptr<arrow::util::Codec>& codec,
+      const std::shared_ptr<Codec>& codec,
       arrow::MemoryPool* pool,
       uint32_t& numRows,
       uint64_t& decompressTime,
-      ByteBuffer** readAheadBuffer);
+      ByteBuffer** readAheadBuffer,
+      ColumnBufferPool* bufferPool = nullptr);
 
   arrow::Status serialize(arrow::io::OutputStream* outputStream) override;
 
@@ -147,7 +242,7 @@ class BlockPayload : public Payload {
   static void concatBuffer(
       std::vector<std::shared_ptr<arrow::Buffer>>& buffers,
       arrow::MemoryPool* pool,
-      arrow::util::Codec* codec,
+      Codec* codec,
       Payload::Mode& mode,
       bool hasComplexType);
 
@@ -163,7 +258,7 @@ class BlockPayload : public Payload {
       std::vector<std::shared_ptr<arrow::Buffer>> buffers,
       const std::vector<bool>* isValidityBuffer,
       arrow::MemoryPool* pool,
-      arrow::util::Codec* codec,
+      Codec* codec,
       Payload::Mode mode = Payload::Mode::kBuffer)
       : Payload(type, numRows, isValidityBuffer, mode),
         buffers_(std::move(buffers)),
@@ -174,7 +269,7 @@ class BlockPayload : public Payload {
 
   std::vector<std::shared_ptr<arrow::Buffer>> buffers_;
   arrow::MemoryPool* pool_;
-  arrow::util::Codec* codec_;
+  Codec* codec_;
 };
 
 class InMemoryPayload final : public Payload {
@@ -196,17 +291,22 @@ class InMemoryPayload final : public Payload {
       std::unique_ptr<InMemoryPayload> append,
       arrow::MemoryPool* pool,
       int64_t rowvectorModeCompressionMinColumns,
-      int64_t rowvectorModeCompressionMaxBufferSize);
+      int64_t rowvectorModeCompressionMaxBufferSize,
+      bool sourceBuffersResizable = false);
 
   arrow::Status serialize(arrow::io::OutputStream* outputStream) override;
 
   arrow::Result<std::shared_ptr<arrow::Buffer>> readBufferAt(
       uint32_t index) override;
 
+  int64_t bufferSizeAt(uint32_t index) const {
+    return buffers_[index] ? buffers_[index]->size() : 0;
+  }
+
   arrow::Result<std::unique_ptr<BlockPayload>> toBlockPayload(
       Payload::Type payloadType,
       arrow::MemoryPool* pool,
-      arrow::util::Codec* codec,
+      Codec* codec,
       bool hasComplexType);
 
   int64_t getBufferSize() const;
@@ -226,7 +326,7 @@ class UncompressedDiskBlockPayload : public Payload {
       arrow::io::InputStream*& inputStream,
       uint64_t rawSize,
       arrow::MemoryPool* pool,
-      arrow::util::Codec* codec);
+      Codec* codec);
 
   arrow::Result<std::shared_ptr<arrow::Buffer>> readBufferAt(
       uint32_t index) override;
@@ -237,7 +337,7 @@ class UncompressedDiskBlockPayload : public Payload {
   arrow::io::InputStream*& inputStream_;
   uint64_t rawSize_;
   arrow::MemoryPool* pool_;
-  arrow::util::Codec* codec_;
+  Codec* codec_;
   uint32_t readPos_{0};
 
   arrow::Result<std::shared_ptr<arrow::Buffer>> readUncompressedBuffer();
@@ -271,7 +371,7 @@ class RowBlockPayload : public Payload {
       uint8_t* dst,
       int32_t dstSize,
       int32_t& offset,
-      ZstdStreamCodec* codec,
+      AdaptiveParallelZstdCodec* codec,
       std::vector<std::string_view>& outputRows,
       int32_t& outputLen,
       bool& eof,
@@ -288,7 +388,7 @@ class RowBlockPayload : public Payload {
       folly::Range<uint8_t**> rows,
       const int64_t rawSize,
       arrow::MemoryPool* pool,
-      ZstdStreamCodec* codec,
+      AdaptiveParallelZstdCodec* codec,
       RowVectorLayout layout = RowVectorLayout::kColumnar)
       : Payload(kCompressed, rows.size(), nullptr, kUnsafeRow),
         rows_(rows),
@@ -300,7 +400,7 @@ class RowBlockPayload : public Payload {
  private:
   folly::Range<uint8_t**> rows_;
   arrow::MemoryPool* pool_;
-  ZstdStreamCodec* codec_;
+  AdaptiveParallelZstdCodec* codec_;
   // Caution: rawSize_ is not accuracy for rss
   const int64_t rawSize_{0};
   const RowVectorLayout layout_{RowVectorLayout::kColumnar};

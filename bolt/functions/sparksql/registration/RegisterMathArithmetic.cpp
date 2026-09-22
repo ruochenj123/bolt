@@ -54,5 +54,11 @@ void registerMathArithmeticFunctions(const std::string& prefix) {
 
   // Power function
   registerFunction<PowerFunction, double, double, double>({prefix + "power"});
+
+  // Checked arithmetic functions
+  registerBinaryNumeric<CheckedAddFunction>({prefix + "checked_add"});
+  registerBinaryNumeric<CheckedSubtractFunction>({prefix + "checked_subtract"});
+  registerBinaryNumeric<CheckedMultiplyFunction>({prefix + "checked_multiply"});
+  registerBinaryNumeric<CheckedDivideFunction>({prefix + "checked_divide"});
 }
 } // namespace bytedance::bolt::functions::sparksql

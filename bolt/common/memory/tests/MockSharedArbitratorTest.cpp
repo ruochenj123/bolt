@@ -35,6 +35,7 @@
 #include <re2/re2.h>
 
 #include "bolt/common/base/tests/GTestUtils.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/memory/MallocAllocator.h"
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/MemoryArbitrator.h"
@@ -45,9 +46,6 @@
 #include "bolt/exec/tests/utils/PlanBuilder.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 #include "folly/experimental/EventCount.h"
-
-DECLARE_bool(bolt_memory_leak_check_enabled);
-DECLARE_bool(bolt_suppress_memory_capacity_exceeding_error_message);
 
 using namespace ::testing;
 using namespace bytedance::bolt::common::testutil;
@@ -444,7 +442,7 @@ class MockSharedArbitrationTest : public testing::Test {
   static void SetUpTestCase() {
     SharedArbitrator::registerFactory();
     FLAGS_bolt_memory_leak_check_enabled = true;
-    TestValue::enable();
+    BOLT_TEST_VALUE_ENABLE();
   }
 
   /*  static void TearDownTestCase() {
@@ -961,7 +959,7 @@ TEST_F(MockSharedArbitrationTest, asyncArbitrationWork) {
   std::atomic_int reclaimedCount{0};
   std::shared_ptr<MockTask> task = addTask(poolCapacity);
   MockMemoryOperator* memoryOp = addMemoryOp(
-      task, true, [&](MemoryPool* pool, uint64_t /*unsed*/) -> bool {
+      task, true, [&](MemoryPool* pool, uint64_t /*unused*/) -> bool {
         struct Result {
           bool succeeded{true};
 
@@ -984,7 +982,7 @@ TEST_F(MockSharedArbitrationTest, asyncArbitrationWork) {
   ASSERT_EQ(reclaimedCount, 1);
 }
 
-// Test different kinds of arbitraton failures.
+// Test different kinds of arbitration failures.
 TEST_F(MockSharedArbitrationTest, arbitrationFailures) {
   // Local arbitration failure with exceeded capacity limit.
   {
@@ -1510,7 +1508,7 @@ DEBUG_ONLY_TEST_F(MockSharedArbitrationTest, localArbitrationsFromSameQuery) {
   ASSERT_EQ(allocationCount, 2);
 }
 
-// This test verifies arbitration operations from different queris can run in
+// This test verifies arbitration operations from different queries can run in
 // parallel.
 DEBUG_ONLY_TEST_F(
     MockSharedArbitrationTest,
@@ -1594,7 +1592,7 @@ DEBUG_ONLY_TEST_F(
 TEST_F(MockSharedArbitrationTest, badNonReclaimableQuery) {
   const int64_t memoryCapacity = 256 << 20;
   const ReclaimInjectionCallback badReclaimInjectCallback =
-      [&](MemoryPool* pool, uint64_t /*unsed*/) -> bool { return false; };
+      [&](MemoryPool* pool, uint64_t /*unused*/) -> bool { return false; };
 
   struct TestTask {
     bool reclaimable;
@@ -1934,7 +1932,7 @@ DEBUG_ONLY_TEST_F(
   ASSERT_EQ(runtimeStats[SharedArbitrator::kLocalArbitrationCount].sum, 1);
 
   // Global arbitration thread may still be running in the background,
-  // triggerring ASAN failure. Wait until it exits.
+  // triggering ASAN failure. Wait until it exits.
   test::SharedArbitratorTestHelper arbitratorHelper(arbitrator_);
   arbitratorHelper.waitForGlobalArbitrationToFinish();
 }
@@ -2058,7 +2056,7 @@ TEST_F(MockSharedArbitrationTest, globalArbitrationSmallParticipantLargeGrow) {
   setupMemory(
       {.memoryCapacity = kMemoryCapacity,
        .memoryPoolInitCapacity = kMemoryPoolInitCapacity,
-       // Set abort capacity limit to differenciate capacity.
+       // Set abort capacity limit to differentiate capacity.
        .memoryPoolAbortCapacityLimit = kMemoryCapacity,
        .globalArbitrationWithoutSpill = true});
 
@@ -2217,7 +2215,7 @@ TEST_F(MockSharedArbitrationTest, globalArbitrationByAbortWithPriority) {
   setupMemory(
       {.memoryCapacity = memoryCapacity,
        .memoryPoolInitCapacity = memoryPoolInitCapacity,
-       // Set abort capacity limit to differenciate capacity.
+       // Set abort capacity limit to differentiate capacity.
        .memoryPoolAbortCapacityLimit = memoryCapacity,
        .globalArbitrationWithoutSpill = true});
 
@@ -2793,8 +2791,8 @@ DEBUG_ONLY_TEST_F(MockSharedArbitrationTest, arbitrationAbort) {
   int64_t memoryCapacity = 256 * MB;
   setupMemory({.memoryCapacity = memoryCapacity});
   std::shared_ptr<MockTask> task1 = addTask(memoryCapacity);
-  auto* op1 =
-      task1->addMemoryOp(true, [&](MemoryPool* /*unsed*/, uint64_t /*unsed*/) {
+  auto* op1 = task1->addMemoryOp(
+      true, [&](MemoryPool* /*unused*/, uint64_t /*unused*/) {
         BOLT_FAIL("throw reclaim exception");
         return false;
       });
@@ -4142,7 +4140,7 @@ TEST_F(MockSharedArbitrationTest, memoryReclaimeFailureTriggeredAbort) {
   }
   std::shared_ptr<MockTask> largeTask = addTask();
   MockMemoryOperator* largeTaskOp = addMemoryOp(
-      largeTask, true, [&](MemoryPool* /*unsed*/, uint64_t /*unsed*/) {
+      largeTask, true, [&](MemoryPool* /*unused*/, uint64_t /*unused*/) {
         BOLT_FAIL("throw reclaim exception");
         return false;
       });
@@ -4228,11 +4226,12 @@ DEBUG_ONLY_TEST_F(
   std::atomic_bool reclaimBlockFlag{true};
   SCOPED_TESTVALUE_SET(
       "bytedance::bolt::memory::SharedArbitrator::sortAndGroupSpillCandidates",
-      std::function<void(const MemoryPool*)>(([&](const MemoryPool* /*unsed*/) {
-        reclaimWaitFlag = false;
-        reclaimWait.notifyAll();
-        reclaimBlock.await([&]() { return !reclaimBlockFlag.load(); });
-      })));
+      std::function<void(const MemoryPool*)>(
+          ([&](const MemoryPool* /*unused*/) {
+            reclaimWaitFlag = false;
+            reclaimWait.notifyAll();
+            reclaimBlock.await([&]() { return !reclaimBlockFlag.load(); });
+          })));
 
   const auto oldStats = arbitrator_->stats();
 

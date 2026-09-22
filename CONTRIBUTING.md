@@ -40,37 +40,66 @@ If you're a first-time contributor, we recommend starting with issues labeled "g
 
 ## Development Environment Setup
 
-Bolt uses Conan for dependency management and a Makefile to drive its build and test processes. Follow these steps to set up your environment.
+Bolt uses **Conan 2** for dependency management and a Makefile to drive its build and test processes. You can set up the environment automatically using our helper script, or configure it manually if you prefer granular control over your toolchain.
 
 ### Prerequisites
 
-- **OS**: Linux (Ubuntu 20.04+, CentOS 7+). macOS is currently experimental.
+- **OS**: Linux (Ubuntu 20.04+, CentOS 7+) or macOS (Experimental).
 
-- **Compiler**: GCC 10+ or Clang 12+ (C++17 support required).
+- **Compiler**: GCC 10+ or Clang 16+ (Must support C++17).
+- **Build Tools**: CMake 3.25+, Ninja.
+- **Dependency Manager**: Conan 2.0+.
 
-- **Build Tools**: CMake 3.20+, Ninja.
+### Setup Options
 
-- **Dependency Manager**: Conan 2.
+#### Option 1: Automatic Setup (Recommended)
 
-
-### One-Click Script (Recommended)
-
-Run the following script to check your compiler, install Conan, configure its profile, and import dependency recipes into your local cache:
+Run the helper script to bootstrap your development environment:
 
 ```Bash
 scripts/setup-dev-env.sh
 ```
+**⚠️ Important: What this script does** This script is "opinionated" and performs the following actions. Please review them to ensure they fit your workflow:
 
-This script will:
+1. **Python Environment (Miniconda)**:
+   - Checks for `~/miniconda3`.
+   - **If missing**: Automatically downloads and installs Miniconda locally.
+   - **Shell Modification**: Appends the Miniconda path to your shell configuration file (`~/.bashrc` or `~/.zshrc`).
+   - Installs Python dependencies (including `conan`) into this environment.
+2. **Conan Configuration**:
+   - Sets the C++ standard to `gnu17` in the default Conan profile.
+   - **Clones & Patches Recipes**: Calls `install-bolt-deps.sh` to download a specific version of `conan-center-index` to `~/.conan2/conan-center-index` and applies Bolt-specific patches (required for `folly`, `arrow`, etc.).
+   - Configures local Conan remotes to prioritize these patched recipes.
+3. **Git Hooks**: Installs `pre-commit` hooks for automatic code formatting.
 
-- Check for a compatible compiler version (GCC 10/11/12 or Clang 16).
+#### Option 2: Manual Setup (For Advanced Users)
 
-- Install Conan and `pydot`, then create/adjust the default profile (setting the C++ standard to `gnu17` from `gnu14`).
+If you prefer to manage your own Python environment (e.g., via system packages, pyenv, or poetry) or use a specific compiler, you can skip the setup script. However, you **must** still configure the Conan dependencies manually.
 
-- Call `scripts/install-bolt-deps.sh` to export recipes for dependencies like folly, arrow, sonic-cpp, ryu, roaring, utf8proc, date, and llvm-core to your local Conan cache.
+1. **Install Python Dependencies**:
 
+   ```Bash
+   pip install -r requirements.txt
+   pre-commit install
+   ```
 
-**Note**: The first-time build will compile dependencies from source and cache them, which can be time-consuming. You can set up your own Conan remote to speed up builds.
+2. **Configure Conan Dependencies (Crucial)**: Bolt relies on patched versions of several libraries. You must run the dependency installation script to set up the local recipe index and apply necessary patches:
+
+   ```Bash
+   # This sets up the local conan-center-index with required patches
+   # and configures the 'bolt-local' and 'bolt-cci-local' remotes.
+   scripts/install-bolt-deps.sh
+   ```
+
+### Platform Specific Notes
+
+- **First-Time Build**: The first build will compile dependencies from source (e.g., Folly, Arrow), which can take a significant amount of time. Please be patient.
+
+- **macOS Users**: Ensure Xcode Command Line Tools are installed:
+
+  ```bash
+  xcode-select --install
+  ```
 
 ## Fork and PR Workflow
 
@@ -123,6 +152,7 @@ make release_spark
 make release_spark BUILD_VERSION=main
 ```
 
+
 ### Working with IDE
 
 Vscode guide in [English](./doc/vscode-config-en.md) or [Chinese](./doc/vscode-config.md).
@@ -161,21 +191,96 @@ find bolt -name "*.h" -o -name "*.cpp" | xargs clang-format -i -style=file
 
 ### Static Analysis (clang-tidy)
 
-The repository provides a `.clang-tidy` configuration and a helper script at `scripts/run-clang-tidy.py`. It's best to run this after a successful build, as it relies on the compilation database in `-p=build/release/`.
+The repository provides a `.clang-tidy` configuration and a helper script at `scripts/run-clang-tidy.py`.
+
+#### Prerequisites
+It is best to run this after a successful build, as it relies on the compilation database (`compile_commands.json`). By default, the script looks for this database in `_build/Release` or the current directory.
 
 ```Bash
-# First, create a release build to generate the compile database
+# First, create a release build to generate the compile database (compile_commands.json)
 make release
 
-# Run clang-tidy on specific files (reports issues without fixing)
-python3 scripts/run-clang-tidy.py bolt/path/to/*.cpp bolt/other/path/*.h
-
-# Check only the lines changed in the last commit (more focused)
-python3 scripts/run-clang-tidy.py --commit HEAD~1 bolt/path/to/*.cpp
-
-# Automatically apply fixes (use with caution and review changes)
-python3 scripts/run-clang-tidy.py --fix bolt/path/to/*.cpp
 ```
+
+#### Basic Usage
+You can run the script on specific files, directories, or based on git changes.
+
+```Bash
+# 1. Run on specific files
+python3 scripts/run-clang-tidy.py src/path/to/file.cpp src/other/file.h
+
+# 2. Run recursively on a directory (New feature)
+# This will scan all .cpp/.h/.cc etc. files in 'src/'
+python3 scripts/run-clang-tidy.py -d src/
+
+# 3. Parallel execution (Recommended for speed)
+# Use '-j' to specify number of threads (defaults to half of CPU cores)
+python3 scripts/run-clang-tidy.py -d src/ -j 12
+```
+
+#### Advanced Filtering & Configuration
+The script includes default filters to skip tests and benchmarks. You can customize this behavior.
+
+```Bash
+# Exclude specific files using Regex
+# (Default excludes: tests/, benchmarks/, *Test.cpp, etc.)
+python3 scripts/run-clang-tidy.py -d src/ --exclude "legacy/|.*_generated.cpp"
+
+# Specify a custom build path if not in _build/Release
+python3 scripts/run-clang-tidy.py -d src/ -p build/debug/
+
+# Use a specific clang-tidy binary or config file
+python3 scripts/run-clang-tidy.py -d src/ \
+    --clang-tidy-binary /usr/bin/clang-tidy-14 \
+    --config-file .clang-tidy-strict
+```
+
+#### Focused Checks (Git Awareness)
+To save time, you can check only the files or lines changed in a specific commit.
+
+```Bash
+# Check only the lines changed in the last commit (Incremental check)
+python3 scripts/run-clang-tidy.py --commit HEAD~1 src/
+
+# Check files changed relative to the main branch
+python3 scripts/run-clang-tidy.py --commit origin/main src/
+```
+
+#### Auto-Fixing
+
+```Bash
+# Automatically apply fixes (Use with caution and review changes)
+python3 scripts/run-clang-tidy.py --fix src/
+```
+
+#### CI/CD & Automation Features
+
+**GitHub Actions Auto-Annotations** The script contains built-in logic to detect GitHub Actions environments. When running in a CI pipeline, it translates clang-tidy errors into GitHub Annotations, allowing them to show up directly in Pull Request diff views.
+
+**Standard Input (Stdin)** You can pipe file paths directly into the script using the `-` argument:
+
+```Bash
+find src/ -name "Legacy*.cpp" | python3 scripts/run-clang-tidy.py -
+```
+
+**Environment Variables**
+
+- `BUILD_`BUILD_PATH`: Overrides the default search path for `compile_commands.json` (alternative to `-p`).
+- `GITHUB_ACTIONS`: Triggers the CI-friendly output format (automatically set by GitHub).
+
+#### Script Options Reference
+
+| Option                                    | Description                                                  |
+| :---------------------------------------- | :----------------------------------------------------------- |
+| `FILES` or `-`                            | List of specific files. Use `-` to read file list from stdin. |
+| `-d`, `--directory`--directory`           | Recursively scan a directory for `.cpp`, `.h`, `.cc`, `.cxx`, etc. |
+| `-j`, `--jobs`                            | Number of parallel threads (Batch size is fixed at 5 files per job). |
+| `--commit`                                | **Incremental Mode**: Analyze only modified lines relative to a git ref. |
+| `--fix`--fix`                             | Apply suggested fixes to the files automatically.            |
+| `--exclude`                               | Regex to ignore files. Default includes tests, benchmarks, and test files. |
+| `-p`                                      | Path to build dir. Falls back to `BUILD_PATH` env var, then `_build/Release`, then `.`. |
+| `--clang-tidy-binary`--clang-tidy-binary` | Custom path to executable (e.g. `/usr/bin/clang-tidy-15`).   |
+| `--config-file`                           | Path to custom config. If omitted, uses standard `.clang-tidy` lookup (`--`--format-style=file`). |
 
 The script uses different check sets for test and main code. Please ensure your changes introduce no new warnings before committing.
 
@@ -191,6 +296,19 @@ The Bolt project and all its contributors are governed by a [Code of Conduct.](h
 
 - **Location**: Place test files in the `tests` directory of the corresponding module, following existing naming and structure conventions.
 
+### Test Target Conventions
+
+- GoogleTest unit test targets must link `bolt_gtest_main`. It provides the
+  standard test entry point and the public `bolt_testutils` dependency.
+- Do not define `main()` in individual GoogleTest source files or compile a
+  second copy of the test entry point.
+- Consume test utilities through `bolt_gtest_main` or `bolt_testutils`. Do not
+  collect or link the object libraries that implement `bolt_testutils`
+  directly.
+- Select shared or static test linkage through `BOLT_TEST_LINKAGE`. Do not
+  hard-code a concrete engine or testutils implementation target in an
+  individual test.
+
 - **Execution**:
 
 
@@ -202,7 +320,7 @@ make unittest_release_spark # Tests in Spark
 
 # run a specific test
 cd bolt/_build/Release/bolt/functions/sparksql/tests
-./velox_functions_spark_test --gtest_filter=SparkCastExprTest.stringToTimestamp
+./bolt_functions_spark_test --gtest_filter=SparkCastExprTest.stringToTimestamp
 ```
 
 ### Sanitizers (Crucial for C++)

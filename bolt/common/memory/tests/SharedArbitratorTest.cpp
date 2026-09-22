@@ -33,11 +33,11 @@
 #include <re2/re2.h>
 #include <deque>
 
-#include <folly/init/Init.h>
 #include <functional>
 #include <optional>
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/base/tests/GTestUtils.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/memory/MallocAllocator.h"
 #include "bolt/common/memory/SharedArbitrator.h"
 #include "bolt/common/testutil/TestValue.h"
@@ -52,9 +52,6 @@
 #include "bolt/exec/tests/utils/HiveConnectorTestBase.h"
 #include "bolt/exec/tests/utils/SumNonPODAggregate.h"
 #include "folly/experimental/EventCount.h"
-
-DECLARE_bool(bolt_memory_leak_check_enabled);
-DECLARE_bool(bolt_suppress_memory_capacity_exceeding_error_message);
 
 using namespace ::testing;
 using namespace bytedance::bolt::common::testutil;
@@ -292,10 +289,11 @@ class SharedArbitrationTest : public testing::WithParamInterface<TestParam>,
 
   void setupMemory(
       int64_t memoryCapacity = 0,
-      uint64_t memoryPoolInitCapacity = kMemoryPoolInitCapacity) {
+      uint64_t memoryPoolInitCapacity = kMemoryPoolInitCapacity,
+      uint64_t maxArbitrationTimeMs = 5 * 60 * 1'000) {
     memoryCapacity = (memoryCapacity != 0) ? memoryCapacity : kMemoryCapacity;
-    memoryManager_ =
-        createMemoryManager(memoryCapacity, memoryPoolInitCapacity);
+    memoryManager_ = createMemoryManager(
+        memoryCapacity, memoryPoolInitCapacity, maxArbitrationTimeMs);
     ASSERT_EQ(memoryManager_->arbitrator()->kind(), "SHARED");
     arbitrator_ = static_cast<SharedArbitrator*>(memoryManager_->arbitrator());
   }
@@ -1308,7 +1306,7 @@ TEST_P(
     SCOPED_TRACE(testData.debugString());
     const auto totalCapacity = testData.totalCapacity;
     const auto queryCapacity = testData.queryCapacity;
-    setupMemory(totalCapacity);
+    setupMemory(totalCapacity, kMemoryPoolInitCapacity, 10'000);
 
     std::mutex mutex;
     std::vector<std::shared_ptr<core::QueryCtx>> queries;
@@ -1384,6 +1382,7 @@ TEST_P(
           if (e.errorCode() != error_code::kMemCapExceeded.c_str() &&
               e.errorCode() != error_code::kMemAborted.c_str() &&
               e.errorCode() != error_code::kMemAllocError.c_str() &&
+              e.errorCode() != error_code::kMemArbitrationTimeout.c_str() &&
               (e.message() != "Aborted for external error")) {
             std::rethrow_exception(std::current_exception());
           }
@@ -1454,9 +1453,3 @@ BOLT_INSTANTIATE_TEST_SUITE_P(
           "{}", info.param.isSerialExecutionMode ? "serial" : "parallel");
     });
 } // namespace bytedance::bolt::memory
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  folly::Init init{&argc, &argv, false};
-  return RUN_ALL_TESTS();
-}

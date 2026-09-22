@@ -14,24 +14,28 @@
 # limitations under the License.
 
 add_executable(
-  bolt_functions_flink_test FlinkSqlDataTimeFunctionsTest.cpp JsonFunctionsTest.cpp RandTest.cpp
-                            StringFunctionsTest.cpp
+  bolt_functions_flink_test
+  RoundTest.cpp
+  ElementAtTest.cpp
+  FlinkCastExprTest.cpp
+  FlinkSqlDataTimeFunctionsTest.cpp
+  TemporalFunctionsTest.cpp
+  JsonFunctionsTest.cpp
+  RegexFunctionsTest.cpp
+  RandTest.cpp
+  StringFunctionsTest.cpp
+  URLFunctionsTest.cpp
 )
 
 add_test(
   NAME bolt_functions_flink_test
-  COMMAND bolt_functions_flink_test
+  COMMAND
+    bolt_functions_flink_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_link_libraries(
   bolt_functions_flink_test
-  bolt_functions_flink
-  bolt_functions_test_lib
-  bolt_exec_test_lib
-  ${FMT}
-  GTest::gtest
-  GTest::gtest_main
+  bolt_gtest_main
   GTest::gmock
-  gflags::gflags
 )

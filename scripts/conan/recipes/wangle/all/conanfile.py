@@ -53,13 +53,19 @@ class WangleConan(ConanFile):
         cmake_layout(self, src_folder="src")
 
     def requirements(self):
-        self.requires("fizz/2022.10.31.00", transitive_headers=True, transitive_libs=True)
-        self.requires("folly/2022.10.31.00", transitive_headers=True, transitive_libs=True)
+        self.requires(
+            "fizz/2022.10.31.00", transitive_headers=True, transitive_libs=True
+        )
+        self.requires(
+            "folly/2022.10.31.00", transitive_headers=True, transitive_libs=True
+        )
         self.requires("fmt/8.0.1", transitive_headers=True, transitive_libs=True)
         self.requires("openssl/1.1.1w")
         self.requires("glog/0.7.1", transitive_headers=True, transitive_libs=True)
         self.requires("gflags/2.2.2")
-        self.requires("double-conversion/3.3.0", transitive_headers=True, transitive_libs=True)
+        self.requires(
+            "double-conversion/3.3.0", transitive_headers=True, transitive_libs=True
+        )
         self.requires("libevent/2.1.12", transitive_headers=True, transitive_libs=True)
 
     def build_requirements(self):
@@ -87,7 +93,6 @@ class WangleConan(ConanFile):
         deps.generate()
 
     def build(self):
-        cmakelists = os.path.join(self.source_folder, "wangle", "CMakeLists.txt")
         cmake = CMake(self)
         cmake.configure(build_script_folder=os.path.join(self.source_folder, "wangle"))
         cmake.build()

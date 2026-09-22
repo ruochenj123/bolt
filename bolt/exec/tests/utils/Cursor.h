@@ -33,7 +33,14 @@
 #include "bolt/core/PlanNode.h"
 #include "bolt/exec/Driver.h"
 #include "bolt/exec/Task.h"
+
+#include <optional>
+
 namespace bytedance::bolt::exec::test {
+
+/// Returns the maximum number of threads for test executors, capped to avoid
+/// scaling every parallel test process to all CPUs visible on the host.
+unsigned testExecutorConcurrency();
 
 /// Wait up to maxWaitMicros for all the task drivers to finish. The function
 /// returns true if all the drivers have finished, otherwise false.
@@ -102,6 +109,8 @@ struct CursorParameters {
   /// If both 'queryConfigs' and 'queryCtx' are specified, the configurations
   /// in 'queryCtx' will be overridden by 'queryConfig'.
   std::unordered_map<std::string, std::string> queryConfigs;
+
+  std::optional<std::string> taskId;
 };
 
 class TaskQueue {

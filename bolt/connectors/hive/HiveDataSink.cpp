@@ -34,6 +34,7 @@
 #include "bolt/common/base/Fs.h"
 #include "bolt/common/base/StatsReporter.h"
 #include "bolt/common/base/Uuid.h"
+#include "bolt/common/file/FileSystems.h"
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/connectors/hive/HiveConfig.h"
 #include "bolt/connectors/hive/HivePartitionFunction.h"
@@ -410,6 +411,8 @@ HiveDataSink::HiveDataSink(
       fileOptions_.values[key] = value.value();
     }
   }
+  filesystems::copyOpenFileOptionsFromConfig(
+      connectorQueryCtx_->sessionProperties(), fileOptions_);
 
   if (!isBucketed()) {
     return;
@@ -443,6 +446,9 @@ bool HiveDataSink::canReclaim() const {
 void HiveDataSink::appendData(RowVectorPtr input) {
   checkRunning();
 
+  // Lazy load all the input columns.
+  input->loadedVector();
+
   // Write to unpartitioned (and unbucketed) table.
   if (!isPartitioned() && !isBucketed()) {
     const auto index = ensureWriter(HiveWriterId::unpartitionedId());
@@ -452,11 +458,6 @@ void HiveDataSink::appendData(RowVectorPtr input) {
 
   // Compute partition and bucket numbers.
   computePartitionAndBucketIds(input);
-
-  // Lazy load all the input columns.
-  for (column_index_t i = 0; i < input->childrenSize(); ++i) {
-    input->childAt(i)->loadedVector();
-  }
 
   // All inputs belong to a single non-bucketed partition. The partition id
   // must be zero.
@@ -531,6 +532,13 @@ DataSink::Stats HiveDataSink::stats() const {
 
   stats.numWrittenFiles = writers_.size();
   for (int i = 0; i < writerInfo_.size(); ++i) {
+    const auto writerMetrics = writers_.at(i)->metrics();
+    stats.writeRecodeWallNanos += writerMetrics.writeRecodeWallNanos;
+    stats.writeEncodeWallNanos += writerMetrics.writeEncodeWallNanos;
+    stats.writeCompressionWallNanos += writerMetrics.writeCompressionWallNanos;
+    stats.writeIOWallNanos += writerMetrics.writeIOWallNanos;
+    stats.writeFinalizeWallNanos += writerMetrics.writeFinalizeWallNanos;
+
     const auto& info = writerInfo_.at(i);
     BOLT_CHECK_NOT_NULL(info);
     if (!info->spillStats->empty()) {
@@ -627,7 +635,7 @@ void HiveDataSink::abort() {
 void HiveDataSink::closeInternal() {
   BOLT_CHECK_NE(state_, State::kRunning);
 
-  TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::connector::hive::HiveDataSink::closeInternal", this);
 
   if (state_ == State::kClosed) {
@@ -941,7 +949,7 @@ std::string LocationHandle::toString() const {
       "LocationHandle [targetPath: {}, writePath: {}, tableType: {},",
       targetPath_,
       writePath_,
-      tableTypeName(tableType_));
+      tableTypeName(tableType()));
 }
 
 void LocationHandle::registerSerDe() {
@@ -952,17 +960,22 @@ void LocationHandle::registerSerDe() {
 folly::dynamic LocationHandle::serialize() const {
   folly::dynamic obj = folly::dynamic::object;
   obj["name"] = "LocationHandle";
+  obj["connectorId"] = connectorId();
   obj["targetPath"] = targetPath_;
   obj["writePath"] = writePath_;
-  obj["tableType"] = tableTypeName(tableType_);
+  obj["tableType"] = tableTypeName(tableType());
+  obj["targetFileName"] = targetFileName_;
   return obj;
 }
 
 LocationHandlePtr LocationHandle::create(const folly::dynamic& obj) {
+  auto connectorId = obj["connectorId"].asString();
   auto targetPath = obj["targetPath"].asString();
   auto writePath = obj["writePath"].asString();
   auto tableType = tableTypeFromName(obj["tableType"].asString());
-  return std::make_shared<LocationHandle>(targetPath, writePath, tableType);
+  auto targetFileName = obj.getDefault("targetFileName", "").asString();
+  return std::make_shared<LocationHandle>(
+      targetPath, writePath, tableType, targetFileName, connectorId);
 }
 
 std::unique_ptr<memory::MemoryReclaimer> HiveDataSink::WriterReclaimer::create(

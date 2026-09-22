@@ -14,20 +14,22 @@
 # limitations under the License.
 
 add_executable(unsafe_row_serialize_benchmark UnsafeRowSerializeBenchmark.cpp)
+add_executable(dense_row_serialize_benchmark DenseRowSerializeBenchmark.cpp)
 
 target_link_libraries(
   unsafe_row_serialize_benchmark
   bolt_row_fast
-  bolt_exec
-  bolt_vector
-  bolt_hive_connector
-  bolt_exec_test_lib
-  bolt_dwio_common_exception
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  Folly::folly
+  bolt_testutils
   ${FOLLY_BENCHMARK}
-  gflags::gflags
+  GTest::gtest
+)
+
+target_link_libraries(
+  dense_row_serialize_benchmark
+  bolt_row_fast
+  bolt_testutils
+  ${FOLLY_BENCHMARK}
+  GTest::gtest
 )
 
 set_target_properties(unsafe_row_serialize_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

@@ -440,6 +440,61 @@ TEST_F(Re2FunctionsTest, regexExtractConstantPatternNoGroupId) {
   EXPECT_EQ(extract("a b245 c3", "\\d+"), "245");
 }
 
+TEST_F(Re2FunctionsTest, likeSignaturesAllowDynamicPattern) {
+  const auto signatures = likeSignatures();
+  ASSERT_EQ(signatures.size(), 2);
+  EXPECT_THAT(
+      signatures[0]->constantArguments(), ::testing::ElementsAre(false, false));
+  EXPECT_THAT(
+      signatures[1]->constantArguments(),
+      ::testing::ElementsAre(false, false, true));
+}
+
+TEST_F(Re2FunctionsTest, likeDynamicPatterns) {
+  auto input = makeNullableFlatVector<std::string>(
+      {"axb", "axb", "xhelloy", "abcdef", std::nullopt, "abc"});
+  auto pattern = makeNullableFlatVector<std::string>(
+      {"a%b", "a_b", "%hello%", "%xyz%", "%a%", std::nullopt});
+
+  auto result = evaluate("like(c0, c1)", makeRowVector({input, pattern}));
+  auto expected = makeNullableFlatVector<bool>(
+      {true, true, true, false, std::nullopt, std::nullopt});
+
+  assertEqualVectors(expected, result);
+}
+
+TEST_F(Re2FunctionsTest, likeDynamicPatternsWithConstantEscape) {
+  auto input =
+      makeNullableFlatVector<std::string>({"a_b", "a%b", "axb", std::nullopt});
+  auto pattern =
+      makeNullableFlatVector<std::string>({R"(a\_b)", R"(a\%b)", "a_b", "%"});
+
+  auto result = evaluate("like(c0, c1, '\\')", makeRowVector({input, pattern}));
+  auto expected =
+      makeNullableFlatVector<bool>({true, true, true, std::nullopt});
+
+  assertEqualVectors(expected, result);
+}
+
+TEST_F(Re2FunctionsTest, likeDynamicLongPatterns) {
+  auto input = makeFlatVector<std::string>(
+      {"longfixedpatternvalue",
+       "longprefixpatternvalue",
+       "valuelongsuffixpattern",
+       "prefixlongsubstringpatternsuffix",
+       "a_long_generic_pattern_value"});
+  auto pattern = makeFlatVector<std::string>(
+      {"longfixedpatternvalue",
+       "longprefixpattern%",
+       "%longsuffixpattern",
+       "%longsubstringpattern%",
+       "%long_generic_pattern%"});
+
+  auto result = evaluate("like(c0, c1)", makeRowVector({input, pattern}));
+
+  assertEqualVectors(makeConstant(true, input->size()), result);
+}
+
 TEST_F(Re2FunctionsTest, likePattern) {
   testLike("abc", "%b%", true);
   testLike("bcd", "%b%", true);
@@ -1036,19 +1091,19 @@ TEST_F(Re2FunctionsTest, regexExtractAllNoMatch) {
   const std::vector<std::optional<int32_t>> noGroupId = {};
   const std::vector<std::optional<int32_t>> groupIds0 = {0};
 
-  testRe2ExtractAll({""}, {"[0-9]+"}, noGroupId, {{{}}});
-  testRe2ExtractAll({"(╯°□°)╯︵ ┻━┻"}, {"[0-9]+"}, noGroupId, {{{}}});
-  testRe2ExtractAll({"abcde"}, {"[0-9]+"}, groupIds0, {{{}}});
+  testRe2ExtractAll({""}, {"[0-9]+"}, noGroupId, {emptyArray});
+  testRe2ExtractAll({"(╯°□°)╯︵ ┻━┻"}, {"[0-9]+"}, noGroupId, {emptyArray});
+  testRe2ExtractAll({"abcde"}, {"[0-9]+"}, groupIds0, {emptyArray});
   testRe2ExtractAll(
       {"rYBKVn6DnfSI2an4is4jbvf4btGpV"},
       {"81jnp58n31BtMdlUsP1hiF4QWSYv411"},
       noGroupId,
-      {{{}}});
+      {emptyArray});
   testRe2ExtractAll(
       {"rYBKVn6DnfSI2an4is4jbvf4btGpV"},
       {"81jnp58n31BtMdlUsP1hiF4QWSYv411"},
       groupIds0,
-      {{{}}});
+      {emptyArray});
 
   // Test empty pattern.
   testRe2ExtractAll<int32_t>(
@@ -1086,7 +1141,7 @@ TEST_F(Re2FunctionsTest, tryException) {
   auto input = makeRowVector({stringVector, patternVector});
   auto oneGoodInput = makeRowVector({stringVector, oneGoodPatternVector});
 
-  // Assert we can handle trys safely for re2_extract.
+  // Assert we can handle tries safely for re2_extract.
   {
     auto result = evaluate("try(re2_extract(c0, c1))", input);
     assertEqualVectors(makeNullConstant(TypeKind::VARCHAR, 3), result);

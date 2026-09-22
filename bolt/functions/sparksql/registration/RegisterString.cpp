@@ -31,6 +31,8 @@
 #include "bolt/functions/lib/Re2Functions.h"
 #include "bolt/functions/prestosql/StringFunctions.h"
 #include "bolt/functions/sparksql/Base64Function.h"
+#include "bolt/functions/sparksql/FormatNumber.h"
+#include "bolt/functions/sparksql/LuhnCheckFunction.h"
 #include "bolt/functions/sparksql/MaskFunction.h"
 #include "bolt/functions/sparksql/String.h"
 #include "bolt/functions/sparksql/UnBase64Function.h"
@@ -59,14 +61,29 @@ void registerStringFunctions(const std::string& prefix) {
       {prefix + "locate"});
   registerFunction<RepeatStringFunction, Varchar, Varchar, int32_t>(
       {prefix + "string_repeat"});
-  registerFunction<RepeatFunction, Varchar, Varchar, int32_t>(
-      {prefix + "repeat"});
+  exec::registerStatefulVectorFunction(
+      prefix + "repeat", sparkRepeatSignatures(), makeRepeat);
   registerFunction<UUIDWithoutSeedFunction, Varchar>({prefix + "uuid"});
   registerFunction<UUIDWithSeedFunction, Varchar, Constant<int64_t>>(
       {prefix + "uuid"});
 
   registerFunction<ToTitleFunction, Varchar, Varchar>(
       {prefix + "to_title", prefix + "initcap"});
+
+  BOLT_REGISTER_VECTOR_FUNCTION(
+      udf_decimal_format_number, prefix + "format_number");
+  registerFunction<FormatNumberFunction, Varchar, int8_t, int32_t>(
+      {prefix + "format_number"});
+  registerFunction<FormatNumberFunction, Varchar, int16_t, int32_t>(
+      {prefix + "format_number"});
+  registerFunction<FormatNumberFunction, Varchar, int32_t, int32_t>(
+      {prefix + "format_number"});
+  registerFunction<FormatNumberFunction, Varchar, int64_t, int32_t>(
+      {prefix + "format_number"});
+  registerFunction<FormatNumberFunction, Varchar, float, int32_t>(
+      {prefix + "format_number"});
+  registerFunction<FormatNumberFunction, Varchar, double, int32_t>(
+      {prefix + "format_number"});
 
   registerFunction<TrimSpaceFunction, Varchar, Varchar>({prefix + "trim"});
   registerFunction<TrimFunction, Varchar, Varchar, Varchar>({prefix + "trim"});
@@ -169,8 +186,14 @@ void registerStringFunctions(const std::string& prefix) {
       {prefix + "bit_length"});
   registerFunction<sparksql::BitLengthFunction, int32_t, Varbinary>(
       {prefix + "bit_length"});
+  registerFunction<sparksql::OctetLengthFunction, int32_t, Varchar>(
+      {prefix + "octet_length"});
+  registerFunction<sparksql::OctetLengthFunction, int32_t, Varbinary>(
+      {prefix + "octet_length"});
   registerFunction<Empty2NullFunction, Varchar, Varchar>(
       {prefix + "empty2null"});
+
+  registerFunction<LuhnCheckFunction, bool, Varchar>({prefix + "luhn_check"});
 }
 } // namespace sparksql
 } // namespace bytedance::bolt::functions

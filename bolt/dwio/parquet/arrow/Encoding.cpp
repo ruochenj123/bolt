@@ -30,6 +30,8 @@
 
 // Adapted from Apache Arrow.
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include "bolt/dwio/parquet/arrow/Encoding.h"
 
 #include <algorithm>
@@ -58,6 +60,7 @@
 #include "arrow/util/rle_encoding.h"
 #include "arrow/util/ubsan.h"
 #include "arrow/visit_data_inline.h"
+#include "bolt/dwio/parquet/arrow/EncodingInternal.h"
 #include "bolt/dwio/parquet/arrow/Exception.h"
 #include "bolt/dwio/parquet/arrow/Platform.h"
 #include "bolt/dwio/parquet/arrow/Schema.h"
@@ -131,6 +134,16 @@ class EncoderImpl : virtual public Encoder {
     return pool_;
   }
 
+  template <typename SinkType>
+  std::shared_ptr<::arrow::Buffer> FinishSink(SinkType& sink) {
+    std::shared_ptr<Buffer> buffer;
+    // The customized Spark ArrowMemoryPool can't resize an empty buffer. The
+    // buffer is released immediately, so skip shrinking in that case.
+    PARQUET_THROW_NOT_OK(sink.Finish(
+        &buffer, !::bytedance::bolt::kSparkCompatible || sink.length() > 0));
+    return buffer;
+  }
+
  protected:
   // For accessing type-specific metadata, like FIXED_LEN_BYTE_ARRAY
   const ColumnDescriptor* descr_;
@@ -156,10 +169,13 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
     return sink_.length();
   }
 
+  void testSinkResize0() override {
+    sink_.Resize(10);
+    FlushValues();
+  }
+
   std::shared_ptr<::arrow::Buffer> FlushValues() override {
-    std::shared_ptr<Buffer> buffer;
-    PARQUET_THROW_NOT_OK(sink_.Finish(&buffer));
-    return buffer;
+    return FinishSink<::arrow::BufferBuilder>(sink_);
   }
 
   using TypedEncoder<DType>::Put;
@@ -446,9 +462,7 @@ int64_t PlainEncoder<BooleanType>::EstimatedDataEncodedSize() {
 }
 
 std::shared_ptr<::arrow::Buffer> PlainEncoder<BooleanType>::FlushValues() {
-  std::shared_ptr<Buffer> buffer;
-  PARQUET_THROW_NOT_OK(sink_.Finish(&buffer));
-  return buffer;
+  return FinishSink<::arrow::TypedBufferBuilder<bool>>(sink_);
 }
 
 void PlainEncoder<BooleanType>::Put(const bool* src, int num_values) {
@@ -494,6 +508,105 @@ int RlePreserveBufferSize(int num_values, int bit_width) {
       ::arrow::util::RleEncoder::MinBufferSize(bit_width);
 }
 
+// A growable equivalent to Arrow's BitWriter. Unlike BitWriter, this writes
+// into a ResizableBuffer that can grow as needed while preserving the current
+// bit-writing state across batches.
+class GrowingBitWriter {
+ public:
+  explicit GrowingBitWriter(ResizableBuffer* buffer)
+      : buffer_(buffer), byte_offset_(0), bit_offset_(0), buffered_values_(0) {}
+
+  void Reset(int start_offset) {
+    byte_offset_ = start_offset;
+    bit_offset_ = 0;
+    buffered_values_ = 0;
+    PARQUET_THROW_NOT_OK(
+        buffer_->Resize(start_offset, /*shrink_to_fit=*/false));
+  }
+
+  int bytes_written() const {
+    return byte_offset_ + static_cast<int>(bit_util::BytesForBits(bit_offset_));
+  }
+
+  bool PutValue(uint64_t v, int num_bits) {
+    DCHECK_LE(num_bits, 64);
+    if (num_bits < 64) {
+      DCHECK_EQ(v >> num_bits, 0) << "v = " << v << ", num_bits = " << num_bits;
+    }
+
+    buffered_values_ |= v << bit_offset_;
+    bit_offset_ += num_bits;
+
+    if (bit_offset_ >= 64) {
+      EnsureSize(byte_offset_ + 8);
+      auto buffered_values = bit_util::ToLittleEndian(buffered_values_);
+      std::memcpy(buffer_->mutable_data() + byte_offset_, &buffered_values, 8);
+      buffered_values_ = 0;
+      byte_offset_ += 8;
+      bit_offset_ -= 64;
+      buffered_values_ =
+          (num_bits - bit_offset_ == 64) ? 0 : (v >> (num_bits - bit_offset_));
+    }
+    DCHECK_LT(bit_offset_, 64);
+    return true;
+  }
+
+  void Flush(bool align = false) {
+    int num_bytes = static_cast<int>(bit_util::BytesForBits(bit_offset_));
+    EnsureSize(byte_offset_ + num_bytes);
+    auto buffered_values = bit_util::ToLittleEndian(buffered_values_);
+    std::memcpy(
+        buffer_->mutable_data() + byte_offset_, &buffered_values, num_bytes);
+
+    if (align) {
+      buffered_values_ = 0;
+      byte_offset_ += num_bytes;
+      bit_offset_ = 0;
+    }
+  }
+
+  uint8_t* GetNextBytePtr(int num_bytes = 1) {
+    Flush(/*align=*/true);
+    EnsureSize(byte_offset_ + num_bytes);
+    uint8_t* ptr = buffer_->mutable_data() + byte_offset_;
+    byte_offset_ += num_bytes;
+    return ptr;
+  }
+
+  template <typename T>
+  bool PutAligned(T val, int num_bytes) {
+    uint8_t* ptr = GetNextBytePtr(num_bytes);
+    if (ptr == nullptr) {
+      return false;
+    }
+    val = bit_util::ToLittleEndian(val);
+    std::memcpy(ptr, &val, num_bytes);
+    return true;
+  }
+
+  bool PutVlqInt(uint32_t v) {
+    bool result = true;
+    while ((v & 0xFFFFFF80UL) != 0UL) {
+      result &= PutAligned<uint8_t>(static_cast<uint8_t>((v & 0x7F) | 0x80), 1);
+      v >>= 7;
+    }
+    result &= PutAligned<uint8_t>(static_cast<uint8_t>(v & 0x7F), 1);
+    return result;
+  }
+
+ private:
+  void EnsureSize(int size) {
+    if (size > buffer_->size()) {
+      PARQUET_THROW_NOT_OK(buffer_->Resize(size, /*shrink_to_fit=*/false));
+    }
+  }
+
+  ResizableBuffer* buffer_;
+  int byte_offset_;
+  int bit_offset_;
+  uint64_t buffered_values_;
+};
+
 /// See the dictionary encoding section of
 /// https://github.com/Parquet/parquet-format.  The encoding supports
 /// streaming encoding. Values are encoded as they are added while the
@@ -522,7 +635,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
     DCHECK(buffered_indices_.empty());
   }
 
-  int dict_encoded_size() const override {
+  int64_t dict_encoded_size() const override {
     return dict_encoded_size_;
   }
 
@@ -689,7 +802,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
         throw ParquetException(
             "Parquet cannot store strings with size 2GB or more");
       }
-      dict_encoded_size_ += static_cast<int>(v.size() + sizeof(uint32_t));
+      dict_encoded_size_ += static_cast<int64_t>(v.size()) + sizeof(uint32_t);
       int32_t unused_memo_index;
       PARQUET_THROW_NOT_OK(memo_table_.GetOrInsert(
           v.data(), static_cast<int32_t>(v.size()), &unused_memo_index));
@@ -697,7 +810,7 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
   }
 
   /// The number of bytes needed to encode the dictionary.
-  int dict_encoded_size_;
+  int64_t dict_encoded_size_;
 
   MemoTableType memo_table_;
 };
@@ -736,7 +849,7 @@ inline void DictEncoderImpl<DType>::Put(const T& v) {
   // Put() implementation for primitive types
   auto on_found = [](int32_t memo_index) {};
   auto on_not_found = [this](int32_t memo_index) {
-    dict_encoded_size_ += static_cast<int>(sizeof(T));
+    dict_encoded_size_ += sizeof(T);
   };
 
   int32_t memo_index;
@@ -760,7 +873,7 @@ inline void DictEncoderImpl<ByteArrayType>::PutByteArray(
 
   auto on_found = [](int32_t memo_index) {};
   auto on_not_found = [&](int32_t memo_index) {
-    dict_encoded_size_ += static_cast<int>(length + sizeof(uint32_t));
+    dict_encoded_size_ += static_cast<int64_t>(length) + sizeof(uint32_t);
   };
 
   DCHECK(ptr != nullptr || length == 0);
@@ -875,7 +988,7 @@ void DictEncoderImpl<DType>::PutDictionary(const ::arrow::Array& values) {
   const auto& data = checked_cast<const ArrayType&>(values);
 
   dict_encoded_size_ +=
-      static_cast<int>(sizeof(typename DType::c_type) * data.length());
+      static_cast<int64_t>(sizeof(typename DType::c_type)) * data.length();
   for (int64_t i = 0; i < data.length(); i++) {
     int32_t unused_memo_index;
     PARQUET_THROW_NOT_OK(
@@ -890,7 +1003,7 @@ void DictEncoderImpl<FLBAType>::PutDictionary(const ::arrow::Array& values) {
 
   const auto& data = checked_cast<const ::arrow::FixedSizeBinaryArray&>(values);
 
-  dict_encoded_size_ += static_cast<int>(type_length_ * data.length());
+  dict_encoded_size_ += static_cast<int64_t>(type_length_) * data.length();
   for (int64_t i = 0; i < data.length(); i++) {
     int32_t unused_memo_index;
     PARQUET_THROW_NOT_OK(memo_table_.GetOrInsert(
@@ -2669,7 +2782,7 @@ std::shared_ptr<::arrow::Buffer> DeltaBitPackEncoder<DType>::FlushValues() {
   if (values_current_block_ > 0) {
     FlushBlock();
   }
-  PARQUET_ASSIGN_OR_THROW(auto buffer, sink_.Finish(/*shrink_to_fit=*/true));
+  auto buffer = FinishSink<::arrow::BufferBuilder>(sink_);
 
   uint8_t header_buffer_[kMaxPageHeaderWriterSize] = {};
   bit_util::BitWriter header_writer(header_buffer_, sizeof(header_buffer_));
@@ -3036,13 +3149,12 @@ class DeltaLengthByteArrayEncoder : public EncoderImpl,
             Encoding::DELTA_LENGTH_BYTE_ARRAY,
             pool = ::arrow::default_memory_pool()),
         sink_(pool),
-        length_encoder_(nullptr, pool),
-        encoded_size_{0} {}
+        length_encoder_(nullptr, pool) {}
 
   std::shared_ptr<::arrow::Buffer> FlushValues() override;
 
   int64_t EstimatedDataEncodedSize() override {
-    return encoded_size_ + length_encoder_.EstimatedDataEncodedSize();
+    return sink_.length() + length_encoder_.EstimatedDataEncodedSize();
   }
 
   using TypedEncoder<ByteArrayType>::Put;
@@ -3068,6 +3180,13 @@ class DeltaLengthByteArrayEncoder : public EncoderImpl,
                 return Status::Invalid(
                     "Parquet cannot store strings with size 2GB or more");
               }
+              if (ARROW_PREDICT_FALSE(
+                      view.size() + sink_.length() >
+                      static_cast<size_t>(
+                          std::numeric_limits<int32_t>::max()))) {
+                return Status::Invalid(
+                    "excess expansion in DELTA_LENGTH_BYTE_ARRAY");
+              }
               length_encoder_.Put({static_cast<int32_t>(view.length())}, 1);
               PARQUET_THROW_NOT_OK(sink_.Append(view.data(), view.length()));
               return Status::OK();
@@ -3077,7 +3196,6 @@ class DeltaLengthByteArrayEncoder : public EncoderImpl,
 
   ::arrow::BufferBuilder sink_;
   DeltaBitPackEncoder<Int32Type> length_encoder_;
-  uint32_t encoded_size_;
 };
 
 template <typename DType>
@@ -3111,7 +3229,9 @@ void DeltaLengthByteArrayEncoder<DType>::Put(const T* src, int num_values) {
     length_encoder_.Put(lengths.data(), batch_size);
   }
 
-  if (AddWithOverflow(encoded_size_, total_increment_size, &encoded_size_)) {
+  if (ARROW_PREDICT_FALSE(
+          sink_.length() + total_increment_size >
+          std::numeric_limits<int32_t>::max())) {
     throw ParquetException("excess expansion in DELTA_LENGTH_BYTE_ARRAY");
   }
   PARQUET_THROW_NOT_OK(sink_.Reserve(total_increment_size));
@@ -3144,8 +3264,7 @@ std::shared_ptr<::arrow::Buffer>
 DeltaLengthByteArrayEncoder<DType>::FlushValues() {
   std::shared_ptr<Buffer> encoded_lengths = length_encoder_.FlushValues();
 
-  std::shared_ptr<Buffer> data;
-  PARQUET_THROW_NOT_OK(sink_.Finish(&data));
+  std::shared_ptr<Buffer> data = FinishSink<::arrow::BufferBuilder>(sink_);
   sink_.Reset();
 
   PARQUET_THROW_NOT_OK(sink_.Resize(encoded_lengths->size() + data->size()));
@@ -3153,9 +3272,7 @@ DeltaLengthByteArrayEncoder<DType>::FlushValues() {
       sink_.Append(encoded_lengths->data(), encoded_lengths->size()));
   PARQUET_THROW_NOT_OK(sink_.Append(data->data(), data->size()));
 
-  std::shared_ptr<Buffer> buffer;
-  PARQUET_THROW_NOT_OK(sink_.Finish(&buffer, true));
-  encoded_size_ = 0;
+  std::shared_ptr<Buffer> buffer = FinishSink<::arrow::BufferBuilder>(sink_);
   return buffer;
 }
 
@@ -3758,8 +3875,7 @@ std::shared_ptr<Buffer> DeltaByteArrayEncoder<DType>::FlushValues() {
   std::shared_ptr<Buffer> suffixes = suffix_encoder_.FlushValues();
   PARQUET_THROW_NOT_OK(sink_.Append(suffixes->data(), suffixes->size()));
 
-  std::shared_ptr<Buffer> buffer;
-  PARQUET_THROW_NOT_OK(sink_.Finish(&buffer, true));
+  std::shared_ptr<Buffer> buffer = FinishSink<::arrow::BufferBuilder>(sink_);
   last_value_.clear();
   return buffer;
 }
@@ -4140,6 +4256,195 @@ int ByteStreamSplitDecoder<DType>::DecodeArrow(
 }
 
 } // namespace
+
+class IncrementalLevelRleEncoder::Impl {
+ public:
+  explicit Impl(ResizableBuffer* buffer)
+      : buffer_(buffer),
+        bit_width_(0),
+        prefix_size_(0),
+        bit_writer_(buffer),
+        buffered_values_{},
+        num_buffered_values_(0),
+        current_value_(0),
+        repeat_count_(0),
+        literal_count_(0),
+        literal_indicator_byte_offset_(-1) {}
+
+  void Reset(int16_t max_level, int prefix_size) {
+    bit_width_ = bit_util::Log2(max_level + 1);
+    prefix_size_ = prefix_size;
+    bit_writer_.Reset(prefix_size_);
+    current_value_ = 0;
+    repeat_count_ = 0;
+    num_buffered_values_ = 0;
+    literal_count_ = 0;
+    literal_indicator_byte_offset_ = -1;
+  }
+
+  void Put(const int16_t* levels, int64_t num_levels) {
+    for (int64_t i = 0; i < num_levels; ++i) {
+      Put(static_cast<uint64_t>(levels[i]));
+    }
+  }
+
+  int32_t Flush() {
+    if (literal_count_ > 0 || repeat_count_ > 0 || num_buffered_values_ > 0) {
+      bool all_repeat = literal_count_ == 0 &&
+          (repeat_count_ == num_buffered_values_ || num_buffered_values_ == 0);
+      if (repeat_count_ > 0 && all_repeat) {
+        FlushRepeatedRun();
+      } else {
+        DCHECK_EQ(literal_count_ % 8, 0);
+        for (; num_buffered_values_ != 0 && num_buffered_values_ < 8;
+             ++num_buffered_values_) {
+          buffered_values_[num_buffered_values_] = 0;
+        }
+        literal_count_ += num_buffered_values_;
+        FlushLiteralRun(/*update_indicator_byte=*/true);
+        repeat_count_ = 0;
+      }
+    }
+    bit_writer_.Flush();
+    PARQUET_THROW_NOT_OK(
+        buffer_->Resize(bit_writer_.bytes_written(), /*shrink_to_fit=*/false));
+
+    if (prefix_size_ > 0) {
+      int32_t encoded_length = bit_writer_.bytes_written() - prefix_size_;
+      encoded_length = bit_util::ToLittleEndian(encoded_length);
+      std::memcpy(
+          buffer_->mutable_data(), &encoded_length, sizeof(encoded_length));
+    }
+
+    DCHECK_EQ(num_buffered_values_, 0);
+    DCHECK_EQ(literal_count_, 0);
+    DCHECK_EQ(repeat_count_, 0);
+    return bit_writer_.bytes_written();
+  }
+
+ private:
+  void Put(uint64_t value) {
+    DCHECK(bit_width_ == 64 || value < (1ULL << bit_width_));
+
+    if (current_value_ == value) {
+      ++repeat_count_;
+      if (repeat_count_ > 8) {
+        return;
+      }
+    } else {
+      if (repeat_count_ >= 8) {
+        DCHECK_EQ(literal_count_, 0);
+        FlushRepeatedRun();
+      }
+      repeat_count_ = 1;
+      current_value_ = value;
+    }
+
+    buffered_values_[num_buffered_values_] = value;
+    if (++num_buffered_values_ == 8) {
+      DCHECK_EQ(literal_count_ % 8, 0);
+      FlushBufferedValues(/*done=*/false);
+    }
+  }
+
+  void FlushLiteralRun(bool update_indicator_byte) {
+    if (literal_indicator_byte_offset_ == -1) {
+      uint8_t* ptr = bit_writer_.GetNextBytePtr();
+      DCHECK(ptr != nullptr);
+      literal_indicator_byte_offset_ =
+          static_cast<int64_t>(ptr - buffer_->mutable_data());
+    }
+
+    for (int i = 0; i < num_buffered_values_; ++i) {
+      bool success = bit_writer_.PutValue(buffered_values_[i], bit_width_);
+      DCHECK(success);
+    }
+    num_buffered_values_ = 0;
+
+    if (update_indicator_byte) {
+      DCHECK_EQ(literal_count_ % 8, 0);
+      int num_groups = literal_count_ / 8;
+      int32_t indicator_value = (num_groups << 1) | 1;
+      DCHECK_EQ(indicator_value & 0xFFFFFF00, 0);
+      buffer_->mutable_data()[literal_indicator_byte_offset_] =
+          static_cast<uint8_t>(indicator_value);
+      literal_indicator_byte_offset_ = -1;
+      literal_count_ = 0;
+    }
+  }
+
+  void FlushRepeatedRun() {
+    DCHECK_GT(repeat_count_, 0);
+    bool result = true;
+    const uint32_t indicator_value = static_cast<uint32_t>(repeat_count_) << 1;
+    result &= bit_writer_.PutVlqInt(indicator_value);
+    result &= bit_writer_.PutAligned(
+        current_value_, static_cast<int>(bit_util::CeilDiv(bit_width_, 8)));
+    DCHECK(result);
+    num_buffered_values_ = 0;
+    repeat_count_ = 0;
+  }
+
+  void FlushBufferedValues(bool done) {
+    if (repeat_count_ >= 8) {
+      num_buffered_values_ = 0;
+      if (literal_count_ != 0) {
+        DCHECK_EQ(literal_count_ % 8, 0);
+        DCHECK_EQ(repeat_count_, 8);
+        FlushLiteralRun(/*update_indicator_byte=*/true);
+      }
+      DCHECK_EQ(literal_count_, 0);
+      return;
+    }
+
+    literal_count_ += num_buffered_values_;
+    DCHECK_EQ(literal_count_ % 8, 0);
+    int num_groups = literal_count_ / 8;
+    if (num_groups + 1 >= (1 << 6)) {
+      DCHECK_NE(literal_indicator_byte_offset_, -1);
+      FlushLiteralRun(/*update_indicator_byte=*/true);
+    } else {
+      FlushLiteralRun(done);
+    }
+    repeat_count_ = 0;
+  }
+
+  ResizableBuffer* buffer_;
+  int bit_width_;
+  int prefix_size_;
+  GrowingBitWriter bit_writer_;
+  int64_t buffered_values_[8];
+  int num_buffered_values_;
+  uint64_t current_value_;
+  int repeat_count_;
+  int literal_count_;
+  int64_t literal_indicator_byte_offset_;
+};
+
+IncrementalLevelRleEncoder::IncrementalLevelRleEncoder(ResizableBuffer* buffer)
+    : impl_(std::make_unique<Impl>(buffer)) {}
+
+IncrementalLevelRleEncoder::~IncrementalLevelRleEncoder() = default;
+
+IncrementalLevelRleEncoder::IncrementalLevelRleEncoder(
+    IncrementalLevelRleEncoder&&) noexcept = default;
+
+IncrementalLevelRleEncoder& IncrementalLevelRleEncoder::operator=(
+    IncrementalLevelRleEncoder&&) noexcept = default;
+
+void IncrementalLevelRleEncoder::Reset(int16_t max_level, int prefix_size) {
+  impl_->Reset(max_level, prefix_size);
+}
+
+void IncrementalLevelRleEncoder::Put(
+    const int16_t* levels,
+    int64_t num_levels) {
+  impl_->Put(levels, num_levels);
+}
+
+int32_t IncrementalLevelRleEncoder::Flush() {
+  return impl_->Flush();
+}
 
 // ----------------------------------------------------------------------
 // Encoder and decoder factory functions

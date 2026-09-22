@@ -25,37 +25,47 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_expression_test_utility ArgumentTypeFuzzer.cpp FuzzerToolkit.cpp)
+bolt_add_library(bolt_expression_test_utility ArgumentTypeFuzzer.cpp FuzzerToolkit.cpp)
 
-target_link_libraries(bolt_expression_test_utility bolt_type bolt_expression_functions GTest::gtest)
+target_link_libraries(
+  bolt_expression_test_utility
+  bolt_type
+  bolt_expression_functions
+  GTest::gtest
+)
 
 add_library(
-  bolt_expression_fuzzer ArgumentTypeFuzzer.cpp ExpressionFuzzer.cpp ExpressionFuzzerVerifier.cpp
-                         FuzzerRunner.cpp
+  bolt_expression_fuzzer
+  STATIC
+  ExpressionFuzzer.cpp
+  ExpressionFuzzerVerifier.cpp
+  FuzzerRunner.cpp
 )
 
 target_link_libraries(
   bolt_expression_fuzzer
-  bolt_expression_verifier
-  bolt_type
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  bolt_function_registry
-  bolt_expression_test_utility
+  bolt_testutils
+  bolt_fuzzer_flags
 )
 
 add_executable(bolt_expression_fuzzer_test ExpressionFuzzerTest.cpp)
 
 target_link_libraries(
-  bolt_expression_fuzzer_test bolt_expression_fuzzer bolt_functions_prestosql GTest::gtest
-  GTest::gtest_main
+  bolt_expression_fuzzer_test
+  PRIVATE
+    bolt_expression_fuzzer
+    bolt_testutils
+    GTest::gtest
 )
 
 add_executable(spark_expression_fuzzer_test SparkExpressionFuzzerTest.cpp)
 
 target_link_libraries(
-  spark_expression_fuzzer_test bolt_expression_fuzzer bolt_functions_spark GTest::gtest
-  GTest::gtest_main
+  spark_expression_fuzzer_test
+  PRIVATE
+    bolt_expression_fuzzer
+    bolt_testutils
+    GTest::gtest
 )
 
 find_package(Arrow CONFIG REQUIRED)
@@ -63,13 +73,8 @@ add_executable(spark_double_to_decimal_fuzzer_test DoubleToDecimalFuzzerTest.cpp
 
 target_link_libraries(
   spark_double_to_decimal_fuzzer_test
-  bolt_type
-  bolt_process
-  bolt_functions_spark
-  arrow::arrow
-  folly::folly
+  bolt_testutils
   GTest::gtest
-  GTest::gtest_main
 )
 
 if(${BOLT_BUILD_TESTING})

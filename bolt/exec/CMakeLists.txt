@@ -25,7 +25,7 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(
+bolt_add_library(
   bolt_exec
   $<$<BOOL:${ENABLE_META_SORT}>:meta/MetaRowSorter.cpp>
   AddressableNonNullValueList.cpp
@@ -68,6 +68,7 @@ add_library(
   LocalShuffle.cpp
   MarkDistinct.cpp
   MemoryReclaimer.cpp
+  MemoryPressureUtils.cpp
   Merge.cpp
   MergeJoin.cpp
   MergeSource.cpp
@@ -122,9 +123,14 @@ add_library(
   WindowPartition.cpp
 )
 
-target_compile_features(bolt_exec PRIVATE cxx_std_20)
+set_target_properties(
+  bolt_exec
+  PROPERTIES
+    ENABLE_EXPORTS
+      ON
+)
 
-set_target_properties(bolt_exec PROPERTIES ENABLE_EXPORTS ON)
+add_subdirectory(radixsort)
 
 if(${ENABLE_BOLT_JIT})
   find_package(LLVM REQUIRED CONFIG)
@@ -139,7 +145,6 @@ target_link_libraries(
   bolt_connector
   bolt_time
   bolt_common_base
-  bolt_test_util
   bolt_arrow_bridge
   bolt_common_compression
   bolt_functions_json
@@ -166,7 +171,11 @@ endif()
 if(${BOLT_ENABLE_CUDF})
   target_compile_definitions(bolt_exec PRIVATE BOLT_HAS_CUDF=1)
   target_include_directories(bolt_exec SYSTEM PRIVATE ${cudf_INCLUDE_DIRS})
-  target_link_libraries(bolt_exec bolt_cudf_exec cudf::cudf)
+  target_link_libraries(
+    bolt_exec
+    bolt_cudf_exec
+    cudf::cudf
+  )
 endif()
 
 if(${BOLT_BUILD_TESTING})
@@ -176,7 +185,7 @@ elseif(${BOLT_BUILD_TEST_UTILS})
   add_subdirectory(tests/utils)
 endif()
 
-if(${BOLT_ENABLE_BENCHMARKS})
+if(${BOLT_BUILD_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
 

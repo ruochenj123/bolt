@@ -29,13 +29,16 @@
  */
 
 #include "Driver.h"
+
 #include <folly/ScopeGuard.h>
 #include <folly/executors/QueuedImmediateExecutor.h>
 #include <folly/executors/thread_factory/InitThreadFactory.h>
 #include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <optional>
 #include "bolt/common/base/Counters.h"
+#include "bolt/common/base/SparkCompatibility.h"
 #include "bolt/common/base/StatsReporter.h"
-#include "bolt/common/base/logging.h"
 #include "bolt/common/process/ThreadNameHolder.h"
 #include "bolt/common/process/TraceContext.h"
 #include "bolt/common/testutil/TestValue.h"
@@ -198,7 +201,8 @@ std::optional<common::SpillConfig> DriverCtx::makeSpillConfig(
              queryConfig.testingSpillPct(),
              queryConfig.spillCompressionKind(),
              queryConfig.spillFileCreateConfig(),
-             rowBasedSpillMode)
+             rowBasedSpillMode,
+             queryConfig.singlePartitionSpillSerdeKind())
       .setJITenableForSpill(queryConfig.enableJitRowCmpRow());
 }
 
@@ -286,6 +290,8 @@ std::ostream& operator<<(std::ostream& out, const StopReason& reason) {
   return out << stopReasonString(reason);
 }
 Driver::Driver() = default;
+
+Driver::~Driver() = default;
 // static
 void Driver::enqueue(std::shared_ptr<Driver> driver) {
   process::ScopedThreadDebugInfo scopedInfo(
@@ -398,7 +404,7 @@ void Driver::enqueueInternal() {
   queueTimeStartMicros_ = getCurrentTimeMicro();
 }
 
-// Call an Oprator method. record silenced throws, but not a query
+// Call an Operator method. record silenced throws, but not a query
 // terminating throw. Annotate exceptions with Operator info.
 #define CALL_OPERATOR(call, operatorPtr, operatorId, operatorMethod)       \
   try {                                                                    \
@@ -595,7 +601,7 @@ StopReason Driver::runInternal(
     // Invoked to initialize the operators once before driver starts execution.
     initializeOperators();
 
-    TestValue::adjust("bytedance::bolt::exec::Driver::runInternal", this);
+    BOLT_TEST_ADJUST("bytedance::bolt::exec::Driver::runInternal", this);
 
     const int32_t numOperators = operators_.size();
     ContinueFuture future;
@@ -682,7 +688,7 @@ StopReason Driver::runInternal(
             uint64_t resultBytes = 0;
             RowVectorPtr intermediateResult;
             withDeltaCpuWallTimer(op, &OperatorStats::getOutputTiming, [&]() {
-              TestValue::adjust(
+              BOLT_TEST_ADJUST(
                   "bytedance::bolt::exec::Driver::runInternal::getOutput", op);
               CALL_OPERATOR(
                   intermediateResult = op->getOutput(),
@@ -720,7 +726,7 @@ StopReason Driver::runInternal(
                     resultBytes, intermediateResult->size());
               }
               nextOp->traceInput(intermediateResult);
-              TestValue::adjust(
+              BOLT_TEST_ADJUST(
                   "bytedance::bolt::exec::Driver::runInternal::addInput",
                   nextOp);
 
@@ -769,14 +775,16 @@ StopReason Driver::runInternal(
                     kOpMethodIsFinished);
               });
               if (finished) {
-                LOG_SPARK(INFO) << "Operator " << op->name()
-                                << " finished. nextOp: " << nextOp->name();
+                if (::bytedance::bolt::kSparkCompatible) {
+                  LOG(INFO) << "Operator " << op->name()
+                            << " finished. nextOp: " << nextOp->name();
+                }
                 auto timer = createDeltaCpuWallTimer(
                     [nextOp, this](const CpuWallTiming& timing) {
-                      processLazyTiming(*nextOp, timing);
-                      nextOp->stats().wlock()->finishTiming.add(timing);
+                      auto selfDelta = processLazyTiming(*nextOp, timing);
+                      nextOp->stats().wlock()->finishTiming.add(selfDelta);
                     });
-                TestValue::adjust(
+                BOLT_TEST_ADJUST(
                     "bytedance::bolt::exec::Driver::runInternal::noMoreInput",
                     nextOp);
                 CALL_OPERATOR(
@@ -784,8 +792,15 @@ StopReason Driver::runInternal(
                     nextOp,
                     curOperatorId_ + 1,
                     kOpMethodNoMoreInput);
-                LOG_SPARK(INFO)
-                    << "Operator " << nextOp->name() << " no more input.";
+                auto* nextOpPool = nextOp->pool();
+                if (::bytedance::bolt::kSparkCompatible) {
+                  LOG(INFO)
+                      << "Operator " << nextOp->name() << " no more input. "
+                      << nextOpPool->name() << "["
+                      << succinctBytes(nextOpPool->currentBytes()) << ", "
+                      << succinctBytes(nextOpPool->reservedBytes()) << ", "
+                      << succinctBytes(nextOpPool->capacity()) << "]";
+                }
                 break;
               }
             }
@@ -873,9 +888,10 @@ void Driver::recordYieldCount() {
 
 // static
 void Driver::run(std::shared_ptr<Driver> self) {
-#ifndef SPARK_COMPATIBLE
-  process::ThreadNameHolder holder(self->driverCtx()->task->taskId());
-#endif
+  std::optional<process::ThreadNameHolder> threadNameHolder;
+  if (!::bytedance::bolt::kSparkCompatible) {
+    threadNameHolder.emplace(self->driverCtx()->task->taskId());
+  }
   process::TraceContext trace("Driver::run");
   bytedance::bolt::process::ScopedThreadDebugInfo scopedInfo(
       self->driverCtx()->threadDebugInfo);

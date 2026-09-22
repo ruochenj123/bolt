@@ -13,27 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
-import pydot
 import platform
 import re
 from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
 from conan.tools import files, scm
 from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
-from conan.tools.env import Environment, VirtualBuildEnv, VirtualRunEnv
-import csv
+from conan.tools.env import VirtualBuildEnv, VirtualRunEnv
 
 # Now, set options of third parties
 postfix = "/*"
 folly = f"folly{postfix}"
 glog = f"glog{postfix}"
+gflags = f"gflags{postfix}"
 boost = f"boost{postfix}"
 arrow = f"arrow{postfix}"
 orc = f"orc{postfix}"
 icu = f"icu{postfix}"
 gperftools = f"gperftools{postfix}"
 liburing = f"liburing{postfix}"
+llvm_core = f"llvm-core{postfix}"
+paimon_cpp = f"paimon-cpp{postfix}"
 
 
 class TorchOption:
@@ -60,96 +61,6 @@ class TorchOption:
         return [None, "CPU", "GPU"]
 
 
-class DepLoader:
-    def is_bolt(self, name):
-        # we doesn't export executable file's dependency
-        executable = [
-            "bolt_in_10_min_demo",
-            "bolt_sparksql_coverage",
-            "bolt_prestosql_coverage",
-            "bolt_memcpy_meter",
-            "bolt_query_replayer",
-            "bolt_trace_file_tool",
-        ]
-        benchmarks = [
-            "_benchmarks_",
-            "_benchmarks",
-            "benchmarks",
-            "_benchmark_",
-            "_benchmark",
-            "benchmark",
-            "_bm",
-        ]
-        if (
-            name in executable
-            or "example" in name
-            or name.endswith("test")
-            or name.endswith("benchmark")
-            or name.endswith("fuzzer")
-        ):
-            return False
-        for benchmark in benchmarks:
-            if benchmark in name:
-                return False
-        names = ["duckdb", "tpch_extension", "dbgen", "md5"]
-        return name in names or name.startswith("bolt")
-
-    def get_edge(self, graph, edge):
-        dst, src = edge.get_destination(), edge.get_source()
-        dst_name = graph.get_node(dst)[0].get_attributes()["label"]
-        src_name = graph.get_node(src)[0].get_attributes()["label"]
-        return src_name.replace('"', ""), dst_name.replace('"', "")
-
-    def append_result(self, result, src_name, dst_name):
-        if src_name in result:
-            if self.is_bolt(dst_name):
-                result[src_name][0].append(dst_name)
-            else:
-                result[src_name][1].append(dst_name)
-        else:
-            if self.is_bolt(dst_name):
-                result[src_name] = [[dst_name], []]
-            else:
-                result[src_name] = [[], [dst_name]]
-        if dst_name not in result and self.is_bolt(dst_name):
-            result[dst_name] = [[], []]
-
-    def get_dep(self, path):
-        graph = pydot.graph_from_dot_file(path)[0]
-        dependencies = {}
-        black_list = [
-            "bolt_link_libs",
-            "bolt_fuzzer_connector",
-            "bolt_hive_config",
-            "bolt_functions_string",
-        ]
-        for edge in graph.get_edge_list():
-            src_name, dst_name = self.get_edge(graph, edge)
-            # We will not process target if target's name isn't v with 'bolt'
-            if (
-                not self.is_bolt(src_name)
-                or (dst_name in black_list)
-                or (src_name in black_list)
-            ):
-                continue
-            self.append_result(dependencies, src_name, dst_name)
-        return dependencies
-
-    def get_bolt_dep(self, path):
-        ans = {}
-        result = self.get_dep(path)
-        for key in result:
-            ans[key] = result[key][0]
-        return ans
-
-    def get_third_party_dep(self, path):
-        ans = {}
-        result = self.get_dep(path)
-        for key in result:
-            ans[key] = result[key][1]
-        return ans
-
-
 class BoltConan(ConanFile):
     description = """
         Bolt is a C++ acceleration library providing composable, extensible and performant data processing toolkit.
@@ -170,21 +81,19 @@ class BoltConan(ConanFile):
         "python_bind": [True, False],
         "spark_compatible": [True, False],
         "enable_testutil": [True, False],
-        "enable_test": [True, False],
-        "build_benchmark": ["off", "basic", "on"],
-        "enable_coverage": [True, False],
         # format options
         "enable_parquet": [True, False],
         "enable_orc": [True, False],
         "enable_txt": [True, False],
+        "enable_paimon": [True, False],
         # file system options
         "enable_hdfs": [True, False],
         "enable_s3": [True, False],
+        "enable_gcs": [True, False],
+        "enable_abfs": [True, False],
         "use_arrow_hdfs": [True, False],
         "enable_asan": [True, False],
         "enable_jit": [True, False],
-        "enable_color": [True, False],
-        "enable_exception_trace": [True, False],
         "es_build": [True, False],
         "ldb_build": [True, False],
         "enable_arrow_connector": [True, False],
@@ -192,51 +101,51 @@ class BoltConan(ConanFile):
         "enable_colocate": [True, False],
         "io_uring_supported": [True, False],
         "enable_torch": TorchOption.all(),
+        "enable_cudf": [True, False],
         "enable_perf": [True, False],
-        "targets": ["ANY", None],
     }
     default_options = {
         "shared": False,
         "fPIC": True,
         "python_bind": False,
         "enable_asan": False,
-        "enable_color": True,
         # presto cpp worker needs bolt's testutil for ut
-        "enable_testutil": True,
-        # False by default, to avoid linking
-        "enable_test": False,
-        "build_benchmark": "off",
-        "enable_coverage": False,
+        "enable_testutil": False,
         "enable_parquet": True,
         "enable_orc": True,
         "enable_txt": True,
+        "enable_paimon": True,
         # file system options
         "enable_hdfs": True,
         "enable_s3": False,
+        "enable_gcs": False,
+        "enable_abfs": False,
         "use_arrow_hdfs": True,
-        "targets": None,
         "enable_arrow_connector": False,
         "enable_jit": True,
         "spark_compatible": False,
         "es_build": False,
-        "enable_exception_trace": True,
         "ldb_build": False,
         # bytedance presto do not support crc flag
         "enable_crc": False,
         "enable_colocate": False,
         "io_uring_supported": True,
         "enable_torch": TorchOption().value,
+        "enable_cudf": False,
         "enable_perf": False,
     }
 
     FB_VERSION = "2022.10.31.00"
 
     # global compiler options
-    BOLT_GLOABL_FLAGS = "-Werror=return-type"
+    BOLT_GLOBAL_FLAGS = "-Werror=return-type"
 
     build_policy = "missing"
 
-    scm_url = "https://github.com/bytedance/bolt.git"
+    @property
+    def scm_url(self):
+        # The Conan user selects the GitHub owner, defaulting to upstream.
+        return f"https://github.com/{self.user or 'bytedance'}/bolt.git"
 
     def source(self):
         git = scm.Git(self)
@@ -244,7 +153,7 @@ class BoltConan(ConanFile):
         # by default, use main branch
         git.clone(self.scm_url, target=".")
 
-        # if use 'stable" channel, we should use a git relase tag.
+        # if use 'stable" channel, we should use a git release tag.
         # TODO: Remove it since Conan 2.0 is no longer recommending to use
         # variable users and channels
         if self.channel and self.channel == "stable":
@@ -276,8 +185,22 @@ class BoltConan(ConanFile):
                     f"Has minimum kernel required for io_uring: {has_minimum_kernel}"
                 )
                 return has_minimum_kernel
-        self.output.info(f"OS is not Linux. io_uring is not supported.")
+        self.output.info("OS is not Linux. io_uring is not supported.")
         return False
+
+    def _test_linkage(self):
+        linkage = os.getenv("BOLT_TEST_LINKAGE", "shared")
+        if linkage not in ("static", "shared"):
+            raise ConanInvalidConfiguration(
+                "BOLT_TEST_LINKAGE must be either 'static' or 'shared'"
+            )
+        return linkage
+
+    def _needs_test_runtime(self):
+        if not self.options.get_safe("enable_testutil"):
+            return False
+        library_linkage = "shared" if self.options.shared else "static"
+        return self._test_linkage() != library_linkage
 
     def requirements(self):
         protobuf_version = os.getenv("PROTOBUF_VERSION", "3.21.4")
@@ -286,13 +209,29 @@ class BoltConan(ConanFile):
         )
         self.requires("arrow/15.0.1-oss", transitive_headers=True, transitive_libs=True)
         if self.options.get_safe("enable_jit"):
-            self.requires("llvm-core/13.0.0")
+            self.requires("llvm-core/19.1.7-bolt")
 
         if self.options.get_safe("enable_s3"):
-            self.requires("aws-sdk-cpp/1.11.692", transitive_headers=True, transitive_libs=True)
+            self.requires(
+                "aws-sdk-cpp/1.11.692", transitive_headers=True, transitive_libs=True
+            )
             self.requires("aws-c-common/0.12.5", force=True)
+        if self.options.get_safe("enable_gcs"):
+            self.requires(
+                "google-cloud-cpp/[>=2.10 <3]",
+                transitive_headers=True,
+                transitive_libs=True,
+            )
+        if self.options.get_safe("enable_abfs"):
+            self.requires(
+                "azure-sdk-for-cpp/1.16.1",
+                transitive_headers=True,
+                transitive_libs=True,
+            )
         self.requires("simdjson/3.12.3", transitive_headers=True)
-        self.requires("sonic-cpp/1.0.2-fix", transitive_headers=True, transitive_libs=True)
+        self.requires(
+            "sonic-cpp/1.0.2-bolt", transitive_headers=True, transitive_libs=True
+        )
         self.requires(
             f"protobuf/{protobuf_version}",
             transitive_headers=True,
@@ -300,7 +239,6 @@ class BoltConan(ConanFile):
             force=True,
         )
         self.requires("re2/20230301", transitive_headers=True, transitive_libs=True)
-        self.requires("gtest/1.17.0")
         self.requires(
             "icu/74.2", headers=True, transitive_headers=True, transitive_libs=True
         )
@@ -315,8 +253,10 @@ class BoltConan(ConanFile):
             "fmt/9.0.0", transitive_headers=True, transitive_libs=True, force=True
         )
         self.requires("ryu/2.0.1", transitive_headers=True, transitive_libs=True)
-        self.requires("cpr/1.10.5")
+        if self.options.get_safe("enable_testutil"):
+            self.requires("cpr/1.10.5")
         self.requires("zlib/[>=1.3.1 <2]", force=True)
+        self.requires("zstd/1.5.7", override=True)
         self.requires(
             "flex/2.6.4",
             visible=False,
@@ -326,11 +266,11 @@ class BoltConan(ConanFile):
             transitive_libs=False,
         )
         self.requires("timsort/2.1.0", transitive_headers=True)
-        self.requires("duckdb/0.8.1")
         self.requires("snappy/1.2.1", headers=True, force=True)
         self.requires(
             "glog/0.7.1", headers=True, transitive_headers=True, transitive_libs=True
         )
+        self.requires("gflags/2.2.2", transitive_headers=True, transitive_libs=True)
         self.requires("thrift/0.17.0", headers=True, force=True)
         self.requires("roaring/4.3.1", headers=True)
         self.requires("boost/1.85.0", transitive_headers=True, transitive_libs=True)
@@ -344,50 +284,78 @@ class BoltConan(ConanFile):
             self.requires("liburing/2.6")
         if self.options.get_safe("python_bind"):
             self.requires("pybind11/2.13.1")
+        if self.options.get_safe("enable_cudf"):
+            self.requires("cudf/25.06")
         if self.options.get_safe("enable_colocate"):
-            self.requires(f"grpc/1.50.0")
-        # upgrade libcurl from 8.11.1 to 8.12.1 to avoid SIGABRT issue in https://github.com/curl/curl/issues/15725
-        self.requires("libcurl/8.12.1", override=True)
-        if self.options.enable_torch != None:
+            self.requires("grpc/1.50.0")
+
+        if (
+            self.options.enable_torch is not None
+            and self.options.enable_torch.value is not None
+        ):
             self.requires(
                 "libtorch/2.6.0", options={"torch": self.options.enable_torch}
             )
         if self.settings.os in ["Linux", "FreeBSD"]:
             if self.options.get_safe("enable_perf"):
                 self.requires("gperftools/2.16")
-                self.requires("libunwind/1.8.0", override=True)
-            else:
-                self.requires("libunwind/1.8.0")
+            self.requires("libunwind/1.8.3", force=True)
         self.requires("utf8proc/2.11.0", transitive_headers=True, transitive_libs=True)
         self.requires("date/3.0.4-bolt", transitive_headers=True, transitive_libs=True)
         self.requires("libbacktrace/cci.20210118")
         if self.options.get_safe("spark_compatible"):
             self.requires("celeborn-cpp-client/main-20251212")
+        if self.options.get_safe("enable_paimon"):
+            self.requires("paimon-cpp/0.0.4-bolt")
+        if self.options.get_safe("enable_testutil"):
+            self.requires("gtest/1.17.0", force=True)
+            self.requires("duckdb/1.1.3")
 
     def build_requirements(self):
         self.tool_requires("m4/1.4.19")
         self.tool_requires("bison/3.8.2")
         self.tool_requires("flex/2.6.4")
-        self.tool_requires("cmake/3.31.10", override=True)
+        self.tool_requires("cmake/3.31.10")
         self.tool_requires("ninja/1.11.1")
         self.tool_requires("protobuf/<host_version>")
         self.tool_requires("thrift/<host_version>")
-        if self.options.get_safe("enable_test") and self.settings.os in ["Linux", "FreeBSD"]:
+        if self._needs_test_runtime():
+            test_runtime_shared = self._test_linkage() == "shared"
+            # Keep the exported library's dependencies in the host context and
+            # provide the opposite linkage only for the test runtime.
+            self.requires(
+                "gflags/2.2.2",
+                build=True,
+                visible=False,
+                headers=True,
+                libs=True,
+                run=True,
+                options={"shared": test_runtime_shared},
+            )
+            self.requires(
+                "glog/0.7.1",
+                build=True,
+                visible=False,
+                headers=True,
+                libs=True,
+                run=True,
+                options={"shared": test_runtime_shared, "with_unwind": False},
+            )
+        if not self.conf.get("tools.build:skip_test", default=True):
             self.test_requires("jemalloc/5.3.0")
 
     def layout(self):
         cmake_layout(self, build_folder="_build")
 
     def config_options(self):
-        if self.options.get_safe("ldb_build"):
-            self.options.enable_exception_trace = False
+        pass
 
     # Set default options of third parties here
     def configure(self):
-        if not self.options.get_safe("enable_test"):
-            self.options.enable_coverage = False
-
         self.options[glog].with_unwind = False
+        if self.options.shared:
+            self.options[gflags].shared = True
+            self.options[glog].shared = True
         if self.options.get_safe("es_build"):
             self.options[glog].shared = True
 
@@ -396,18 +364,20 @@ class BoltConan(ConanFile):
         if not self.options.python_bind:
             self.options[boost].without_stacktrace = True
 
-        if not self.options.get_safe("enable_test"):
-            self.options.enable_coverage = False
-
         if self.options.get_safe("enable_s3"):
             s3_opt = self.options["aws-sdk-cpp/*"]
-            setattr(s3_opt, 'text-to-speech', False)
+            setattr(s3_opt, "text-to-speech", False)
+        self.options[paimon_cpp].shared = False
+        self.options[paimon_cpp].with_avro = True
 
         arrow_simd_level = "default"
+        llvm_targets = None
         if str(self.settings.arch) in ["x86", "x86_64"]:
             arrow_simd_level = "avx2"
+            llvm_targets = "X86"
         elif str(self.settings.arch) in ["armv8", "arm", "armv9"]:
             arrow_simd_level = "neon"
+            llvm_targets = "AArch64"
         self.options[arrow].parquet = True
         self.options[arrow].filesystem_layer = True
         self.options[arrow].simd_level = arrow_simd_level
@@ -423,19 +393,31 @@ class BoltConan(ConanFile):
         self.options[arrow].substrait = True
         # substrait depends on protobuf
         self.options[arrow].with_protobuf = True
-        self.options[arrow].arrow_acero = True
-        self.options[arrow].arrow_bundled_dependencies = True
+        self.options[arrow].acero = True
         if self.options.get_safe("enable_colocate"):
             self.options[arrow].with_boost = True
             self.options[arrow].with_gflags = True
             self.options[arrow].with_protobuf = True
             self.options[arrow].with_grpc = True
             self.options[arrow].with_flight_rpc = True
-        self.options[arrow].with_test = True
+        self.options[arrow].with_test = False
         self.options[arrow].with_csv = True
+        if self.options.get_safe("enable_jit"):
+            self.options[llvm_core].with_libedit = False
+            self.options[llvm_core].with_xml2 = False
+            self.options[llvm_core].with_z3 = False
+            self.options[llvm_core].with_zstd = False
+            self.options[llvm_core].with_ffi = False
+            self.options[llvm_core].with_clang = True
+            if llvm_targets is None:
+                raise RuntimeError("Unsupported target for JIT feature")
+            self.options[llvm_core].targets = llvm_targets
 
-        if self.options.get_safe("enable_hdfs") and self.options.get_safe("use_arrow_hdfs"):
-            self.options[arrow].with_hdfs = True
+        if self.options.get_safe("enable_hdfs") and self.options.get_safe(
+            "use_arrow_hdfs"
+        ):
+            # This is the legacy spelling exposed by the pinned Arrow recipe.
+            self.options[arrow].hdfs_bridgs = True
 
         if self.options.get_safe("es_build"):
             self.options[arrow].with_pyarrow = False
@@ -456,9 +438,10 @@ class BoltConan(ConanFile):
             self.options[onetbb].tbbmalloc = False
             # self.options[onetbb].tbbproxy = False
 
+        self.options[folly].no_exception_tracer = True
+
         openssl = f"openssl{postfix}"
         if self.options.get_safe("ldb_build"):
-            self.options[folly].no_exception_tracer = True
             self.options[openssl].rand_seed = "devrandom"
             self.options[boost].filesystem_disable_statx = True
             self.options[boost].without_stacktrace = True
@@ -483,40 +466,66 @@ class BoltConan(ConanFile):
 
         num_link_job = os.getenv("NUM_LINK_JOB", "4")
 
+        # e.g. `BOLT_LINKER=mold make release`
+        if "BOLT_LINKER" in os.environ:
+            bolt_linker = os.getenv("BOLT_LINKER")
+        else:
+            bolt_linker = self.conf.get("user.bolt:linker", default=None)
+
         tc = CMakeToolchain(self, generator="Ninja")
 
         tc.cache_variables["MAX_LINK_JOBS"] = num_link_job
+        tc.cache_variables["BOLT_TEST_LINKAGE"] = self._test_linkage()
+        if bolt_linker:
+            use_ld = f"-fuse-ld={bolt_linker}"
+            tc.extra_exelinkflags.append(use_ld)
+            tc.extra_sharedlinkflags.append(use_ld)
+            tc.cache_variables["CMAKE_MODULE_LINKER_FLAGS"] = use_ld
 
         if str(self.settings.arch) in ["x86", "x86_64"]:
             flags = (
-                f"{self.BOLT_GLOABL_FLAGS} -mavx2 -mfma -mavx -mf16c -mlzcnt -mbmi2 "
+                f"{self.BOLT_GLOBAL_FLAGS} -mavx2 -mfma -mavx -mf16c -mlzcnt -mbmi2 "
             )
-            tc.cache_variables["CMAKE_CXX_FLAGS"] = flags
-            tc.cache_variables["CMAKE_C_FLAGS"] = flags
+            tc.extra_cxxflags.append(flags)
+            tc.extra_cflags.append(flags)
 
-        if str(self.settings.arch) in ["armv8", "arm"]:
-            # Support CRC & NEON on ARMv8
-            flags = f"{self.BOLT_GLOABL_FLAGS} -march=armv8.3-a"
-            tc.cache_variables["CMAKE_CXX_FLAGS"] = flags
-            tc.cache_variables["CMAKE_C_FLAGS"] = flags
-        elif str(self.settings.arch) in ["armv9"] and not is_msvc(self):
-            # gcc 12+ https://www.phoronix.com/news/GCC-12-ARMv9-march-armv9-a
-            flags = f"{self.BOLT_GLOABL_FLAGS} -march=armv9-a"
-            tc.variables["CMAKE_C_FLAGS"] = flags
-            tc.variables["CMAKE_CXX_FLAGS"] = flags
+        if str(self.settings.arch) in ["armv8", "arm", "armv9"]:
+            flags = self._get_arm_cpu_flags()
+            tc.extra_cxxflags.append(flags)
+            tc.extra_cflags.append(flags)
 
-        if self.options.enable_torch != None:
+        if str(self.settings.compiler) == "clang":
+            # ThinLTO needs bitcode inputs as well as the linker flag.
+            tc.extra_cflags.append("-flto=thin")
+            tc.extra_cxxflags.append("-flto=thin")
+            tc.extra_exelinkflags.append("-flto=thin")
+            tc.extra_sharedlinkflags.append("-flto=thin")
+            # Avoid incorrect dynamic_cast results across ThinLTO shared libraries.
+            # https://github.com/llvm/llvm-project/issues/71196
+            tc.extra_cxxflags.append("-fno-assume-unique-vtables")
+
+        if (
+            self.options.enable_torch is not None
+            and self.options.enable_torch.value is not None
+        ):
             tc.cache_variables["BOLT_ENABLE_TORCH"] = "ON"
         else:
             tc.cache_variables["BOLT_ENABLE_TORCH"] = "OFF"
 
+        tc.cache_variables["BOLT_ENABLE_CUDF"] = (
+            "ON" if self.options.get_safe("enable_cudf") else "OFF"
+        )
+
         if self.options.enable_asan:
-            tc.cache_variables[
-                "CMAKE_CXX_FLAGS"
-            ] += " -fsanitize=address -fno-omit-frame-pointer "
-            tc.cache_variables[
-                "CMAKE_C_FLAGS"
-            ] += " -fsanitize=address -fno-omit-frame-pointer "
+            tc.extra_cxxflags.append("-fsanitize=address")
+            tc.extra_cflags.append("-fsanitize=address")
+
+        if (
+            str(self.settings.build_type) == "RelWithDebInfo"
+            or self.options.enable_asan
+        ):
+            tc.extra_cxxflags.append("-fno-omit-frame-pointer")
+            tc.extra_cflags.append("-fno-omit-frame-pointer")
 
         tc.cache_variables["TREAT_WARNINGS_AS_ERRORS"] = "OFF"
         tc.cache_variables["ENABLE_ALL_WARNINGS"] = "ON"
@@ -530,9 +539,21 @@ class BoltConan(ConanFile):
         tc.cache_variables["BOLT_ENABLE_TXT"] = (
             "ON" if self.options.enable_txt else "OFF"
         )
+        tc.cache_variables["BOLT_ENABLE_PAIMON"] = (
+            "ON" if self.options.enable_paimon else "OFF"
+        )
         if self.options.get_safe("enable_jit"):
             tc.cache_variables["ENABLE_BOLT_JIT"] = "ON"
             tc.preprocessor_definitions["ENABLE_BOLT_JIT"] = 1
+
+            # Verify clang exists in llvm-core package.
+            llvm_dep = self.dependencies["llvm-core"]
+            clang_path = os.path.join(str(llvm_dep.package_folder), "bin", "clang")
+            if not os.path.exists(clang_path):
+                raise Exception(
+                    f"clang not found at {clang_path}. "
+                    "Ensure llvm-core is built with -o llvm-core/*:with_clang=True"
+                )
 
             # TODO: Refactor the IR codegen of expression evaluation
             # Disable it right now
@@ -561,54 +582,24 @@ class BoltConan(ConanFile):
             if tc.preprocessor_definitions.get("ENABLE_META_SORT", None) is not None:
                 del tc.preprocessor_definitions["ENABLE_META_SORT"]
 
-        # enable_exception_trace
-        tc.cache_variables["ENABLE_EXCEPTION_TRACE"] = self.options.get_safe(
-            "enable_exception_trace"
-        )
-        if self.options.get_safe("enable_exception_trace"):
-            tc.preprocessor_definitions["ENABLE_EXCEPTION_TRACE"] = 1
-        else:
-            if (
-                tc.preprocessor_definitions.get("ENABLE_EXCEPTION_TRACE", None)
-                is not None
-            ):
-                del tc.preprocessor_definitions["ENABLE_EXCEPTION_TRACE"]
-
         if self.options.es_build:
             tc.cache_variables["BOLT_ENABLE_SIMDJSON"] = "ON"
 
-        if self.options.python_bind:
-            tc.cache_variables["BOLT_BUILD_PYTHON_PACKAGE"] = "ON"
+        tc.cache_variables["BOLT_BUILD_PYTHON_PACKAGE"] = (
+            "ON" if self.options.python_bind else "OFF"
+        )
 
         if self.options.enable_arrow_connector:
             tc.cache_variables["BOLT_ENABLE_ARROW_CONNECTOR"] = "ON"
 
-        if self.options.spark_compatible:
-            tc.cache_variables["BOLT_ENABLE_SPARK_COMPATIBLE"] = "ON"
+        tc.cache_variables["BOLT_ENABLE_SPARK_COMPATIBLE"] = (
+            "ON" if self.options.spark_compatible else "OFF"
+        )
 
         if self.options.get_safe("enable_testutil"):
             tc.cache_variables["BOLT_ENABLE_DUCKDB"] = "ON"
             tc.cache_variables["BOLT_BUILD_TEST_UTILS"] = "ON"
-        if self.options.get_safe("enable_test"):
-            tc.cache_variables["BOLT_BUILD_TESTING"] = "ON"
-        else:
-            tc.cache_variables["BOLT_BUILD_TESTING"] = "OFF"
-            self.output.info("BOLT_BUILD_TESTING is disabled")
-
-        if self.options.get_safe("build_benchmark") == "on":
-            tc.cache_variables["BOLT_BUILD_BENCHMARKS"] = "ON"
-            self.output.info("BOLT_BUILD_BENCHMARKS is enabled")
-        elif self.options.get_safe("build_benchmark") == "basic":
-            tc.cache_variables["BOLT_BUILD_BENCHMARKS_BASIC"] = "ON"
-            self.output.info("BOLT_BUILD_BENCHMARKS_BASIC is enabled")
-        else:
-            self.output.info("BOLT_BUILD_BENCHMARKS is disabled")
-
-        if self.options.get_safe("enable_coverage"):
-            tc.cache_variables["BOLT_BUILD_TESTING_WITH_COVERAGE"] = "ON"
-        else:
-            tc.cache_variables["BOLT_BUILD_TESTING_WITH_COVERAGE"] = "OFF"
-            self.output.info("BOLT_BUILD_TESTING_WITH_COVERAGE is disabled")
+            tc.cache_variables["BOLT_ENABLE_PARSE"] = "ON"
 
         # hdfs file system, arrow implement as default
         if self.options.get_safe("enable_hdfs"):
@@ -624,8 +615,15 @@ class BoltConan(ConanFile):
         if self.options.get_safe("enable_s3"):
             tc.cache_variables["BOLT_ENABLE_S3"] = "ON"
 
-        if self.options.enable_color:
-            tc.cache_variables["BOLT_FORCE_COLORED_OUTPUT"] = "ON"
+        tc.cache_variables["BOLT_ENABLE_GCS"] = "OFF"
+        if self.options.get_safe("enable_gcs"):
+            tc.cache_variables["BOLT_ENABLE_GCS"] = "ON"
+
+        tc.cache_variables["BOLT_ENABLE_ABFS"] = "OFF"
+        if self.options.get_safe("enable_abfs"):
+            tc.cache_variables["BOLT_ENABLE_ABFS"] = "ON"
+
+        tc.cache_variables["BOLT_FORCE_COLORED_OUTPUT"] = "ON"
         if self.options.enable_crc:
             tc.cache_variables["BOLT_ENABLE_CRC"] = "ON"
         if self.options.enable_colocate:
@@ -639,10 +637,49 @@ class BoltConan(ConanFile):
         if self.options.get_safe("enable_perf"):
             tc.cache_variables["BOLT_ENABLE_PERF"] = "ON"
 
+        # benchmark and coverage should NOT be in conan options/configurations
+        if not self.conf.get("tools.build:skip_test", default=True):
+            tc.cache_variables["BOLT_BUILD_TESTING"] = "ON"
+
+            if os.getenv("BOLT_BUILD_TESTING_WITH_COVERAGE", "OFF") == "ON":
+                tc.cache_variables["BOLT_BUILD_TESTING_WITH_COVERAGE"] = "ON"
+
+        if os.getenv("BOLT_BUILD_BENCHMARKS", "OFF") == "ON":
+            tc.cache_variables["BOLT_BUILD_BENCHMARKS"] = "ON"
+            tc.cache_variables["BOLT_BUILD_TESTING"] = "ON"
+            tc.cache_variables["BOLT_BUILD_BENCHMARKS_BASIC"] = "ON"
+        elif os.getenv("BOLT_BUILD_BENCHMARKS_BASIC", "OFF") == "ON":
+            tc.cache_variables["BOLT_BUILD_BENCHMARKS_BASIC"] = "ON"
+
         tc.generate()
 
         # generate conantoolchain.cmake & xxx-config.cmake
-        CMakeDeps(self).generate()
+        cmake_deps = CMakeDeps(self)
+        if self._needs_test_runtime():
+            cmake_deps.build_context_activated = ["gflags", "glog"]
+            cmake_deps.build_context_suffix = {
+                "gflags": "_test_runtime",
+                "glog": "_test_runtime",
+            }
+            cmake_deps.set_property(
+                "gflags",
+                "cmake_target_name",
+                "gflags_test_runtime::gflags_test_runtime",
+                build_context=True,
+            )
+            cmake_deps.set_property(
+                "gflags", "cmake_target_aliases", [], build_context=True
+            )
+            cmake_deps.set_property(
+                "glog",
+                "cmake_target_name",
+                "glog_test_runtime::glog_test_runtime",
+                build_context=True,
+            )
+            cmake_deps.set_property(
+                "glog", "cmake_target_aliases", [], build_context=True
+            )
+        cmake_deps.generate()
 
     def build(self):
         num_threads = os.getenv("NUM_THREADS", "4")
@@ -651,31 +688,12 @@ class BoltConan(ConanFile):
 
         cmake = CMake(self)
         cmake.configure()
-        targets = None
-        target_option = self.options.get_safe("targets")
-        if target_option != None:  # target is an internal class with __eq__ override
-            targets = str(target_option).split(",")
-            self.output.info(f"Building targets: {targets}")
-        cmake.build(target=targets)
-        self.generate_dep_graph()
-
-    def generate_dep_graph(self):
-        dot_file = os.path.join(self.build_folder, "graph", "bolt.dot")
-        graphviz_command =  f"cmake --graphviz={dot_file} ."
-        self.run(graphviz_command, cwd=self.build_folder)
-        # generate dependency graph
-        dep_path = os.path.join(self.build_folder, "deps")
-        deps = {
-            "deps": DepLoader().get_bolt_dep(dot_file),
-            "thirdparties": DepLoader().get_third_party_dep(dot_file),
-        }
-        os.makedirs(dep_path, exist_ok=True)
-        with open(os.path.join(dep_path, f"dep.json"), "w") as f:
-            json.dump(deps, f, indent=4)
-
-    def split_name_version(self, pkg_str):
-        parts = pkg_str.split("/", 1)
-        return parts
+        if os.getenv("BOLT_CONAN_CONFIGURE_ONLY") == "1":
+            self.output.info(
+                f"✓ compile_commands.json at {self.build_folder}/compile_commands.json"
+            )
+        else:
+            cmake.build()
 
     def package(self):
         files.copy(
@@ -703,42 +721,16 @@ class BoltConan(ConanFile):
 
     def package_info(self):
         self.cpp_info.set_property("cmake_target_name", "bolt::bolt")
-        self.cpp_info.set_property(
-            "cmake_file_name", "bolt"
-        )  # generates config file bolt-config.cmake
-        self.cpp_info.set_property(
-            "cmake_module_file_name", "bolt"
-        )  # generates Findbolt.cmake
-        with open(os.path.join(self.package_folder, "deps", "dep.json"), "r") as f:
-            deps = json.load(f)
-        components_graph_ = deps["deps"]
-        bolt_components_third_parties = deps["thirdparties"]
+        self.cpp_info.set_property("cmake_file_name", "bolt")
+        self.cpp_info.set_property("cmake_module_file_name", "bolt")
 
-        testutils_components_graph_ = {}
-        # if expose test utils for presto cpp worker,
-        # if not self.options.spark_compatible:
-        if self.options.enable_testutil:
-            components_graph_.update(testutils_components_graph_)
-
-        for comp, deps in components_graph_.items():
-            # Special handling for interface libraries
-            if comp == "bolt_type" or comp == "bolt_type_headers":
-                self.cpp_info.components[comp].libs = []
-            else:
-                self.cpp_info.components[comp].libs = [comp]
-            for dep in deps:
-                self.cpp_info.components[comp].requires.append(dep)
-
-            self.cpp_info.components[comp].set_property(
-                "cmake_target_name", f"bolt::{comp}"
-            )
-            self.cpp_info.components[comp].set_property("pkg_config_name", f"lib{comp}")
-
-        for comp, thirdparties in bolt_components_third_parties.items():
-            self.cpp_info.components[comp].requires.extend(
-                self._cmake_target_to_conan_pkgname(thirdparties)
-            )
-        self.cpp_info.requires.extend(
+        self.cpp_info.components["bolt_engine"].libs = ["bolt_engine"]
+        self.cpp_info.components["bolt_engine"].set_property(
+            "cmake_target_name", "bolt::bolt_engine"
+        )
+        if self.io_uring_supported():
+            self.cpp_info.components["bolt_engine"].defines.append("IO_URING_SUPPORTED")
+        self.cpp_info.components["bolt_engine"].requires.extend(
             [
                 "arrow::arrow",
                 "folly::folly",
@@ -746,21 +738,19 @@ class BoltConan(ConanFile):
                 "sonic-cpp::sonic-cpp",
                 "protobuf::protobuf",
                 "re2::re2",
-                "gtest::gtest",
                 "icu::icu",
                 "xsimd::xsimd",  # Adjust if the package defines a different target name
                 "cityhash::cityhash",
                 "xxhash::xxhash",
                 "fmt::fmt",
                 "ryu::ryu",
-                "cpr::cpr",
                 "timsort::timsort",
                 "utf8proc::utf8proc",
                 "date::date",
                 "openssl::openssl",
-                "duckdb::duckdb",
                 "libunwind::libunwind",
                 "snappy::snappy",
+                "gflags::gflags",
                 "glog::glog",
                 "thrift::thrift",
                 "roaring::roaring",
@@ -770,45 +760,145 @@ class BoltConan(ConanFile):
                 "libbacktrace::libbacktrace",
             ]
         )
-        if self.options.get_safe("enable_s3"):
-            self.cpp_info.requires.append("aws-c-common::aws-c-common")
-
-    def _cmake_target_to_conan_pkgname(self, deps_list):
-        if not isinstance(deps_list, list):
-            raise "error in third parties"
-        pkg_list = []
-        for tgt_name in deps_list:
-            # corner case:
-            # in the dot files generated by cmake
-            # the name of target with alias would look like: "xsimd\\n(xsimd::xsimd)"
-            # Note: instead of dot file,
-            # it would be better to generate dependency file using a cmake function
-            if "(" in tgt_name and ")" in tgt_name:
-                l = tgt_name.find("(")
-                r = tgt_name.find(")")
-                tgt_name = tgt_name[l + 1 : r]
-
-            # here, conan's API seems a bit weird
-            pkg = tgt_name.lower()
-
-            # check if is the direct depended 3rd parties
-            direct_visible_host = self.dependencies.filter(
-                {"build": False, "visible": True, "direct": True}
+        if self.options.get_safe("enable_testutil"):
+            self.cpp_info.components["bolt_engine"].requires.extend(
+                [
+                    "gtest::gtest",
+                    "cpr::cpr",
+                    "duckdb::duckdb",
+                ]
             )
-            prj_requires = [
-                str(r).split("/")[0] for r in direct_visible_host.values()
-            ]  # openssl/1.1.1
+        if self.options.get_safe("enable_jit"):
+            self.cpp_info.components["bolt_engine"].requires.append(
+                "llvm-core::llvm-core"
+            )
+            if self.settings.os == "Macos":
+                self.cpp_info.components["bolt_engine"].exelinkflags.append(
+                    "-Wl,-export_dynamic"
+                )
+            elif self.settings.os == "Linux":
+                self.cpp_info.components["bolt_engine"].exelinkflags.append(
+                    "-Wl,--export-dynamic-symbol=jit_*"
+                )
+        if (
+            self.options.enable_torch is not None
+            and self.options.enable_torch.value is not None
+        ):
+            self.cpp_info.components["bolt_engine"].requires.append(
+                "libtorch::libtorch"
+            )
+            self.cpp_info.components["bolt_engine"].defines.append("BOLT_HAS_TORCH=1")
+        if self.options.get_safe("python_bind"):
+            self.cpp_info.components["bolt_engine"].requires.append(
+                "pybind11::pybind11_"
+            )
+            self.cpp_info.components["bolt_engine"].defines.append("BOLT_HAS_PYTHON=1")
+        if self.options.get_safe("enable_cudf"):
+            self.cpp_info.components["bolt_engine"].requires.append("cudf::cudf")
+            self.cpp_info.components["bolt_engine"].defines.extend(
+                [
+                    "BOLT_HAS_CUDF=1",
+                    "LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE",
+                ]
+            )
+        if self.options.get_safe("enable_s3"):
+            self.cpp_info.components["bolt_engine"].requires.append(
+                "aws-c-common::aws-c-common"
+            )
+        if self.options.get_safe("spark_compatible") and not self.options.shared:
+            self.cpp_info.components["bolt_engine"].requires.append(
+                "celeborn-cpp-client::celeborn-cpp-client"
+            )
+        if self.options.get_safe("enable_paimon"):
+            self.cpp_info.components["bolt_engine"].requires.extend(
+                [
+                    "paimon-cpp::core",
+                    "paimon-cpp::format_avro",
+                    "paimon-cpp::avro",
+                    "paimon-cpp::fs_local",
+                    "paimon-cpp::tbb",
+                ]
+            )
 
-            if pkg == "protobuf::protoc":
-                continue
+        if self.options.get_safe("enable_testutil"):
+            self.cpp_info.components["bolt_testutils"].libs = ["bolt_testutils"]
+            self.cpp_info.components["bolt_testutils"].set_property(
+                "cmake_target_name", "bolt::bolt_testutils"
+            )
+            self.cpp_info.components["bolt_testutils"].requires = [
+                "bolt_engine",
+                "gflags::gflags",
+                "gtest::gtest",
+                "duckdb::duckdb",
+            ]
 
-            if pkg.split("::")[0] in prj_requires:
-                pkg_list.append(pkg)
+    def _get_arm_cpu_flags(self) -> str:
+        """
+        Detect specific ARM CPU and return optimal compiler flags.
 
-        return pkg_list
+        Detection:
+        Apple Silicon on Darwin -> -mcpu=apple-m1+crc
+        Linux ARM64 via MIDR_EL1 -> specific -mcpu flags
+        Fallback to generic -march flags
+        """
+        base_flags = self.BOLT_GLOBAL_FLAGS
 
-    def imports(self):
-        if self.options.get_safe("es_build"):
-            self.copy("*.dll", "bin", "bin")
-            self.copy("*.dylib*", "lib", "lib")
-            self.copy("*.so*", "lib", "lib")
+        # Apple Silicon detection (macOS)
+        # Note: Conan uses "Macos" not "macOS", see https://docs.conan.io/2/reference/config_files/settings.html
+        if self.settings.os == "Macos" and platform.machine() == "arm64":
+            self.output.info("Detected Apple Silicon, using -mcpu=apple-m1+crc")
+            return f"{base_flags} -mcpu=apple-m1+crc"
+
+        # Linux ARM64 detection via MIDR_EL1
+        if self.settings.os == "Linux":
+            midr_path = "/sys/devices/system/cpu/cpu0/regs/identification/midr_el1"
+            try:
+                with open(midr_path, "r") as f:
+                    midr_value = int(f.read().strip(), 16)
+
+                # Extract PartNum (bits 15:4) and Implementer (bits 31:24)
+                part_num = (midr_value >> 4) & 0xFFF
+                implementer = (midr_value >> 24) & 0xFF
+
+                # CPU flag mapping based on PartNum
+                cpu_flags_map = {
+                    0xD0C: "neoverse-n1",  # AWS Graviton2, Ampere Altra
+                    0xD49: "neoverse-n2",  # AWS Graviton3
+                    0xD40: "neoverse-v1",  # Neoverse V1
+                    0xD4F: "neoverse-v2",  # AWS Graviton4, NVIDIA Grace
+                    0xD06: "neoverse-n2",
+                }
+
+                if part_num in cpu_flags_map:
+                    cpu_name = cpu_flags_map[part_num]
+                    mcpu_flag = f"-mcpu={cpu_name}"
+
+                    # NVIDIA Grace (Neoverse V2 with NVIDIA implementer)
+                    if part_num == 0xD4F and implementer == 0x4E:
+                        mcpu_flag += "+crypto+sha3+sm4+sve2-aes+sve2-sha3+sve2-sm4"
+                        self.output.info(
+                            f"Detected NVIDIA Grace CPU, using {mcpu_flag}"
+                        )
+                    elif part_num == 0xD06 and implementer == 0x48:
+                        mcpu_flag += " -march=armv9-a+sve2-bitperm -msve-vector-bits=256 -DSVE_BITS=256"
+                        self.output.info(
+                            f"Detected ARM {cpu_name} with extra features, using {mcpu_flag}"
+                        )
+                    else:
+                        self.output.info(f"Detected ARM {cpu_name}, using {mcpu_flag}")
+
+                    return f"{base_flags} {mcpu_flag}"
+                else:
+                    self.output.info(
+                        f"Unknown ARM CPU (PartNum: 0x{part_num:x}), using fallback"
+                    )
+            except (FileNotFoundError, PermissionError, ValueError) as e:
+                self.output.warning(f"Could not detect ARM CPU via MIDR_EL1: {e}")
+
+        # Fallback based on arch setting (preserves original behavior)
+        if str(self.settings.arch) == "armv9":
+            self.output.info("Using fallback -march=armv9-a")
+            return f"{base_flags} -march=armv9-a"
+        else:
+            self.output.info("Using fallback -march=armv8.3-a")
+            return f"{base_flags} -march=armv8.3-a"

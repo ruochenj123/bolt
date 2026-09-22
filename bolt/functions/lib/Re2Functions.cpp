@@ -33,6 +33,7 @@
 #include "folly/container/EvictingCacheMap.h"
 
 #include <re2/re2.h>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,7 +46,7 @@ using ::bytedance::bolt::exec::VectorFunction;
 using ::bytedance::bolt::exec::VectorFunctionArg;
 using ::re2::RE2;
 
-// set to 40 to more compitable with spark
+// set to 40 to more compatible with spark
 static const int kMaxCompiledRegexes = 40;
 
 std::string printTypesCsv(
@@ -107,6 +108,21 @@ bool re2PartialMatch(StringView str, const RE2& re) {
   return RE2::PartialMatch(toStringPiece(str), re);
 }
 
+bool handleInvalidRegex(
+    const RE2& re,
+    InvalidRegexPolicy invalidRegexPolicy,
+    std::function<void()> returnFalse) {
+  if (LIKELY(re.ok())) {
+    return true;
+  }
+  if (invalidRegexPolicy == InvalidRegexPolicy::kReturnFalse) {
+    returnFalse();
+    return false;
+  }
+  BOLT_USER_FAIL("invalid regular expression: {}", re.error());
+  return false;
+}
+
 bool re2Extract(
     FlatVector<StringView>& result,
     int row,
@@ -114,7 +130,7 @@ bool re2Extract(
     const exec::LocalDecodedVector& strs,
     std::vector<re2::StringPiece>& groups,
     int32_t groupId,
-    bool emptyNoMatch) {
+    const Re2ExtractOptions& options) {
   const StringView str = strs->valueAt<StringView>(row);
   DCHECK_GT(groups.size(), groupId);
   if (!re.Match(
@@ -124,15 +140,20 @@ bool re2Extract(
           RE2::UNANCHORED, // Full match not required.
           groups.data(),
           groupId + 1)) {
-    if (emptyNoMatch) {
+    if (options.noMatchPolicy == Re2ExtractResultPolicy::kReturnEmptyString) {
       result.setNoCopy(row, StringView(nullptr, 0));
-      return true;
+      return false;
     } else {
       result.setNull(row, true);
       return false;
     }
   } else {
     const re2::StringPiece extracted = groups[groupId];
+    if (groupId > 0 && extracted.data() == nullptr &&
+        options.unmatchedGroupPolicy == Re2ExtractResultPolicy::kReturnNull) {
+      result.setNull(row, true);
+      return false;
+    }
     result.setNoCopy(row, StringView(extracted.data(), extracted.size()));
     return !StringView::isInline(extracted.size());
   }
@@ -197,8 +218,11 @@ std::string likePatternToRe2(
 template <bool (*Fn)(StringView, const RE2&)>
 class Re2MatchConstantPattern final : public VectorFunction {
  public:
-  explicit Re2MatchConstantPattern(StringView pattern)
-      : re_(toStringPiece(pattern), RE2::Quiet) {}
+  explicit Re2MatchConstantPattern(
+      StringView pattern,
+      InvalidRegexPolicy invalidRegexPolicy)
+      : re_(toStringPiece(pattern), RE2::Quiet),
+        invalidRegexPolicy_(invalidRegexPolicy) {}
 
   void apply(
       const SelectivityVector& rows,
@@ -210,7 +234,17 @@ class Re2MatchConstantPattern final : public VectorFunction {
     FlatVector<bool>& result = ensureWritableBool(rows, context, resultRef);
     exec::LocalDecodedVector toSearch(context, *args[0], rows);
     try {
-      checkForBadPattern(re_);
+      if (!handleInvalidRegex(re_, invalidRegexPolicy_, [&]() {
+            context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
+              if (UNLIKELY(toSearch->isNullAt(i))) {
+                result.setNull(i, true);
+              } else {
+                result.set(i, false);
+              }
+            });
+          })) {
+        return;
+      }
     } catch (const std::exception& e) {
       context.setErrors(rows, std::current_exception());
       return;
@@ -223,12 +257,15 @@ class Re2MatchConstantPattern final : public VectorFunction {
 
  private:
   RE2 re_;
+  const InvalidRegexPolicy invalidRegexPolicy_;
 };
 
 template <bool (*Fn)(StringView, const RE2&)>
 class Re2Match final : public VectorFunction {
  public:
-  Re2Match() : compiledRegularExpressions_(kMaxCompiledRegexes) {}
+  explicit Re2Match(InvalidRegexPolicy invalidRegexPolicy)
+      : compiledRegularExpressions_(kMaxCompiledRegexes),
+        invalidRegexPolicy_(invalidRegexPolicy) {}
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -238,8 +275,8 @@ class Re2Match final : public VectorFunction {
     BOLT_CHECK_EQ(args.size(), 2);
 
     if (auto pattern = getIfConstant<StringView>(*args[1])) {
-      Re2MatchConstantPattern<Fn>(*pattern).apply(
-          rows, args, outputType, context, resultRef);
+      Re2MatchConstantPattern<Fn>(*pattern, invalidRegexPolicy_)
+          .apply(rows, args, outputType, context, resultRef);
       return;
     }
     // General case.
@@ -260,7 +297,8 @@ class Re2Match final : public VectorFunction {
           } else {
             auto regex =
                 std::make_shared<RE2>(toStringPiece(pattern), RE2::Quiet);
-            if (UNLIKELY(!regex->ok())) {
+            if (UNLIKELY(!regex->ok()) &&
+                invalidRegexPolicy_ == InvalidRegexPolicy::kThrow) {
               BOLT_USER_FAIL("invalid regular expression: {}", regex->error());
             }
             auto regexResult =
@@ -270,6 +308,13 @@ class Re2Match final : public VectorFunction {
           }
         }
         BOLT_CHECK_NOT_NULL(impl);
+        if (UNLIKELY(!impl->ok())) {
+          if (invalidRegexPolicy_ == InvalidRegexPolicy::kReturnFalse) {
+            result.set(row, false);
+            return;
+          }
+          BOLT_USER_FAIL("invalid regular expression: {}", impl->error());
+        }
         result.set(row, Fn(toSearch->valueAt<StringView>(row), *impl));
       }
     });
@@ -280,6 +325,7 @@ class Re2Match final : public VectorFunction {
   mutable folly::EvictingCacheMap<std::string, std::shared_ptr<RE2>>
       compiledRegularExpressions_;
   mutable std::mutex mutex_;
+  const InvalidRegexPolicy invalidRegexPolicy_;
 }; // namespace
 
 void checkForBadGroupId(int64_t groupId, const RE2& re) {
@@ -288,13 +334,44 @@ void checkForBadGroupId(int64_t groupId, const RE2& re) {
   }
 }
 
+bool validatePatternForExtract(const RE2& re, Re2ExtractErrorPolicy policy) {
+  if (LIKELY(re.ok())) {
+    return true;
+  }
+  if (policy == Re2ExtractErrorPolicy::kReturnNull) {
+    return false;
+  }
+  checkForBadPattern(re);
+  return false;
+}
+
+bool validateGroupIdForExtract(
+    int64_t groupId,
+    const RE2& re,
+    Re2ExtractErrorPolicy policy) {
+  if (LIKELY(groupId >= 0 && groupId <= re.NumberOfCapturingGroups())) {
+    return true;
+  }
+  if (policy == Re2ExtractErrorPolicy::kReturnNull) {
+    return false;
+  }
+  checkForBadGroupId(groupId, re);
+  return false;
+}
+
+void setNullForRows(
+    const SelectivityVector& rows,
+    FlatVector<StringView>& result) {
+  rows.applyToSelected([&](vector_size_t row) { result.setNull(row, true); });
+}
+
 template <typename T>
 class Re2SearchAndExtractConstantPattern final : public VectorFunction {
  public:
   explicit Re2SearchAndExtractConstantPattern(
       StringView pattern,
-      bool emptyNoMatch)
-      : re_(toStringPiece(pattern), RE2::Quiet), emptyNoMatch_(emptyNoMatch) {}
+      const Re2ExtractOptions& options)
+      : re_(toStringPiece(pattern), RE2::Quiet), options_(options) {}
 
   void apply(
       const SelectivityVector& rows,
@@ -303,14 +380,17 @@ class Re2SearchAndExtractConstantPattern final : public VectorFunction {
       EvalCtx& context,
       VectorPtr& resultRef) const final {
     BOLT_CHECK(args.size() == 2 || args.size() == 3);
-    // TODO: Potentially re-use the string vector, not just the buffer.
+    // TODO: Potentially reuse the string vector, not just the buffer.
     FlatVector<StringView>& result =
         ensureWritableStringView(rows, context, resultRef);
 
     // apply() will not be invoked if the selection is empty.
     try {
-      checkForBadPattern(re_);
-    } catch (const std::exception& e) {
+      if (!validatePatternForExtract(re_, options_.invalidRegexPolicy)) {
+        setNullForRows(rows, result);
+        return;
+      }
+    } catch (const std::exception& /* e */) {
       context.setErrors(rows, std::current_exception());
       return;
     }
@@ -323,7 +403,7 @@ class Re2SearchAndExtractConstantPattern final : public VectorFunction {
       groups.resize(1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
         mustRefSourceStrings |=
-            re2Extract(result, i, re_, toSearch, groups, 0, emptyNoMatch_);
+            re2Extract(result, i, re_, toSearch, groups, 0, options_);
       });
       if (mustRefSourceStrings) {
         result.acquireSharedStringBuffers(toSearch->base());
@@ -333,16 +413,20 @@ class Re2SearchAndExtractConstantPattern final : public VectorFunction {
 
     if (const auto groupId = getIfConstant<T>(*args[2])) {
       try {
-        checkForBadGroupId(*groupId, re_);
-      } catch (const std::exception& e) {
+        if (!validateGroupIdForExtract(
+                *groupId, re_, options_.invalidGroupPolicy)) {
+          setNullForRows(rows, result);
+          return;
+        }
+      } catch (const std::exception& /* e */) {
         context.setErrors(rows, std::current_exception());
         return;
       }
 
       groups.resize(*groupId + 1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
-        mustRefSourceStrings |= re2Extract(
-            result, i, re_, toSearch, groups, *groupId, emptyNoMatch_);
+        mustRefSourceStrings |=
+            re2Extract(result, i, re_, toSearch, groups, *groupId, options_);
       });
       if (mustRefSourceStrings) {
         result.acquireSharedStringBuffers(toSearch->base());
@@ -357,9 +441,12 @@ class Re2SearchAndExtractConstantPattern final : public VectorFunction {
     groups.resize(re_.NumberOfCapturingGroups() + 1);
     context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
       T group = groupIds->valueAt<T>(i);
-      checkForBadGroupId(group, re_);
+      if (!validateGroupIdForExtract(group, re_, options_.invalidGroupPolicy)) {
+        result.setNull(i, true);
+        return;
+      }
       mustRefSourceStrings |=
-          re2Extract(result, i, re_, toSearch, groups, group, emptyNoMatch_);
+          re2Extract(result, i, re_, toSearch, groups, group, options_);
     });
     if (mustRefSourceStrings) {
       result.acquireSharedStringBuffers(toSearch->base());
@@ -368,7 +455,7 @@ class Re2SearchAndExtractConstantPattern final : public VectorFunction {
 
  private:
   RE2 re_;
-  const bool emptyNoMatch_;
+  const Re2ExtractOptions options_;
 }; // namespace
 
 // The factory function we provide returns a unique instance for each call, so
@@ -376,8 +463,8 @@ class Re2SearchAndExtractConstantPattern final : public VectorFunction {
 template <typename T>
 class Re2SearchAndExtract final : public VectorFunction {
  public:
-  explicit Re2SearchAndExtract(bool emptyNoMatch)
-      : emptyNoMatch_(emptyNoMatch) {}
+  explicit Re2SearchAndExtract(const Re2ExtractOptions& options)
+      : options_(options) {}
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -387,7 +474,7 @@ class Re2SearchAndExtract final : public VectorFunction {
     BOLT_CHECK(args.size() == 2 || args.size() == 3);
     // Handle the common case of a constant pattern.
     if (auto pattern = getIfConstant<StringView>(*args[1])) {
-      Re2SearchAndExtractConstantPattern<T>(*pattern, emptyNoMatch_)
+      Re2SearchAndExtractConstantPattern<T>(*pattern, options_)
           .apply(rows, args, outputType, context, resultRef);
       return;
     }
@@ -404,20 +491,27 @@ class Re2SearchAndExtract final : public VectorFunction {
       groups.resize(1);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
         RE2 re(toStringPiece(pattern->valueAt<StringView>(i)), RE2::Quiet);
-        checkForBadPattern(re);
+        if (!validatePatternForExtract(re, options_.invalidRegexPolicy)) {
+          result.setNull(i, true);
+          return;
+        }
         mustRefSourceStrings |=
-            re2Extract(result, i, re, toSearch, groups, 0, emptyNoMatch_);
+            re2Extract(result, i, re, toSearch, groups, 0, options_);
       });
     } else {
       exec::LocalDecodedVector groupIds(context, *args[2], rows);
       context.applyToSelectedNoThrow(rows, [&](vector_size_t i) {
         const auto groupId = groupIds->valueAt<T>(i);
         RE2 re(toStringPiece(pattern->valueAt<StringView>(i)), RE2::Quiet);
-        checkForBadPattern(re);
-        checkForBadGroupId(groupId, re);
+        if (!validatePatternForExtract(re, options_.invalidRegexPolicy) ||
+            !validateGroupIdForExtract(
+                groupId, re, options_.invalidGroupPolicy)) {
+          result.setNull(i, true);
+          return;
+        }
         groups.resize(groupId + 1);
         mustRefSourceStrings |=
-            re2Extract(result, i, re, toSearch, groups, groupId, emptyNoMatch_);
+            re2Extract(result, i, re, toSearch, groups, groupId, options_);
       });
     }
     if (mustRefSourceStrings) {
@@ -426,7 +520,7 @@ class Re2SearchAndExtract final : public VectorFunction {
   }
 
  private:
-  const bool emptyNoMatch_;
+  const Re2ExtractOptions options_;
 };
 
 // Match string 'input' with a fixed pattern (with no wildcard characters).
@@ -687,8 +781,12 @@ class LikeGeneric final : public VectorFunction {
     auto applyRow = [&](const StringView& input,
                         const StringView& pattern,
                         const std::optional<char>& escapeChar) -> bool {
+      // Keep the pattern valid if memory arbitration reclaims its source
+      // buffer while processing this row.
+      const std::string patternCopy(pattern.data(), pattern.size());
+      const StringView patternView(patternCopy);
       PatternMetadata patternMetadata =
-          determinePatternKind(std::string_view(pattern), escapeChar);
+          determinePatternKind(patternCopy, escapeChar);
       const auto reducedLength = patternMetadata.length;
       const auto& fixedPattern = patternMetadata.fixedPattern;
 
@@ -696,10 +794,10 @@ class LikeGeneric final : public VectorFunction {
         switch (patternMetadata.patternKind) {
           case PatternKind::kExactlyN:
             return OptimizedLike<PatternKind::kExactlyN>::match<
-                /*isAscii*/ true>(input, pattern, reducedLength);
+                /*isAscii*/ true>(input, patternView, reducedLength);
           case PatternKind::kAtLeastN:
             return OptimizedLike<PatternKind::kAtLeastN>::match<
-                /*isAscii*/ true>(input, pattern, reducedLength);
+                /*isAscii*/ true>(input, patternView, reducedLength);
           case PatternKind::kFixed:
             return OptimizedLike<PatternKind::kFixed>::match</*isAscii*/ true>(
                 input, fixedPattern, reducedLength);
@@ -713,16 +811,16 @@ class LikeGeneric final : public VectorFunction {
             return OptimizedLike<PatternKind::kSubstring>::match<
                 /*isAscii*/ true>(input, fixedPattern, reducedLength);
           default:
-            return applyWithRegex(input, pattern, escapeChar);
+            return applyWithRegex(input, patternView, escapeChar);
         }
       } else {
         switch (patternMetadata.patternKind) {
           case PatternKind::kExactlyN:
             return OptimizedLike<PatternKind::kExactlyN>::match<
-                /*isAscii*/ false>(input, pattern, reducedLength);
+                /*isAscii*/ false>(input, patternView, reducedLength);
           case PatternKind::kAtLeastN:
             return OptimizedLike<PatternKind::kAtLeastN>::match<
-                /*isAscii*/ false>(input, pattern, reducedLength);
+                /*isAscii*/ false>(input, patternView, reducedLength);
           case PatternKind::kFixed:
             return OptimizedLike<PatternKind::kFixed>::match</*isAscii*/ false>(
                 input, fixedPattern, reducedLength);
@@ -736,7 +834,7 @@ class LikeGeneric final : public VectorFunction {
             return OptimizedLike<PatternKind::kSubstring>::match<
                 /*isAscii*/ false>(input, fixedPattern, reducedLength);
           default:
-            return applyWithRegex(input, pattern, escapeChar);
+            return applyWithRegex(input, patternView, escapeChar);
         }
       }
     };
@@ -950,7 +1048,8 @@ class Re2ExtractAll final : public VectorFunction {
 template <bool (*Fn)(StringView, const RE2&)>
 std::shared_ptr<VectorFunction> makeRe2MatchImpl(
     const std::string& name,
-    const std::vector<VectorFunctionArg>& inputArgs) {
+    const std::vector<VectorFunctionArg>& inputArgs,
+    InvalidRegexPolicy invalidRegexPolicy) {
   if (inputArgs.size() != 2 || !inputArgs[0].type->isVarchar() ||
       !inputArgs[1].type->isVarchar()) {
     BOLT_UNSUPPORTED(
@@ -963,11 +1062,10 @@ std::shared_ptr<VectorFunction> makeRe2MatchImpl(
 
   if (constantPattern != nullptr && !constantPattern->isNullAt(0)) {
     return std::make_shared<Re2MatchConstantPattern<Fn>>(
-        constantPattern->as<ConstantVector<StringView>>()->valueAt(0));
+        constantPattern->as<ConstantVector<StringView>>()->valueAt(0),
+        invalidRegexPolicy);
   }
-  static std::shared_ptr<Re2Match<Fn>> kMatchExpr =
-      std::make_shared<Re2Match<Fn>>();
-  return kMatchExpr;
+  return std::make_shared<Re2Match<Fn>>(invalidRegexPolicy);
 }
 
 } // namespace
@@ -976,7 +1074,8 @@ std::shared_ptr<VectorFunction> makeRe2Match(
     const std::string& name,
     const std::vector<VectorFunctionArg>& inputArgs,
     const core::QueryConfig& /*config*/) {
-  return makeRe2MatchImpl<re2FullMatch>(name, inputArgs);
+  return makeRe2MatchImpl<re2FullMatch>(
+      name, inputArgs, InvalidRegexPolicy::kThrow);
 }
 
 std::vector<std::shared_ptr<exec::FunctionSignature>> re2MatchSignatures() {
@@ -991,8 +1090,17 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> re2MatchSignatures() {
 std::shared_ptr<VectorFunction> makeRe2Search(
     const std::string& name,
     const std::vector<VectorFunctionArg>& inputArgs,
-    const core::QueryConfig& /*config*/) {
-  return makeRe2MatchImpl<re2PartialMatch>(name, inputArgs);
+    const core::QueryConfig& config) {
+  return makeRe2SearchWithPolicy(
+      name, inputArgs, config, InvalidRegexPolicy::kThrow);
+}
+
+std::shared_ptr<VectorFunction> makeRe2SearchWithPolicy(
+    const std::string& name,
+    const std::vector<VectorFunctionArg>& inputArgs,
+    const core::QueryConfig& /*config*/,
+    InvalidRegexPolicy invalidRegexPolicy) {
+  return makeRe2MatchImpl<re2PartialMatch>(name, inputArgs, invalidRegexPolicy);
 }
 
 std::vector<std::shared_ptr<exec::FunctionSignature>> re2SearchSignatures() {
@@ -1007,8 +1115,20 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> re2SearchSignatures() {
 std::shared_ptr<VectorFunction> makeRe2Extract(
     const std::string& name,
     const std::vector<VectorFunctionArg>& inputArgs,
-    const core::QueryConfig& /*config*/,
+    const core::QueryConfig& config,
     const bool emptyNoMatch) {
+  Re2ExtractOptions options;
+  options.noMatchPolicy = emptyNoMatch
+      ? Re2ExtractResultPolicy::kReturnEmptyString
+      : Re2ExtractResultPolicy::kReturnNull;
+  return makeRe2ExtractWithOptions(name, inputArgs, config, options);
+}
+
+std::shared_ptr<VectorFunction> makeRe2ExtractWithOptions(
+    const std::string& name,
+    const std::vector<VectorFunctionArg>& inputArgs,
+    const core::QueryConfig& /*config*/,
+    const Re2ExtractOptions& options) {
   auto numArgs = inputArgs.size();
   BOLT_USER_CHECK(
       numArgs == 2 || numArgs == 3,
@@ -1047,10 +1167,10 @@ std::shared_ptr<VectorFunction> makeRe2Extract(
     switch (groupIdTypeKind) {
       case TypeKind::INTEGER:
         return std::make_shared<Re2SearchAndExtractConstantPattern<int32_t>>(
-            pattern, emptyNoMatch);
+            pattern, options);
       case TypeKind::BIGINT:
         return std::make_shared<Re2SearchAndExtractConstantPattern<int64_t>>(
-            pattern, emptyNoMatch);
+            pattern, options);
       default:
         BOLT_UNREACHABLE();
     }
@@ -1058,9 +1178,9 @@ std::shared_ptr<VectorFunction> makeRe2Extract(
 
   switch (groupIdTypeKind) {
     case TypeKind::INTEGER:
-      return std::make_shared<Re2SearchAndExtract<int32_t>>(emptyNoMatch);
+      return std::make_shared<Re2SearchAndExtract<int32_t>>(options);
     case TypeKind::BIGINT:
-      return std::make_shared<Re2SearchAndExtract<int64_t>>(emptyNoMatch);
+      return std::make_shared<Re2SearchAndExtract<int64_t>>(options);
     default:
       BOLT_UNREACHABLE();
   }
@@ -1442,12 +1562,12 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> likeSignatures() {
       exec::FunctionSignatureBuilder()
           .returnType("boolean")
           .argumentType("varchar")
-          .constantArgumentType("varchar")
+          .argumentType("varchar")
           .build(),
       exec::FunctionSignatureBuilder()
           .returnType("boolean")
           .argumentType("varchar")
-          .constantArgumentType("varchar")
+          .argumentType("varchar")
           .constantArgumentType("varchar")
           .build(),
   };

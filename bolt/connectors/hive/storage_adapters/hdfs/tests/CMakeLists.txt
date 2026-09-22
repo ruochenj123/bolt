@@ -26,21 +26,16 @@
 # --------------------------------------------------------------------------
 
 add_executable(
-  bolt_hdfs_file_test HdfsFileSystemTest.cpp HdfsMiniCluster.cpp HdfsUtilTest.cpp
-                      InsertIntoHdfsTest.cpp
+  bolt_hdfs_file_test
+  HdfsFileSystemTest.cpp
+  HdfsMiniCluster.cpp
+  HdfsUtilTest.cpp
+  InsertIntoHdfsTest.cpp
 )
 
 add_test(bolt_hdfs_file_test bolt_hdfs_file_test)
 target_link_libraries(
   bolt_hdfs_file_test
-  bolt_file
-  bolt_hdfs
-  bolt_core
-  bolt_exec_test_lib
-  bolt_hive_connector
-  bolt_dwio_common_exception
-  bolt_exec
-  GTest::gtest
-  GTest::gtest_main
+  bolt_gtest_main
   GTest::gmock
 )

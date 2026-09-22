@@ -37,6 +37,11 @@
 #include "bolt/dwio/parquet/reader/Statistics.h"
 #include "bolt/dwio/parquet/thrift/ThriftTransport.h"
 #include "bolt/dwio/parquet/thrift/codegen/parquet_types.h"
+
+#include "bolt/dwio/common/BufferedInput.h"
+#include "bolt/dwio/common/ScanSpec.h"
+#include "bolt/dwio/parquet/encryption/InternalFileDecryptor.h"
+
 namespace bytedance::bolt::common {
 class ScanSpec;
 } // namespace bytedance::bolt::common
@@ -52,17 +57,31 @@ class ParquetParams : public dwio::common::FormatParams {
       dwio::common::ColumnReaderStatistics& stats,
       const thrift::FileMetaData& metaData,
       TimestampPrecision timestampPrecision,
+      const std::shared_ptr<InternalFileDecryptor>& fileDecryptor,
       const SchemaHelper& schemaHelper,
+      bool enableMetadataFilter,
+      bool disableFloatingPointToVarcharMetadataFilter,
       bool enableDictionaryFilter,
       int32_t decodeRepDefPageCount,
-      int32_t parquetRepDefMemoryLimit)
+      int32_t parquetRepDefMemoryLimit,
+      int32_t parquetRepDefStreamingWindowSize,
+      int64_t parquetReaderImplicitCastMask = 0)
       : FormatParams(pool, stats),
+        parquetReaderImplicitCastMask(parquetReaderImplicitCastMask),
         metaData_(metaData),
         timestampPrecision_(timestampPrecision),
+        fileDecryptor_(fileDecryptor),
         schemaHelper_(schemaHelper),
+        enableMetadataFilter_(enableMetadataFilter),
+        disableFloatingPointToVarcharMetadataFilter_(
+            disableFloatingPointToVarcharMetadataFilter),
         enableDictionaryFilter_(enableDictionaryFilter),
         decodeRepDefPageCount_(decodeRepDefPageCount),
-        parquetRepDefMemoryLimit_(parquetRepDefMemoryLimit) {}
+        parquetRepDefMemoryLimit_(parquetRepDefMemoryLimit),
+        parquetRepDefStreamingWindowSize_(parquetRepDefStreamingWindowSize) {}
+
+  // ParquetReaderImplicitCastMask selecting implicit casts to block.
+  int64_t parquetReaderImplicitCastMask{0};
 
   std::unique_ptr<dwio::common::FormatData> toFormatData(
       const std::shared_ptr<const dwio::common::TypeWithId>& type,
@@ -76,13 +95,21 @@ class ParquetParams : public dwio::common::FormatParams {
     return enableDictionaryFilter_;
   }
 
+  bool disableFloatingPointToVarcharMetadataFilter() const {
+    return disableFloatingPointToVarcharMetadataFilter_;
+  }
+
  private:
   const thrift::FileMetaData& metaData_;
   const TimestampPrecision timestampPrecision_;
+  const std::shared_ptr<InternalFileDecryptor>& fileDecryptor_;
   const SchemaHelper& schemaHelper_;
+  const bool enableMetadataFilter_;
+  const bool disableFloatingPointToVarcharMetadataFilter_;
   const bool enableDictionaryFilter_;
   const int32_t decodeRepDefPageCount_;
   const int32_t parquetRepDefMemoryLimit_;
+  const int32_t parquetRepDefStreamingWindowSize_;
 };
 
 /// Format-specific data created for each leaf column of a Parquet rowgroup.
@@ -92,22 +119,28 @@ class ParquetData : public dwio::common::FormatData {
       const std::shared_ptr<const dwio::common::TypeWithId>& type,
       const std::vector<thrift::RowGroup>& rowGroups,
       memory::MemoryPool& pool,
+      const std::shared_ptr<InternalFileDecryptor>& fileDecryptor,
       dwio::common::RuntimeStatistics* statis,
       const SchemaHelper& schemaHelper,
+      bool enableMetadataFilter,
       bool enableDictionaryFilter,
       int32_t decodeRepDefPageCount,
-      int32_t parquetRepDefMemoryLimit)
+      int32_t parquetRepDefMemoryLimit,
+      int32_t parquetRepDefStreamingWindowSize)
       : pool_(pool),
         type_(std::static_pointer_cast<const ParquetTypeWithId>(type)),
         rowGroups_(rowGroups),
         maxDefine_(type_->maxDefine_),
         maxRepeat_(type_->maxRepeat_),
         rowsInRowGroup_(-1),
+        fileDecryptor_(fileDecryptor),
         statis_(statis),
         schemaHelper_(schemaHelper),
+        enableMetadataFilter_(enableMetadataFilter),
         enableDictionaryFilter_(enableDictionaryFilter),
         decodeRepDefPageCount_(decodeRepDefPageCount),
-        parquetRepDefMemoryLimit_(parquetRepDefMemoryLimit) {
+        parquetRepDefMemoryLimit_(parquetRepDefMemoryLimit),
+        parquetRepDefStreamingWindowSize_(parquetRepDefStreamingWindowSize) {
     rowGroupOffsets_ = std::vector<int64_t>(rowGroups_.size());
     rowGroupOffsets_[0] = 0;
     for (int32_t i = 1; i < rowGroups_.size(); ++i) {
@@ -124,12 +157,18 @@ class ParquetData : public dwio::common::FormatData {
   /// Other formats may use it.
   dwio::common::PositionProvider seekToRowGroup(int64_t index) override;
 
+  void releaseRowGroupReader();
+
   void filterRowGroups(
       const common::ScanSpec& scanSpec,
       uint64_t rowsPerRowGroup,
       const dwio::common::StatsContext& writerContext,
       FilterRowGroupsResult&,
       dwio::common::BufferedInput& input) override;
+
+  void disableTypeDependentMetadataFilters() {
+    typeDependentMetadataFiltersEnabled_ = false;
+  }
 
   PageReader* FOLLY_NONNULL reader() const {
     return reader_.get();
@@ -168,20 +207,31 @@ class ParquetData : public dwio::common::FormatData {
     // If the query accesses only nulls, read the nulls from the pages in range.
     // If nulls are preread, return those minus any skipped.
     if (presetNulls_) {
-      BOLT_CHECK_LE(numValues, presetNullsSize_ - presetNullsConsumed_);
+      const int32_t available = presetNullsSize_ - presetNullsConsumed_;
+      // Tolerate parquet writer defects where an inner column's rep/def
+      // level stream is shorter than what the parent repeated reader
+      // expects. Pad the missing tail positions with null bits (length 0
+      // entries) so reading does not crash.
+      const int32_t toCopy = std::min<int32_t>(numValues, available);
+
       if (!presetNullsConsumed_ && numValues == presetNullsSize_) {
         nulls = std::move(presetNulls_);
         presetNullsConsumed_ = numValues;
       } else {
         dwio::common::ensureCapacity<bool>(nulls, numValues, &pool_);
         auto bits = nulls->asMutable<uint64_t>();
-        bits::copyBits(
-            presetNulls_->as<uint64_t>(),
-            presetNullsConsumed_,
-            bits,
-            0,
-            numValues);
-        presetNullsConsumed_ += numValues;
+        if (toCopy > 0) {
+          bits::copyBits(
+              presetNulls_->as<uint64_t>(),
+              presetNullsConsumed_,
+              bits,
+              0,
+              toCopy);
+        }
+        if (numValues > available) {
+          bits::fillBits(bits, toCopy, numValues, bits::kNull);
+        }
+        presetNullsConsumed_ += toCopy;
       }
       return;
     }
@@ -237,6 +287,10 @@ class ParquetData : public dwio::common::FormatData {
     return reader_->isDeltaBinaryPacked();
   }
 
+  bool isDeltaByteArray() const {
+    return reader_->isDeltaByteArray();
+  }
+
   bool parentNullsInLeaves() const override {
     return true;
   }
@@ -284,6 +338,8 @@ class ParquetData : public dwio::common::FormatData {
   // Streams for this column in each of 'rowGroups_'. Will be created on or
   // ahead of first use, not at construction.
   std::vector<std::unique_ptr<dwio::common::SeekableInputStream>> streams_;
+  std::vector<std::unique_ptr<dwio::common::SeekableInputStream>>
+      repDefStreams_;
   std::vector<int64_t> rowGroupOffsets_;
 
   const uint32_t maxDefine_;
@@ -300,11 +356,16 @@ class ParquetData : public dwio::common::FormatData {
   // Count of leading skipped positions in 'presetNulls_'
   int32_t presetNullsConsumed_{0};
 
+  const std::shared_ptr<InternalFileDecryptor> fileDecryptor_;
+
   dwio::common::RuntimeStatistics* statis_{nullptr};
   const SchemaHelper& schemaHelper_;
+  const bool enableMetadataFilter_;
+  bool typeDependentMetadataFiltersEnabled_{true};
   const bool enableDictionaryFilter_;
   const int32_t decodeRepDefPageCount_;
   const int32_t parquetRepDefMemoryLimit_;
+  const int32_t parquetRepDefStreamingWindowSize_;
 };
 
 } // namespace bytedance::bolt::parquet

@@ -15,51 +15,99 @@
 #
 set -euo pipefail
 
-CUR_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
-cd "${CUR_DIR}"
+# Download the conan recipes for Bolt dependencies from the https://github.com/bytedance/conan-center-index.git.
+# And configure it as a local conan remote for building Bolt dependencies.
+#
+# For each Bolt release, a corresponding tag is created in bytedance/conan-center-index. This script downloads the Conan recipes from the tag matching the current Bolt version and configures them as a local Conan remote.
+# If the --branch argument is provided, it must be a valid branch or tag in the conan-center-index repository.
+# If the --repository argument is provided, it must point to a conan-center-index repository.
 
-# Does a shallow checkout of conan-center-index at the given commit id in $1
-checkout_conan_center_index() {
-    rm -rf "${cci_home}"
-    mkdir -p "${cci_home}"
-    pushd "${cci_home}"
-    git init
-    git remote add origin https://github.com/conan-io/conan-center-index.git
-    git fetch --depth 1 origin "${1}"
-    git checkout FETCH_HEAD
-    popd
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null && pwd)"
+readonly BOLT_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+readonly DEFAULT_CCI_REPOSITORY="https://github.com/bytedance/conan-center-index.git"
+readonly CCI_HOME="${CONAN_HOME:-${HOME}/.conan2}/conan-center-index"
+
+usage() {
+  echo "Usage: $0 [--branch <branch-or-tag>] [--repository <repository-url>]"
 }
 
-if ! conan remote list | grep -q 'bolt-local'; then
-    conan remote add -t local-recipes-index bolt-local "${CUR_DIR}/conan"
-fi
+die() {
+  echo "❌ Error: $*" >&2
+  exit 1
+}
 
-# Clone conan-center-index and apply Bolt's patch
-cci_home=${CONAN_HOME-~/.conan2}/conan-center-index
-conan_center_commit_id="bad5c95b810e859c1c31553b92584246fe436d69"
-checkout_conan_center_index ${conan_center_commit_id}
+parse_args() {
+  CCI_REF=""
+  CCI_REPOSITORY="${DEFAULT_CCI_REPOSITORY}"
 
-for patch_file in "${CUR_DIR}/conan/patches"/*.patch; do
-    if [ ! -f "$patch_file" ]; then
-        continue
-    fi
-    patch_name=$(basename "$patch_file")
-    if patch -p1 -t -d "$cci_home" -i "$patch_file" >/dev/null 2>&1; then
-        echo "✅ $patch_name has been applied to conan-center-index@${conan_center_commit_id} successfully"
-    else
-        echo "❌ Failed to apply $patch_name" >&2
-        exit 1
-    fi
-done
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch)
+        [[ $# -ge 2 && -n "$2" ]] || die "--branch requires a value"
+        CCI_REF="$2"
+        shift 2
+        ;;
+      --repository)
+        [[ $# -ge 2 && -n "$2" ]] || die "--repository requires a value"
+        CCI_REPOSITORY="$2"
+        shift 2
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        usage >&2
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
 
-if ! conan remote list | grep -q 'bolt-cci-local'; then
-    conan remote add -t local-recipes-index bolt-cci-local "${cci_home}"
-fi
+resolve_cci_ref() {
+  if [[ -n "${CCI_REF}" ]]; then
+    return
+  fi
 
-# Move conancenter to the end of the list
-if conan remote list | grep -q 'conancenter'; then
-    conan remote remove conancenter
-    conan remote add conancenter https://center2.conan.io
-else
-    conan remote add conancenter https://center2.conan.io
-fi
+  # Bolt release tags have matching tags in bytedance/conan-center-index.
+  CCI_REF="$(git -C "${BOLT_ROOT}" describe --exact-match --tags HEAD 2> /dev/null || true)"
+  CCI_REF="${CCI_REF:-main}"
+}
+
+download_conan_recipes() {
+  local cci_repository="$1"
+
+  echo "ℹ️  Cloning conan-center-index at ${CCI_REF} from ${cci_repository}..."
+  rm -rf "${CCI_HOME}"
+  git clone --quiet --depth 1 --branch "${CCI_REF}" "${cci_repository}" "${CCI_HOME}"
+}
+
+update_conan_remote() {
+  local remote_name="$1"
+  local remote_url="$2"
+  local remote_index="$3"
+  local remote_type="${4:-}"
+
+  pip install --upgrade conan==2.32.0
+
+  echo "⚙️  Configuring remote '${remote_name}'..."
+  conan remote remove "${remote_name}" > /dev/null 2>&1 || true
+
+  if [[ -n "${remote_type}" ]]; then
+    conan remote add --index "${remote_index}" --type "${remote_type}" "${remote_name}" "${remote_url}" > /dev/null
+  else
+    conan remote add --index "${remote_index}" "${remote_name}" "${remote_url}" > /dev/null
+  fi
+}
+
+main() {
+  parse_args "$@"
+  command -v conan > /dev/null 2>&1 || die "'conan' command not found"
+  resolve_cci_ref
+  download_conan_recipes "${CCI_REPOSITORY}"
+  update_conan_remote "bolt-cci-local" "${CCI_HOME}" 0 "local-recipes-index"
+
+  echo "🎉 All done! Conan remotes configured."
+}
+
+main "$@"

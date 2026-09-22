@@ -1,0 +1,146 @@
+/*
+ * Copyright (c) ByteDance Ltd. and/or its affiliates
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "bolt/common/flags/BoltFlags.h"
+
+DEFINE_bool(
+    bolt_time_allocations,
+    true,
+    "Record time and volume for large allocation/free");
+
+// Used in common/base/BoltException.cpp
+DEFINE_bool(
+    bolt_exception_user_stacktrace_enabled,
+    false,
+    "Enable the stacktrace for user type of BoltException");
+
+DEFINE_bool(
+    bolt_exception_system_stacktrace_enabled,
+    true,
+    "Enable the stacktrace for system type of BoltException");
+
+DEFINE_int32(
+    bolt_exception_user_stacktrace_rate_limit_ms,
+    0, // effectively turns off rate-limiting
+    "Min time interval in milliseconds between stack traces captured in"
+    " user type of BoltException; off when set to 0 (the default)");
+
+DEFINE_int32(
+    bolt_exception_system_stacktrace_rate_limit_ms,
+    0, // effectively turns off rate-limiting
+    "Min time interval in milliseconds between stack traces captured in"
+    " system type of BoltException; off when set to 0 (the default)");
+
+// Used in common/base/ProcessBase.cpp
+
+DEFINE_bool(bolt_enable_avx2, true, "Enables use of AVX2 when available");
+
+DEFINE_bool(bolt_enable_bmi2, true, "Enables use of BMI2 when available");
+
+// Used in exec/Expr.cpp
+
+DEFINE_string(
+    bolt_save_input_on_expression_any_failure_path,
+    "",
+    "Enable saving input vector and expression SQL on any failure during "
+    "expression evaluation. Specifies the directory to use for storing the "
+    "vectors and expression SQL strings.");
+
+DEFINE_string(
+    bolt_save_input_on_expression_system_failure_path,
+    "",
+    "Enable saving input vector and expression SQL on system failure during "
+    "expression evaluation. Specifies the directory to use for storing the "
+    "vectors and expression SQL strings. This flag is ignored if "
+    "bolt_save_input_on_expression_any_failure_path is set.");
+
+// TODO: deprecate this once all the memory leak issues have been fixed in
+// existing meta internal use cases.
+DEFINE_bool(
+    bolt_memory_leak_check_enabled,
+    false,
+    "If true, check fails on any memory leaks in memory pool and memory manager");
+
+DEFINE_bool(
+    bolt_memory_pool_debug_enabled,
+    false,
+    "If true, 'MemoryPool' will be running in debug mode to track the allocation and free call sites to detect the source of memory leak for testing purpose");
+
+// TODO: deprecate this after solves all the use cases that can cause
+// significant performance regression by memory usage tracking.
+DEFINE_bool(
+    bolt_enable_memory_usage_track_in_default_memory_pool,
+    false,
+    "If true, enable memory usage tracking in the default memory pool");
+
+DEFINE_bool(
+    bolt_suppress_memory_capacity_exceeding_error_message,
+    false,
+    "If true, suppress the verbose error message in memory capacity exceeded "
+    "exception. This is only used by test to control the test error output size");
+
+DEFINE_bool(bolt_memory_use_hugepages, true, "Use explicit huge pages");
+
+DEFINE_int32(
+    bolt_shuffle_zstd_compression_level,
+    0,
+    "shuffle_zstd_compression_level");
+
+DEFINE_bool(
+    bolt_memory_pool_capacity_transfer_across_tasks,
+    false,
+    "Whether allow to memory capacity transfer between memory pools from different tasks, which might happen in use case like Spark-Gluten");
+
+DEFINE_bool(
+    bolt_force_eval_simplified,
+    false,
+    "Whether to overwrite queryCtx and force the "
+    "use of simplified expression evaluation path.");
+
+DEFINE_bool(
+    bolt_experimental_save_input_on_fatal_signal,
+    false,
+    "This is an experimental flag only to be used for debugging "
+    "purposes. If set to true, serializes the input vector data and "
+    "all the SQL expressions in the ExprSet that is currently "
+    "executing, whenever a fatal signal is encountered. Enabling "
+    "this flag makes the signal handler async signal unsafe, so it "
+    "should only be used for debugging purposes. The vector and SQLs "
+    "are serialized to files in directories specified by either "
+    "'bolt_save_input_on_expression_any_failure_path' or "
+    "'bolt_save_input_on_expression_system_failure_path'");
+
+DEFINE_bool(
+    bolt_experimental_enable_legacy_cast,
+    false,
+    "Experimental feature flag for backward compatibility with previous output"
+    " format of type conversions used for casting. This is a temporary solution"
+    " that aims to facilitate a seamless transition for users who rely on the"
+    " legacy behavior and hence can change in the future.");
+
+DEFINE_bool(bolt_collect_import_time, false, "run q1");
+
+DEFINE_bool(bolt_ssd_odirect, true, "Use O_DIRECT for SSD cache IO");
+DEFINE_bool(
+    bolt_ssd_verify_write,
+    false,
+    "Read back data after writing to SSD");
+DEFINE_bool(bolt_use_ws_vread, false, "Use WS VRead API to load");
+
+DEFINE_int32(
+    cache_prefetch_min_pct,
+    80,
+    "Minimum percentage of actual uses over references to a column for prefetching. No prefetch if > 100");

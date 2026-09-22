@@ -31,6 +31,7 @@
 #pragma once
 
 #include <limits>
+#include <optional>
 #include <unordered_set>
 
 #include <folly/Executor.h>
@@ -105,10 +106,27 @@ class SerDeOptions {
         escapeChar(escape),
         isEscaped(isEscapedFlag) {}
   ~SerDeOptions() = default;
+
+  // Serialization support
+  folly::dynamic serialize() const;
+  static SerDeOptions create(const folly::dynamic& obj);
+  static SerDeOptions deserialize(const folly::dynamic& obj);
 };
 
 struct TableParameter {
   static constexpr const char* kSkipHeaderLineCount = "skip.header.line.count";
+};
+
+struct RowNumberColumnInfo {
+  column_index_t insertPosition;
+  std::string name;
+};
+
+enum class ParquetReaderImplicitCastMask : int64_t {
+  kNone = 0,
+  kVarcharInteger = 1,
+  kVarcharDate = 1 << 1,
+  kAll = -1,
 };
 
 /**
@@ -135,10 +153,11 @@ class RowReaderOptions {
   size_t decodingParallelismFactor_{0};
   bool appendRowNumberColumn_ = false;
   bool appendParquetRowNumberAndFileName_ = false;
+  std::optional<RowNumberColumnInfo> rowNumberColumnInfo_ = std::nullopt;
   // Function to populate metrics related to feature projection stats
   // in Koski. This gets fired in FlatMapColumnReader.
   // This is a bit of a hack as there is (by design) no good way
-  // To propogate information from column reader to Koski
+  // To propagate information from column reader to Koski
   std::function<void(
       bytedance::bolt::dwio::common::flatmap::FlatMapKeySelectionStats)>
       keySelectionCallback_;
@@ -161,10 +180,21 @@ class RowReaderOptions {
   /// against query filters. This can significantly improve performance for
   /// selective queries. Defaults to true.
   bool enableDictionaryFilter_ = false;
+  bool disableFloatingPointToVarcharMetadataFilter_{false};
+  int64_t parquetReaderImplicitCastMask_{0};
 
   int32_t decodeRepDefPageCount_{10};
   int32_t parquetRepDefMemoryLimit_{16UL << 20};
+  // Number of levels per Parquet rep/def streaming window. Zero disables
+  // streaming and uses the legacy preload path.
+  int32_t parquetRepDefStreamingWindowSize_{2 * 1024};
   bool useColumnNamesForColumnMapping_{false};
+
+  // Hard upper bound on the in-memory bytes a single batch is allowed to
+  // produce. The reader uses metadata (e.g. parquet row-group stats) to
+  // shrink the per-call read size so that bytesPerRow * rows <=
+  // maxBatchBytes_. 0 means unlimited.
+  int64_t maxBatchBytes_{0};
 
  public:
   RowReaderOptions() noexcept
@@ -354,6 +384,11 @@ class RowReaderOptions {
     appendRowNumberColumn_ = value;
   }
 
+  void setRowNumberColumnInfo(
+      std::optional<RowNumberColumnInfo> rowNumberColumnInfo) {
+    rowNumberColumnInfo_ = std::move(rowNumberColumnInfo);
+  }
+
   void setAppendParquetRowNumberAndFileName(bool append) {
     appendParquetRowNumberAndFileName_ = append;
   }
@@ -368,6 +403,10 @@ class RowReaderOptions {
 
   bool getAppendRowNumberColumn() const {
     return appendRowNumberColumn_;
+  }
+
+  std::optional<RowNumberColumnInfo> getRowNumberColumnInfo() const {
+    return rowNumberColumnInfo_;
   }
 
   bool getAppendParquetRowNumberAndFileName() const {
@@ -448,6 +487,22 @@ class RowReaderOptions {
     return enableDictionaryFilter_;
   }
 
+  void setDisableFloatingPointToVarcharMetadataFilter(bool disable) {
+    disableFloatingPointToVarcharMetadataFilter_ = disable;
+  }
+
+  bool disableFloatingPointToVarcharMetadataFilter() const {
+    return disableFloatingPointToVarcharMetadataFilter_;
+  }
+
+  void setParquetReaderImplicitCastMask(int64_t parquetReaderImplicitCastMask) {
+    parquetReaderImplicitCastMask_ = parquetReaderImplicitCastMask;
+  }
+
+  int64_t parquetReaderImplicitCastMask() const {
+    return parquetReaderImplicitCastMask_;
+  }
+
   void setDecodeRepDefPageCount(int32_t pageCount) {
     decodeRepDefPageCount_ = pageCount;
   }
@@ -464,6 +519,14 @@ class RowReaderOptions {
     return parquetRepDefMemoryLimit_;
   }
 
+  void setParquetRepDefStreamingWindowSize(int32_t size) {
+    parquetRepDefStreamingWindowSize_ = size;
+  }
+
+  int32_t getParquetRepDefStreamingWindowSize() const {
+    return parquetRepDefStreamingWindowSize_;
+  }
+
   RowReaderOptions& setUseColumnNamesForColumnMapping(bool flag) {
     useColumnNamesForColumnMapping_ = flag;
     return *this;
@@ -471,6 +534,17 @@ class RowReaderOptions {
 
   bool getUseColumnNamesForColumnMapping() const {
     return useColumnNamesForColumnMapping_;
+  }
+
+  /// Sets a hard upper bound (bytes) for the in-memory size of a single
+  /// batch produced by the reader. Used together with metadata-derived
+  /// bytes-per-row to cap rows-to-read; 0 disables the cap.
+  void setMaxBatchBytes(int64_t maxBatchBytes) {
+    maxBatchBytes_ = maxBatchBytes;
+  }
+
+  int64_t getMaxBatchBytes() const {
+    return maxBatchBytes_;
   }
 
   std::string toString() const {
@@ -502,6 +576,8 @@ class RowReaderOptions {
     ss << "decodingExecutor_=" << (decodingExecutor_ ? "set" : "null") << ", ";
     ss << "decodingParallelismFactor_=" << decodingParallelismFactor_ << ", ";
     ss << "appendRowNumberColumn_=" << appendRowNumberColumn_ << ", ";
+    ss << "rowNumberColumnInfo_="
+       << (rowNumberColumnInfo_.has_value() ? "set" : "null") << ", ";
     ss << "appendParquetRowNumberAndFileName_="
        << appendParquetRowNumberAndFileName_ << ", ";
     ss << "keySelectionCallback_=" << (keySelectionCallback_ ? "set" : "null")
@@ -516,9 +592,16 @@ class RowReaderOptions {
        << ", ";
     ss << "fileName_=" << fileName_ << ", ";
     ss << "fileId_=" << fileId_ << ", ";
-    ss << "enableDictionaryFilter_=" << enableDictionaryFilter_;
-    ss << "decodeRepDefPageCount_=" << decodeRepDefPageCount_;
+    ss << "enableDictionaryFilter_=" << enableDictionaryFilter_ << ", ";
+    ss << "disableFloatingPointToVarcharMetadataFilter_="
+       << disableFloatingPointToVarcharMetadataFilter_ << ", ";
+    ss << "parquetReaderImplicitCastMask_=" << parquetReaderImplicitCastMask_
+       << ", ";
+    ss << "decodeRepDefPageCount_=" << decodeRepDefPageCount_ << ", ";
     ss << "parquetRepDefMemoryLimit_=" << parquetRepDefMemoryLimit_ << ", ";
+    ss << "parquetRepDefStreamingWindowSize_="
+       << parquetRepDefStreamingWindowSize_ << ", ";
+    ss << "maxBatchBytes_=" << maxBatchBytes_ << ", ";
     ss << "useColumnNamesForColumnMapping_="
        << (useColumnNamesForColumnMapping_ ? "true" : "false");
 
@@ -723,12 +806,22 @@ class ReaderOptions : public io::ReaderOptions {
   bool isUseColumnNamesForColumnMapping() const {
     return useColumnNamesForColumnMapping_;
   }
+
+  // Serialization support
+  folly::dynamic serialize() const override;
+
+  static ReaderOptions create(
+      const folly::dynamic& obj,
+      bolt::memory::MemoryPool* pool);
+  static void registerSerDe();
 };
 
-struct WriterOptions {
+struct WriterOptions : public ISerializable {
   TypePtr schema;
-  bolt::memory::MemoryPool* memoryPool;
+  bolt::memory::MemoryPool* memoryPool{nullptr};
   const bolt::common::SpillConfig* spillConfig{nullptr};
+  // Owns the SpillConfig when it was produced by deserialize().
+  std::shared_ptr<const bolt::common::SpillConfig> ownedSpillConfig;
   tsan_atomic<bool>* nonReclaimableSection{nullptr};
   std::optional<bolt::common::CompressionKind> compressionKind;
   std::optional<uint64_t> maxStripeSize{std::nullopt};
@@ -743,6 +836,10 @@ struct WriterOptions {
   virtual void processHiveConnectorConfigs(const config::ConfigBase&) {}
 
   virtual ~WriterOptions() = default;
+
+  folly::dynamic serialize() const override;
+  static std::shared_ptr<WriterOptions> create(const folly::dynamic& obj);
+  static void registerSerDe();
 };
 
 struct ColumnReaderOptions {

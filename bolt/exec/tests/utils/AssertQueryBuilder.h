@@ -57,6 +57,9 @@ class AssertQueryBuilder {
   /// Default is false.
   AssertQueryBuilder& serialExecution(bool serial);
 
+  /// Set task id if need
+  AssertQueryBuilder& taskId(const std::string& taskId);
+
   /// Set configuration property. May be called multiple times to set multiple
   /// properties.
   AssertQueryBuilder& config(const std::string& key, const std::string& value);
@@ -179,7 +182,7 @@ class AssertQueryBuilder {
 
   static std::unique_ptr<folly::Executor> newExecutor() {
     return std::make_unique<folly::CPUThreadPoolExecutor>(
-        std::thread::hardware_concurrency());
+        testExecutorConcurrency());
   }
 
   // Used by the created task as the default driver executor.

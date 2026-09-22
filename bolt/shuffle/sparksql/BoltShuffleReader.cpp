@@ -40,7 +40,9 @@
 #include "bolt/serializers/PrestoSerializer.h"
 #include "bolt/shuffle/sparksql/BoltArrowMemoryPool.h"
 #include "bolt/shuffle/sparksql/Payload.h"
+#include "bolt/shuffle/sparksql/ReaderStreamIterator.h"
 #include "bolt/shuffle/sparksql/Utils.h"
+#include "bolt/shuffle/sparksql/compression/Codec.h"
 #include "bolt/shuffle/sparksql/compression/Compression.h"
 #include "bolt/vector/ComplexVector.h"
 #include "bolt/vector/FlatVector.h"
@@ -370,23 +372,72 @@ RowVectorPtr makeColumnarBatch(
 
 } // namespace
 
+std::unique_ptr<InMemoryPayload> BoltColumnarBatchDeserializer::drainSaved() {
+  if (savedPayloads_.payloads.empty()) {
+    return nullptr;
+  }
+  if (savedPayloads_.payloads.size() == 1) {
+    auto payload = std::move(savedPayloads_.payloads[0]);
+    savedPayloads_ = {};
+    return payload;
+  }
+  auto numBuffers = savedPayloads_.payloads[0]->numBuffers();
+  // padding size to avoid simd instructions memory overflow
+  std::vector<int64_t> bufferSizes(numBuffers, simd::kPadding);
+  for (const auto& payload : savedPayloads_.payloads) {
+    for (size_t i = 0; i < numBuffers; ++i) {
+      bufferSizes[i] += payload->bufferSizeAt(i);
+    }
+  }
+  NanosecondTimer timer(&mergeTime_);
+  std::vector<std::shared_ptr<arrow::Buffer>> arrowBuffers;
+  for (int i = 0; i < numBuffers; ++i) {
+    auto buffer = arrow::AllocateResizableBuffer(bufferSizes[i], memoryPool_);
+    BOLT_CHECK(
+        buffer.ok(),
+        "Failed to allocate resizable buffer at index " + std::to_string(i));
+    buffer.ValueUnsafe()->Resize(0, false);
+    arrowBuffers.emplace_back(std::move(buffer).ValueUnsafe());
+  }
+
+  auto payload = std::make_unique<InMemoryPayload>(
+      0, isValidityBuffer_, std::move(arrowBuffers));
+
+  for (auto& savedPayload : savedPayloads_.payloads) {
+    auto result = InMemoryPayload::merge(
+        std::move(payload),
+        std::move(savedPayload),
+        memoryPool_,
+        INT64_MAX,
+        INT64_MIN,
+        /*sourceBuffersResizable=*/true);
+    BOLT_CHECK(result.ok(), "Failed to merge payloads");
+    payload = std::move(result.ValueUnsafe());
+  }
+  savedPayloads_ = {};
+  return payload;
+}
+
 BoltColumnarBatchDeserializer::BoltColumnarBatchDeserializer(
     std::shared_ptr<arrow::io::InputStream> in,
     const std::shared_ptr<arrow::Schema>& schema,
-    const std::shared_ptr<arrow::util::Codec>& codec,
+    const std::shared_ptr<Codec>& codec,
     const bytedance::bolt::RowTypePtr& rowType,
     int32_t batchSize,
     int32_t shuffleBatchByteSize,
+    int32_t shuffleBufferSize,
     arrow::MemoryPool* memoryPool,
     bytedance::bolt::memory::MemoryPool* boltPool,
     std::vector<bool>* isValidityBuffer,
     bool hasComplexType,
     uint64_t& deserializeTime,
     uint64_t& decompressTime,
+    uint64_t& mergeTime,
     bool isRowFormat,
-    ZstdStreamCodec* zstdCodec,
+    AdaptiveParallelZstdCodec* zstdCodec,
     RowBufferPool* rowBufferPool,
-    ShuffleRowToColumnarConverter* row2ColConverter)
+    ShuffleRowToColumnarConverter* row2ColConverter,
+    ColumnBufferPool* columnBufferPool)
     : schema_(schema),
       codec_(codec),
       rowType_(rowType),
@@ -398,12 +449,14 @@ BoltColumnarBatchDeserializer::BoltColumnarBatchDeserializer(
       hasComplexType_(hasComplexType),
       deserializeTime_(deserializeTime),
       decompressTime_(decompressTime),
+      mergeTime_(mergeTime),
       isRowFormat_(isRowFormat),
       zstdCodec_(zstdCodec),
       rowBufferPool_(rowBufferPool),
-      row2ColConverter_(row2ColConverter) {
+      row2ColConverter_(row2ColConverter),
+      columnBufferPool_(columnBufferPool) {
   auto result = arrow::io::BufferedInputStream::Create(
-      shuffleBatchByteSize, memoryPool, std::move(in));
+      shuffleBufferSize, memoryPool, std::move(in));
   BOLT_CHECK(
       result.ok(),
       "Failed to create BufferedInputStream: " + result.status().message());
@@ -461,7 +514,8 @@ RowVectorPtr BoltColumnarBatchDeserializer::next() {
         numRows,
         decompressTime_,
         payloadType_,
-        readAheadBuffer_.size > 0 ? &readAheadBuffer_ : nullptr);
+        readAheadBuffer_.size > 0 ? &readAheadBuffer_ : nullptr,
+        columnBufferPool_);
     BOLT_CHECK(arrowBuffers.ok());
 
     return makeColumnarBatch(
@@ -474,22 +528,18 @@ RowVectorPtr BoltColumnarBatchDeserializer::next() {
   }
 
   if (reachEos_) {
-    if (merged_) {
+    if (!savedPayloads_.payloads.empty()) {
       return makeColumnarBatch(
-          rowType_,
-          std::move(merged_),
-          boltPool_,
-          deserializeTime_,
-          memoryPool_);
+          rowType_, drainSaved(), boltPool_, deserializeTime_, memoryPool_);
     }
     return nullptr;
   }
 
   std::vector<std::shared_ptr<arrow::Buffer>> arrowBuffers{};
   uint32_t numRows = 0;
-  while (!merged_ ||
-         (merged_->numRows() < batchSize_ &&
-          merged_->getBufferSize() < shuffleBatchByteSize_)) {
+  while (savedPayloads_.payloads.empty() ||
+         (savedPayloads_.rowCount < batchSize_ &&
+          savedPayloads_.size < shuffleBatchByteSize_)) {
     if (!payloadType_.has_value()) {
       int64_t bytes = 0;
       bool isComposite = isCompositeRowVectorLayout(bytes);
@@ -501,7 +551,7 @@ RowVectorPtr BoltColumnarBatchDeserializer::next() {
         vectorLayout_ = RowVectorLayout::kComposite;
         zstdCodec_->markHeaderSkipped(readAheadBuffer_.size);
         readAheadBuffer_.reset();
-        if (!merged_) {
+        if (savedPayloads_.payloads.empty()) {
           return nextFromRows();
         } else {
           break;
@@ -516,52 +566,42 @@ RowVectorPtr BoltColumnarBatchDeserializer::next() {
         numRows,
         decompressTime_,
         payloadType_,
-        readAheadBuffer_.size > 0 ? &readAheadBuffer_ : nullptr);
+        readAheadBuffer_.size > 0 ? &readAheadBuffer_ : nullptr,
+        columnBufferPool_);
     BOLT_CHECK(
         result.ok(),
         "Failed to deserialize BlockPayload: " + result.status().message());
     arrowBuffers = std::move(result.ValueUnsafe());
-    if (!merged_) {
-      merged_ = std::make_unique<InMemoryPayload>(
-          numRows, isValidityBuffer_, std::move(arrowBuffers));
+    if (savedPayloads_.payloads.empty()) {
+      savedPayloads_.save(std::make_unique<InMemoryPayload>(
+          numRows, isValidityBuffer_, std::move(arrowBuffers)));
       arrowBuffers.clear();
       continue;
     }
-    auto mergedRows = merged_->numRows() + numRows;
-    auto mergedByteSize =
-        merged_->getBufferSize() + getBufferSize(arrowBuffers);
+    auto mergedRows = savedPayloads_.rowCount + numRows;
+    auto mergedByteSize = savedPayloads_.size + getBufferSize(arrowBuffers);
     if (mergedRows > batchSize_ || mergedByteSize > shuffleBatchByteSize_) {
       break;
     }
 
     auto append = std::make_unique<InMemoryPayload>(
         numRows, isValidityBuffer_, std::move(arrowBuffers));
-    auto mergeResult = InMemoryPayload::merge(
-        std::move(merged_),
-        std::move(append),
-        memoryPool_,
-        INT64_MAX,
-        INT64_MIN);
-    BOLT_CHECK(
-        mergeResult.ok(),
-        "Failed to merge payloads: " + mergeResult.status().message());
-    merged_ = std::move(mergeResult.ValueUnsafe());
-
+    savedPayloads_.save(std::move(append));
     arrowBuffers.clear();
   }
 
   // Reach EOS.
-  if (reachEos_ && !merged_) {
+  if (reachEos_ && savedPayloads_.payloads.empty()) {
     return nullptr;
   }
 
   auto columnarBatch = makeColumnarBatch(
-      rowType_, std::move(merged_), boltPool_, deserializeTime_, memoryPool_);
+      rowType_, drainSaved(), boltPool_, deserializeTime_, memoryPool_);
 
   // Save remaining rows.
   if (!arrowBuffers.empty()) {
-    merged_ = std::make_unique<InMemoryPayload>(
-        numRows, isValidityBuffer_, std::move(arrowBuffers));
+    savedPayloads_.save(std::make_unique<InMemoryPayload>(
+        numRows, isValidityBuffer_, std::move(arrowBuffers)));
   }
   return columnarBatch;
 }
@@ -701,39 +741,42 @@ bool BoltColumnarBatchDeserializer::isCompositeRowVectorLayout(int64_t& bytes) {
 
 BoltColumnarBatchDeserializerFactory::BoltColumnarBatchDeserializerFactory(
     const std::shared_ptr<arrow::Schema>& schema,
-    const std::shared_ptr<arrow::util::Codec>& codec,
+    const std::shared_ptr<Codec>& codec,
     const RowTypePtr& rowType,
     int32_t batchSize,
     int32_t shuffleBatchByteSize,
     arrow::MemoryPool* memoryPool,
-    bytedance::bolt::memory::MemoryPool* boltPool)
+    bytedance::bolt::memory::MemoryPool* boltPool,
+    bool checksumEnabled)
     : schema_(schema),
       codec_(codec),
       rowType_(rowType),
       batchSize_(batchSize),
       shuffleBatchByteSize_(shuffleBatchByteSize),
       memoryPool_(memoryPool),
-      boltPool_(boltPool) {
+      boltPool_(boltPool),
+      checksumEnabled_(checksumEnabled) {
   initFromSchema();
 }
 
 std::unique_ptr<BoltColumnarBatchDeserializer>
 BoltColumnarBatchDeserializerFactory::createDeserializer(
     std::shared_ptr<arrow::io::InputStream> in) {
-  // must be same as BoltRuntime::decideBoltShuffleWriterType
-  bool isRowBased = (!partitioningShortName_.compare("hash") ||
-                     !partitioningShortName_.compare("rr") ||
-                     !partitioningShortName_.compare("range")) &&
+  // must be same as BoltShuffleWriter::decideBoltShuffleWriterType
+  auto partitioning = toPartitioning(partitioningShortName_);
+  bool isRowBased = supportAdaptiveShuffleWriter(partitioning) &&
       ((shuffleWriterType_ == ShuffleWriterType::Adaptive &&
-        numPartitions_ >= rowBasePartitionThreshold &&
-        schema_->num_fields() >= rowBaseColumnNumThreshold) ||
+        ((numPartitions_ >= rowBasePartitionThreshold &&
+          schema_->num_fields() >= rowBaseColumnNumThreshold) ||
+         static_cast<int64_t>(numPartitions_) * schema_->num_fields() >
+             rowBasedShuffleThreshold_)) ||
        (shuffleWriterType_ == ShuffleWriterType::RowBased));
   if (!zstdCodec_) {
-    zstdCodec_ =
-        std::make_shared<ZstdStreamCodec>(1 /*not used*/, false, memoryPool_);
+    zstdCodec_ = std::make_shared<AdaptiveParallelZstdCodec>(
+        1 /*not used*/, false, memoryPool_, checksumEnabled_);
     rowBufferPool_ = std::make_shared<RowBufferPool>(memoryPool_);
-    row2ColConverter_ =
-        std::make_shared<ShuffleRowToColumnarConverter>(rowType_, boltPool_);
+    row2ColConverter_ = std::make_shared<ShuffleRowToColumnarConverter>(
+        rowType_, boltPool_, rowFormat_);
   }
   return std::make_unique<BoltColumnarBatchDeserializer>(
       std::move(in),
@@ -742,12 +785,14 @@ BoltColumnarBatchDeserializerFactory::createDeserializer(
       rowType_,
       batchSize_,
       shuffleBatchByteSize_,
+      shuffleBufferSize_,
       memoryPool_,
       boltPool_,
       &isValidityBuffer_,
       hasComplexType_,
       deserializeTime_,
       decompressTime_,
+      mergeTime_,
       isRowBased,
       zstdCodec_.get(),
       rowBufferPool_.get(),
@@ -764,6 +809,10 @@ int64_t BoltColumnarBatchDeserializerFactory::getDecompressTime() {
 
 int64_t BoltColumnarBatchDeserializerFactory::getDeserializeTime() {
   return deserializeTime_;
+}
+
+int64_t BoltColumnarBatchDeserializerFactory::getMergeTime() {
+  return mergeTime_;
 }
 
 void BoltColumnarBatchDeserializerFactory::initFromSchema() {
@@ -821,17 +870,24 @@ BoltShuffleReader::BoltShuffleReader(
     bytedance::bolt::memory::MemoryPool* boltPool)
     : factory_(std::make_unique<BoltColumnarBatchDeserializerFactory>(
           schema,
-          createArrowIpcCodec(
+          createCodec(
               options.compressionType,
-              getCodecBackend(options.codecBackend)),
+              CodecOptions{
+                  getCodecBackend(options.codecBackend),
+                  kDefaultCompressionLevel,
+                  options.checksumEnabled}),
           bytedance::bolt::asRowType(fromBoltTypeToArrowSchema(schema)),
           options.batchSize,
           options.shuffleBatchByteSize,
           pool,
-          boltPool)) {
+          boltPool,
+          options.checksumEnabled)) {
   factory_->setNumPartitions(options.numPartitions);
   factory_->setShuffleWriterType(options.forceShuffleWriterType);
   factory_->setpartitioningShortName(options.partitionShortName);
+  factory_->setShuffleBufferSize(options.shuffleBufferSize);
+  factory_->setRowFormat(options.rowFormat);
+  factory_->setRowBasedShuffleThreshold(options.rowBasedShuffleThreshold);
 }
 
 } // namespace bytedance::bolt::shuffle::sparksql

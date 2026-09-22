@@ -34,7 +34,9 @@
 #include "bolt/common/memory/Memory.h"
 #include "bolt/vector/tests/utils/VectorMaker.h"
 #include "bolt/vector/tests/utils/VectorTestBase.h"
+
 using namespace bytedance::bolt;
+using bytedance::bolt::test::emptyArray;
 using bytedance::bolt::test::VectorMaker;
 
 class VectorMakerTest : public ::testing::Test {
@@ -492,13 +494,13 @@ TEST_F(VectorMakerTest, nestedArrayVectorFromJson) {
       {{2, 3, 4}},
       {{std::nullopt, 7}},
       {{1, 3, 7, 9}},
-      {{}},
+      emptyArray,
       {{std::nullopt}},
       {{1, 2, std::nullopt}},
-      {{}},
+      emptyArray,
       std::nullopt,
       {{1, 2, 3}},
-      {{}},
+      emptyArray,
       {{4, 5}},
   });
 

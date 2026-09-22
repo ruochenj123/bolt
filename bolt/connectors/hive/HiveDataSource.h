@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "bolt/common/io/IoStatistics.h"
 #include "bolt/common/memory/MemoryPool.h"
 #include "bolt/connectors/Connector.h"
@@ -38,9 +40,6 @@
 #include "bolt/connectors/hive/PaimonConnectorSplit.h"
 #include "bolt/connectors/hive/SplitReader.h"
 #include "bolt/connectors/hive/TableHandle.h"
-#ifdef BOLT_ENABLE_HDFS
-#include "bolt/connectors/hive/storage_adapters/hdfs/StorageException.h"
-#endif
 #include "bolt/core/QueryConfig.h"
 #include "bolt/dwio/common/BufferedInput.h"
 #include "bolt/dwio/common/Reader.h"
@@ -48,6 +47,8 @@
 #include "bolt/dwio/common/Statistics.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/expression/Expr.h"
+#include "bolt/vector/DecodedVector.h"
+#include "bolt/vector/LazyVector.h"
 namespace bytedance::bolt::connector::hive {
 
 class HiveConfig;
@@ -129,6 +130,24 @@ class HiveDataSource : public DataSource {
   memory::MemoryPool* pool_;
   std::shared_ptr<common::ScanSpec> scanSpec_;
   VectorPtr output_;
+  struct ReusableOutputSlot {
+    VectorPtr output;
+    bool inUse{false};
+  };
+  struct ReusableOutputPool {
+    explicit ReusableOutputPool(size_t size) : slots(size) {}
+    std::vector<ReusableOutputSlot> slots;
+  };
+  struct ReusableOutputLease {
+    ReusableOutputLease(std::shared_ptr<ReusableOutputPool> pool, size_t index)
+        : pool(std::move(pool)), index(index) {}
+    ~ReusableOutputLease() {
+      pool->slots[index].inUse = false;
+    }
+    std::shared_ptr<ReusableOutputPool> pool;
+    size_t index;
+  };
+  std::shared_ptr<ReusableOutputPool> reusableOutputPool_;
   std::unique_ptr<HiveSplitReaderBase> splitReader_;
 
   // Output type from file reader.  This is different from outputType_ that it
@@ -148,6 +167,24 @@ class HiveDataSource : public DataSource {
   std::shared_ptr<io::IoStatistics> ioStats_;
 
  private:
+  std::shared_ptr<ReusableOutputLease> prepareReaderOutputForNextRead();
+  template <typename T>
+  std::shared_ptr<T> retainReusableOutputLease(
+      std::shared_ptr<T> vector,
+      const std::shared_ptr<ReusableOutputLease>& lease) {
+    if (!lease) {
+      return vector;
+    }
+
+    struct LeasedVector {
+      std::shared_ptr<T> vector;
+      std::shared_ptr<ReusableOutputLease> lease;
+    };
+    auto leased =
+        std::make_shared<LeasedVector>(LeasedVector{std::move(vector), lease});
+    return std::shared_ptr<T>(leased, leased->vector.get());
+  }
+
   // Evaluates remainingFilter_ on the specified vector. Returns number of
   // rows passed. Populates filterEvalCtx_.selectedIndices and selectedBits
   // if only some rows passed the filter. If none or all rows passed
@@ -213,9 +250,15 @@ class HiveDataSource : public DataSource {
   std::atomic<uint64_t> totalRemainingFilterTime_{0};
   uint64_t completedRows_ = 0;
 
+  // Field indices referenced in both remaining filter and output type. These
+  // columns need to be materialized eagerly to avoid missing values in output.
+  std::vector<column_index_t> multiReferencedFields_;
+
   // Reusable memory for remaining filter evaluation.
   VectorPtr filterResult_;
   SelectivityVector filterRows_;
+  DecodedVector filterLazyDecoded_;
+  SelectivityVector filterLazyBaseRows_;
   exec::FilterEvalCtx filterEvalCtx_;
 
   RowVectorPtr emptyResult_;
@@ -226,21 +269,13 @@ class HiveDataSource : public DataSource {
 
   std::unique_ptr<dwio::common::RuntimeStatistics> runtimeStats_;
 
-  // ignore corrupt file
   int64_t ignoredFileSizes_{0};
-  bool ignoreCorruptFiles_{false};
-#ifdef BOLT_ENABLE_HDFS
-  int64_t taskMaxFailures_{0};
-  inline static std::mutex canIgnoredExceptionsMutex_;
-  inline static std::vector<std::string> canIgnoredExceptions_{};
-  inline const static std::set<filesystems::StorageException::StorageErrorType>
-      kMustIgnoredExceptions{
-          filesystems::StorageException::StorageErrorType::HdfsIOException,
-          filesystems::StorageException::StorageErrorType::
-              MissingBlockException};
-#endif
+
   int32_t parquetRepDefMemoryLimit_{16UL << 20};
+  int32_t parquetRepDefStreamingWindowSize_{2 * 1024};
   int32_t decodeRepDefPageCount_{10};
+  int64_t parquetReaderImplicitCastMask_{0};
+  int64_t parquetMaxBatchBytes_{0};
 };
 
 } // namespace bytedance::bolt::connector::hive

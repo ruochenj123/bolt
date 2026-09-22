@@ -40,6 +40,7 @@
 #include "bolt/exec/Aggregate.h"
 #include "bolt/exec/GroupingSet.h"
 #include "bolt/exec/PlanNodeStats.h"
+#include "bolt/exec/Spill.h"
 #include "bolt/exec/Values.h"
 #include "bolt/exec/tests/utils/AssertQueryBuilder.h"
 #include "bolt/exec/tests/utils/OperatorTestBase.h"
@@ -47,12 +48,53 @@
 #include "bolt/exec/tests/utils/SumNonPODAggregate.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 #include "bolt/exec/tests/utils/WithGPUParamInterface.h"
+#include "bolt/serializers/ArrowSerializer.h"
+#include "bolt/vector/LazyVector.h"
 #include "folly/experimental/EventCount.h"
 namespace bytedance::bolt::exec::test {
 
 using bytedance::bolt::test::BatchMaker;
 using core::QueryConfig;
 using namespace common::testutil;
+
+namespace {
+template <typename T>
+class HookOnlyLazyLoader : public VectorLoader {
+ public:
+  HookOnlyLazyLoader(
+      memory::MemoryPool* pool,
+      std::function<T(vector_size_t)> valueAt,
+      vector_size_t size)
+      : pool_(pool), valueAt_(std::move(valueAt)), size_(size) {}
+
+ private:
+  void loadInternal(
+      RowSet rows,
+      ValueHook* hook,
+      vector_size_t resultSize,
+      VectorPtr* result) override {
+    if (hook != nullptr) {
+      for (auto row : rows) {
+        auto value = valueAt_(row);
+        hook->addValue(row, &value);
+      }
+      return;
+    }
+
+    BaseVector::ensureWritable(
+        SelectivityVector::empty(), CppToType<T>::create(), pool_, *result);
+    auto* flat = (*result)->template asFlatVector<T>();
+    flat->resize(std::max<vector_size_t>(resultSize, size_));
+    for (auto row : rows) {
+      flat->set(row, valueAt_(row));
+    }
+  }
+
+  memory::MemoryPool* const pool_;
+  const std::function<T(vector_size_t)> valueAt_;
+  const vector_size_t size_;
+};
+} // namespace
 
 /// No-op implementation of Aggregate. Provides public access to following
 /// base class methods: setNull, clearNull and isNull.
@@ -162,7 +204,7 @@ class AggregationTest : public OperatorTestBase,
   static void SetUpTestCase() {
     FLAGS_bolt_testing_enable_arbitration = true;
     OperatorTestBase::SetUpTestCase();
-    TestValue::enable();
+    BOLT_TEST_VALUE_ENABLE();
   }
 
   static void TearDownTestCase() {
@@ -396,7 +438,7 @@ class AggregationTest : public OperatorTestBase,
   }
 
   // Makes batches which reference rows in 'rows' via dictionary. The
-  // dictionary indices are given by 'order', wich has values with
+  // dictionary indices are given by 'order', which has values with
   // indices plus random bits so as to create randomly scattered,
   // sometimes repeated values.
   void makeBatches(
@@ -433,6 +475,7 @@ class AggregationTest : public OperatorTestBase,
         false,
         true,
         true,
+        false,
         pool_.get());
   }
 
@@ -650,6 +693,125 @@ TEST_P(AggregationTest, global) {
       "SELECT sum(15), sum(c1), sum(c2), sum(c4), sum(c5), "
       "min(15), min(c1), min(c2), min(c3), min(c4), min(c5), "
       "max(15), max(c1), max(c2), max(c3), max(c4), max(c5), sum(1) FROM tmp");
+
+  EXPECT_EQ(NonPODInt64::constructed, NonPODInt64::destructed);
+}
+
+TEST_P(AggregationTest, globalAggFunctionTimeNs) {
+  if (GetParam().useGPU) {
+    GTEST_SKIP() << "GPU Aggregation does not support statistics yet\n";
+  }
+
+  // Use a large enough workload to make the timer reliably non-zero.
+  auto vectors = makeVectors(rowType_, 20, 1000);
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId aggNodeId;
+  auto plan =
+      PlanBuilder()
+          .values(vectors)
+          .singleAggregation(
+              {},
+              {"sum(c1)", "count(distinct c0)", "array_agg(c0 order by c0)"},
+              {},
+              GetParam().useGPU)
+          .capturePlanNodeId(aggNodeId)
+          .planNode();
+
+  auto task =
+      AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .config("max_drivers_per_task", 1)
+          .assertResults(
+              "SELECT sum(c1), count(distinct c0), array_agg(c0 order by c0) "
+              "FROM tmp");
+
+  auto planStats = toPlanStats(task->taskStats());
+  const auto& runtimeStats = planStats.at(aggNodeId).customStats;
+  ASSERT_GT(runtimeStats.count("aggFunctionTimeNs"), 0);
+  EXPECT_GT(runtimeStats.at("aggFunctionTimeNs").sum, 0);
+}
+
+TEST_P(AggregationTest, emptyGlobalAggDoesNotRecordFunctionTime) {
+  if (GetParam().useGPU) {
+    GTEST_SKIP() << "GPU Aggregation does not support statistics yet\n";
+  }
+
+  auto vectors = makeVectors(rowType_, 20, 10);
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId aggNodeId;
+  auto plan =
+      PlanBuilder()
+          .values(vectors)
+          .filter("c0 != c0")
+          .singleAggregation(
+              {}, {"sum(c1)", "count(distinct c0)"}, {}, GetParam().useGPU)
+          .capturePlanNodeId(aggNodeId)
+          .planNode();
+
+  auto task =
+      AssertQueryBuilder(plan, duckDbQueryRunner_)
+          .config("max_drivers_per_task", 1)
+          .assertResults(
+              "SELECT sum(c1), count(distinct c0) FROM tmp WHERE c0 != c0");
+
+  auto planStats = toPlanStats(task->taskStats());
+  const auto& aggStats = planStats.at(aggNodeId);
+  EXPECT_EQ(aggStats.outputRows, 1);
+  EXPECT_EQ(aggStats.customStats.count("aggFunctionTimeNs"), 0);
+}
+
+TEST_F(AggregationTest, manyGlobalAggregations) {
+  // Test a query with a large number of global aggregations.
+  // Global aggregations have a separate code path that does not use a
+  // HashTable, but rather a single row outside of a RowContainer.  Having many
+  // aggregations can expose issues with that single row that may not occur with
+  // only a few aggregations.
+  auto rowType =
+      bolt::test::VectorMaker::rowType(std::vector<TypePtr>(100, SMALLINT()));
+  auto vectors = makeVectors(rowType, 10, 100);
+  createDuckDbTable(vectors);
+
+  std::vector<std::string> aggregates;
+  for (int i = 0; i < rowType->size(); i++) {
+    aggregates.push_back(fmt::format("sum({})", rowType->nameOf(i)));
+  }
+
+  auto op = PlanBuilder()
+                .values(vectors)
+                .singleAggregation({}, aggregates)
+                .planNode();
+
+  assertQuery(op, "SELECT " + folly::join(", ", aggregates) + " FROM tmp");
+
+  aggregates.clear();
+  for (int i = 0; i < rowType->size(); i++) {
+    aggregates.push_back(fmt::format("sum(distinct {})", rowType->nameOf(i)));
+  }
+
+  op = PlanBuilder()
+           .values(vectors)
+           .singleAggregation({}, aggregates)
+           .planNode();
+
+  assertQuery(op, "SELECT " + folly::join(", ", aggregates) + " FROM tmp");
+
+  rowType =
+      bolt::test::VectorMaker::rowType(std::vector<TypePtr>(32, SMALLINT()));
+  vectors = makeVectors(rowType, 10, 32);
+  createDuckDbTable(vectors);
+  aggregates.clear();
+  for (int i = 0; i < rowType->size(); i++) {
+    aggregates.push_back(fmt::format(
+        "array_agg({} ORDER BY {})", rowType->nameOf(i), rowType->nameOf(i)));
+  }
+
+  op = PlanBuilder()
+           .values(vectors)
+           .singleAggregation({}, aggregates)
+           .planNode();
+
+  assertQuery(op, "SELECT " + folly::join(", ", aggregates) + " FROM tmp");
 
   EXPECT_EQ(NonPODInt64::constructed, NonPODInt64::destructed);
 }
@@ -950,7 +1112,7 @@ TEST_P(AggregationTest, partialDistinctWithAbandon) {
       // 1st batch will produce 100 distinct groups from 10 rows.
       makeRowVector(
           {makeFlatVector<int32_t>(100, [](auto row) { return row; })}),
-      // 2st batch will trigger abandon partial aggregation event with no new
+      // 2nd batch will trigger abandon partial aggregation event with no new
       // distinct values.
       makeRowVector({makeFlatVector<int32_t>(1, [](auto row) { return row; })}),
       // 3rd batch will not produce any new distinct values.
@@ -993,12 +1155,51 @@ TEST_P(AggregationTest, partialDistinctWithAbandon) {
              .assertResults("SELECT distinct c0, sum(c0) FROM tmp group by c0");
 }
 
+TEST_P(AggregationTest, partialDistinctFlushesAccumulatedOutputOnAbandon) {
+  if (GetParam().useGPU) {
+    GTEST_SKIP()
+        << "GPU Aggregation does not support partial aggregation stats\n";
+  }
+  auto vectors = {
+      // 1st batch produces 100 distinct rows which stay buffered in
+      // accumulatedOutput_ because min_output_batch_rows is larger.
+      makeRowVector(
+          {makeFlatVector<int32_t>(100, [](auto row) { return row; })}),
+      // 2nd batch adds one new distinct row and triggers abandon partial
+      // aggregation in the same getOutput() call. Without flushing
+      // accumulatedOutput_, these 101 distinct rows are lost before reaching
+      // the final aggregation.
+      makeRowVector(
+          {makeFlatVector<int32_t>(1, [](auto /*row*/) { return 100; })}),
+  };
+  createDuckDbTable(vectors);
+  CursorParameters params;
+  params.maxDrivers = 1;
+  params.queryCtx = core::QueryCtx::create(executor_.get());
+  params.queryCtx->testingOverrideConfigUnsafe({
+      {QueryConfig::kMinOutputBatchRows, "128"},
+      {QueryConfig::kAbandonPartialAggregationMinRows, "100"},
+      {QueryConfig::kAbandonPartialAggregationMinPct, "50"},
+  });
+  params.planNode = PlanBuilder()
+                        .values(vectors)
+                        .partialAggregation({"c0"}, {}, {}, GetParam().useGPU)
+                        .finalAggregation(GetParam().useGPU)
+                        .planNode();
+  auto result = readCursor(params, [](Task*) {});
+  int64_t numRows = 0;
+  for (const auto& vector : result.second) {
+    numRows += vector->size();
+  }
+  ASSERT_EQ(101, numRows);
+}
+
 TEST_P(AggregationTest, toIntermediate) {
   auto vectors = {
       // 1st batch will produce 100 distinct groups from 10 rows.
       makeRowVector(
           {makeFlatVector<int32_t>(100, [](auto row) { return row; })}),
-      // 2st batch will trigger abandon partial aggregation event with no new
+      // 2nd batch will trigger abandon partial aggregation event with no new
       // distinct values.
       makeRowVector({makeFlatVector<int32_t>(1, [](auto row) { return row; })}),
       // 3rd batch will not produce any new distinct values.
@@ -1062,7 +1263,7 @@ TEST_P(AggregationTest, toIntermediateWithFilter) {
   std::vector<VectorPtr> c0 = {
       // 1st batch will produce 100 distinct groups from 10 rows.
       makeFlatVector<int32_t>(100, [](auto row) { return row; }),
-      // 2st batch will trigger abandon partial aggregation event with no new
+      // 2nd batch will trigger abandon partial aggregation event with no new
       // distinct values.
       makeFlatVector<int32_t>(1, [](auto row) { return row; }),
       // 3rd batch will not produce any new distinct values.
@@ -1073,7 +1274,7 @@ TEST_P(AggregationTest, toIntermediateWithFilter) {
   std::vector<VectorPtr> c1 = {
       // 1st batch will produce 100 distinct groups from 10 rows.
       makeFlatVector<int32_t>(100, [](auto row) { return row; }),
-      // 2st batch will trigger abandon partial aggregation event with no new
+      // 2nd batch will trigger abandon partial aggregation event with no new
       // distinct values.
       makeFlatVector<int32_t>(1, [](auto row) { return row; }),
       // 3rd batch will not produce any new distinct values.
@@ -1084,7 +1285,7 @@ TEST_P(AggregationTest, toIntermediateWithFilter) {
   std::vector<VectorPtr> c2 = {
       // 1st batch will produce 100 distinct groups from 10 rows.
       makeFlatVector<bool>(100, [](auto row) { return true; }),
-      // 2st batch will trigger abandon partial aggregation event with no new
+      // 2nd batch will trigger abandon partial aggregation event with no new
       // distinct values.
       makeFlatVector<bool>(1, [](auto row) { return true; }),
       // 3rd batch will not produce any new distinct values.
@@ -1788,6 +1989,51 @@ TEST_P(AggregationTest, spillAll) {
   ASSERT_EQ(stats[0].operatorStats[1].spilledPartitions, 1);
   // Verifies all the rows have been spilled.
   ASSERT_EQ(stats[0].operatorStats[1].spilledRows, numDistincts);
+  OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
+}
+
+TEST_P(AggregationTest, spillWithArrowSerde) {
+  if (GetParam().useGPU) {
+    GTEST_SKIP() << "GPU Aggregation does not support spilling\n";
+  }
+  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kArrow)) {
+    serializer::arrowserde::ArrowVectorSerde::registerNamedVectorSerde();
+  }
+
+  auto inputs = makeVectors(rowType_, 100, 10);
+  auto plan = PlanBuilder()
+                  .values(inputs)
+                  .singleAggregation({"c0"}, {"sum(c1)"})
+                  .planNode();
+  auto results = AssertQueryBuilder(plan).copyResults(pool_.get());
+
+  auto tempDirectory = exec::test::TempDirectoryPath::create();
+  bool sawArrowSerde = false;
+  SCOPED_TESTVALUE_SET(
+      "bytedance::bolt::exec::SpillState::appendToPartition",
+      std::function<void(exec::SpillState*)>([&](exec::SpillState* state) {
+        const auto kind = state->testingSpillSerdeKind();
+        if (kind.has_value()) {
+          EXPECT_EQ(VectorSerde::Kind::kArrow, kind.value());
+          sawArrowSerde = true;
+        }
+      }));
+  auto task = AssertQueryBuilder(plan)
+                  .spillDirectory(tempDirectory->path)
+                  .config(QueryConfig::kSpillEnabled, "true")
+                  .config(QueryConfig::kAggregationSpillEnabled, "true")
+                  .config(QueryConfig::kAggregationSpillMemoryThreshold, "1024")
+                  .config(QueryConfig::kSinglePartitionSpillSerdeKind, "Arrow")
+                  .config(QueryConfig::kSpillNumPartitionBits, "0")
+                  .assertResults(results);
+
+  auto stats = task->taskStats().pipelineStats;
+  ASSERT_LT(0, stats[0].operatorStats[1].spilledInputBytes);
+  ASSERT_LT(0, stats[0].operatorStats[1].spilledBytes);
+  ASSERT_EQ(stats[0].operatorStats[1].spilledPartitions, 1);
+#ifndef NDEBUG
+  ASSERT_TRUE(sawArrowSerde);
+#endif
   OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
 }
 
@@ -2796,6 +3042,55 @@ TEST_P(AggregationTest, preGroupedAggregationWithSpilling) {
   OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
 }
 
+TEST_P(AggregationTest, preGroupedSplitWithHookOnlyLazyChild) {
+  if (GetParam().useGPU) {
+    GTEST_SKIP() << "GPU Aggregation is not used by this lazy hook test\n";
+  }
+
+  constexpr vector_size_t kSize = 1'024;
+  auto k1 = makeFlatVector<int64_t>(kSize, [](auto row) { return row / 256; });
+  auto k2 = makeFlatVector<int64_t>(kSize, [](auto row) { return row % 8; });
+  auto valueLazy = std::make_shared<LazyVector>(
+      pool(),
+      BIGINT(),
+      kSize,
+      std::make_unique<HookOnlyLazyLoader<int64_t>>(
+          pool(),
+          [](vector_size_t row) { return static_cast<int64_t>(row); },
+          kSize));
+  auto input = makeRowVector({"k1", "k2", "v"}, {k1, k2, valueLazy});
+
+  auto plan = PlanBuilder()
+                  .values({input})
+                  .aggregation(
+                      {"k1", "k2"},
+                      {"k1"},
+                      {"min(v)", "bitwise_or_agg(v)"},
+                      {},
+                      core::AggregationNode::Step::kSingle,
+                      false)
+                  .planNode();
+
+  std::vector<int64_t> expectedK1(32);
+  std::vector<int64_t> expectedK2(32);
+  std::vector<int64_t> expectedMin(32);
+  std::vector<int64_t> expectedOr(32);
+  for (vector_size_t group = 0; group < 32; ++group) {
+    expectedK1[group] = group / 8;
+    expectedK2[group] = group % 8;
+    expectedMin[group] = expectedK1[group] * 256 + expectedK2[group];
+    expectedOr[group] = (expectedK1[group] << 8) | 248 | expectedK2[group];
+  }
+  auto expected = makeRowVector(
+      {"k1", "k2", "m", "o"},
+      {makeFlatVector<int64_t>(expectedK1),
+       makeFlatVector<int64_t>(expectedK2),
+       makeFlatVector<int64_t>(expectedMin),
+       makeFlatVector<int64_t>(expectedOr)});
+
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
 TEST_P(AggregationTest, adaptiveOutputBatchRows) {
   if (GetParam().useGPU) {
     GTEST_SKIP() << "GPU Aggregation does not support output batch rows";
@@ -2896,7 +3191,7 @@ DEBUG_ONLY_TEST_P(AggregationTest, reclaimDuringInputProcessing) {
     auto testWaitKey = testWait.prepareWait();
 
     std::atomic_int numInputs{0};
-    Operator* op;
+    Operator* op = nullptr;
     SCOPED_TESTVALUE_SET(
         "bytedance::bolt::exec::Driver::runInternal::addInput",
         std::function<void(Operator*)>(([&](Operator* testOp) {
@@ -3040,7 +3335,7 @@ DEBUG_ONLY_TEST_P(AggregationTest, reclaimDuringReserve) {
   folly::EventCount testWait;
   auto testWaitKey = testWait.prepareWait();
 
-  Operator* op;
+  Operator* op = nullptr;
   SCOPED_TESTVALUE_SET(
       "bytedance::bolt::exec::Driver::runInternal::addInput",
       std::function<void(Operator*)>(([&](Operator* testOp) {
@@ -3154,7 +3449,7 @@ DEBUG_ONLY_TEST_P(AggregationTest, reclaimDuringAllocation) {
     folly::EventCount testWait;
     auto testWaitKey = testWait.prepareWait();
 
-    Operator* op;
+    Operator* op = nullptr;
     SCOPED_TESTVALUE_SET(
         "bytedance::bolt::exec::Driver::runInternal::addInput",
         std::function<void(Operator*)>(([&](Operator* testOp) {
@@ -3597,7 +3892,7 @@ DEBUG_ONLY_TEST_P(AggregationTest, reclaimWithEmptyAggregationTable) {
             .planNode();
 
     std::atomic_bool injectOnce{true};
-    Operator* op;
+    Operator* op = nullptr;
     SCOPED_TESTVALUE_SET(
         "bytedance::bolt::exec::Driver::runInternal",
         std::function<void(Driver*)>(([&](Driver* driver) {
@@ -3727,7 +4022,7 @@ DEBUG_ONLY_TEST_P(AggregationTest, abortDuringOutputProcessing) {
     auto testWaitKey = testWait.prepareWait();
 
     std::atomic_bool injectOnce{true};
-    Operator* op;
+    Operator* op = nullptr;
     SCOPED_TESTVALUE_SET(
         "bytedance::bolt::exec::Driver::runInternal::noMoreInput",
         std::function<void(Operator*)>(([&](Operator* testOp) {
@@ -3819,7 +4114,7 @@ DEBUG_ONLY_TEST_P(AggregationTest, abortDuringInputgProcessing) {
     auto testWaitKey = testWait.prepareWait();
 
     std::atomic_int numInputs{0};
-    Operator* op;
+    Operator* op = nullptr;
     SCOPED_TESTVALUE_SET(
         "bytedance::bolt::exec::Driver::runInternal::addInput",
         std::function<void(Operator*)>(([&](Operator* testOp) {
@@ -4758,6 +5053,76 @@ TEST_P(AggregationTest, rowBasedSpillNull) {
     checkSpillStats(stats, testData.expectSpill);
     OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
   }
+}
+
+TEST_F(AggregationTest, rowBasedSpillJoinAggregationOrderByWithJit) {
+  constexpr vector_size_t kSize = 100;
+  std::vector<RowVectorPtr> tmp1;
+  std::vector<RowVectorPtr> tmp2;
+  std::vector<RowVectorPtr> duckTmp2;
+  for (auto batch = 0; batch < 5; ++batch) {
+    tmp1.push_back(makeRowVector(
+        {"id"}, {makeFlatVector<int32_t>(kSize, [batch](auto row) {
+          return (batch * kSize + row) % 16;
+        })}));
+    tmp2.push_back(makeRowVector(
+        {"build_id", "amount"},
+        {makeFlatVector<int32_t>(
+             kSize, [batch](auto row) { return (batch * kSize + row) % 16; }),
+         makeFlatVector<int32_t>(
+             kSize, [batch](auto row) { return batch * kSize + row; })}));
+    duckTmp2.push_back(makeRowVector(
+        {"id", "amount"},
+        {makeFlatVector<int32_t>(
+             kSize, [batch](auto row) { return (batch * kSize + row) % 16; }),
+         makeFlatVector<int32_t>(
+             kSize, [batch](auto row) { return batch * kSize + row; })}));
+  }
+
+  createDuckDbTable("tmp1", tmp1);
+  createDuckDbTable("tmp2", duckTmp2);
+
+  core::PlanNodeId aggrNodeId;
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .values(tmp1)
+                  .hashJoin(
+                      {"id"},
+                      {"build_id"},
+                      PlanBuilder(planNodeIdGenerator).values(tmp2).planNode(),
+                      "",
+                      {"id", "amount"})
+                  .singleAggregation({"id"}, {"sum(amount) AS amount_sum"}, {})
+                  .capturePlanNodeId(aggrNodeId)
+                  .orderBy({"id", "amount_sum DESC"}, false)
+                  .planNode();
+
+  const auto* const sql = R"(
+      SELECT id, amount_sum FROM
+       (
+        SELECT id, sum(amount) as amount_sum FROM
+          (SELECT tmp1.id, tmp2.amount FROM
+            tmp1 join tmp2 on tmp1.id = tmp2.id
+          )
+        GROUP BY id
+       )
+       ORDER BY id, amount_sum DESC)";
+
+  auto spillDirectory = exec::test::TempDirectoryPath::create();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .spillDirectory(spillDirectory->path)
+                  .config(QueryConfig::kTestingSpillPct, "100")
+                  .config(QueryConfig::kSpillEnabled, "true")
+                  .config(QueryConfig::kAggregationSpillEnabled, "true")
+                  .config(QueryConfig::kRowBasedSpillMode, "compression")
+                  .config(QueryConfig::kJitLevel, "-1")
+                  .assertResults(sql);
+
+  auto taskStats = exec::toPlanStats(task->taskStats());
+  auto& stats = taskStats.at(aggrNodeId);
+  checkSpillStats(stats, true);
+  checkRowBasedSpillStats(stats, true);
+  OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
 }
 
 INSTANTIATE_GPU_TEST_SUITE_P(AggregationTestOnCPUOrGPU, AggregationTest);

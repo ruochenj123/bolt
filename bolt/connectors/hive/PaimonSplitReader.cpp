@@ -41,7 +41,8 @@ PaimonSplitReader::PaimonSplitReader(
     const std::vector<int>& sequenceNumberIndices,
     int valueKindIndex,
     const std::vector<int>& valueIndices,
-    const std::unordered_map<std::string, std::string>& tableParameters)
+    const std::unordered_map<std::string, std::string>& tableParameters,
+    const std::shared_ptr<io::IoStatistics> ioStats)
     : splitReaders_(std::move(splitReaders)),
       readerOutputType_(readerOutputType),
       primaryKeyIndices_(std::move(primaryKeyIndices)),
@@ -54,7 +55,8 @@ PaimonSplitReader::PaimonSplitReader(
       aggregateFunctions_(getAggregateFunctions()),
       aggregations_(getAggregations()),
       sequenceGroups_(getSequenceGroups()),
-      mergeEngine_(getMergeEngine()) {
+      mergeEngine_(getMergeEngine()),
+      ioStats_(ioStats) {
   for (const auto& splitReader : splitReaders_) {
     auto iterator = getIterator(splitReader.get());
     if (iterator && iterator->primaryKeys->size() > 0) {
@@ -109,8 +111,13 @@ PaimonRowIteratorPtr PaimonSplitReader::getIterator(SplitReader* rowReader) {
   VectorPtr result =
       BaseVector::create(readerOutputType_, 0, rowReader->pool());
 
-  if (rowReader->next(paimon::kMAX_BATCH_SIZE, result)) {
+  while (rowReader->next(paimon::kMAX_BATCH_SIZE, result)) {
+    // next() reports scanned rows, even if all rows are filtered out.
+    if (result->size() == 0) {
+      continue;
+    }
     RowVectorPtr resultAsRowVect = std::static_pointer_cast<RowVector>(result);
+    resultAsRowVect->loadedVector();
     auto primaryKeys = projectVector(resultAsRowVect, primaryKeyIndices_);
 
     auto sequenceFields =
@@ -145,9 +152,8 @@ PaimonRowIteratorPtr PaimonSplitReader::getIterator(SplitReader* rowReader) {
         values,
         sequenceGroups,
         rowReader);
-  } else {
-    return nullptr;
   }
+  return nullptr;
 }
 
 PaimonMergeEngineType PaimonSplitReader::getMergeEngineType() {
@@ -369,14 +375,23 @@ uint64_t PaimonSplitReader::next(int64_t size, VectorPtr& output) {
 
   mergeEngine_->setResult(std::dynamic_pointer_cast<RowVector>(output));
 
-  while (!heap.empty()) {
-    auto iterator = heap.top();
+  auto mergetStartTime = getCurrentTimeMicro();
+  while (true) {
+    auto iterator = heap.empty() ? nullptr : heap.top();
+    auto rowCnt = mergeEngine_->finalizeCompletedGroups(iterator);
+
+    if (rowCnt >= size || !iterator) {
+      auto mergeTime = (getCurrentTimeMicro() - mergetStartTime) * 1000;
+      ioStats_->incTotalMergeTime(mergeTime);
+      return rowCnt;
+    }
+
     VLOG(2) << "Values:" << iterator->values->toString(iterator->rowIndex)
             << "   Seq:"
             << iterator->sequenceFields->toString(iterator->rowIndex);
     heap.pop();
 
-    int rowCnt = mergeEngine_->add(iterator);
+    mergeEngine_->add(iterator);
 
     if (iterator->next()) {
       heap.push(iterator);
@@ -385,15 +400,7 @@ uint64_t PaimonSplitReader::next(int64_t size, VectorPtr& output) {
       if (nextBatchIterator)
         heap.push(nextBatchIterator);
     }
-
-    if (rowCnt >= size) {
-      return rowCnt;
-    }
   }
-
-  mergeEngine_->finish();
-
-  return output->size();
 }
 
 bool PaimonSplitReader::allPrefetchIssued() const {

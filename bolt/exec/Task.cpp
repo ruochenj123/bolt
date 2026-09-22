@@ -28,7 +28,6 @@
  * --------------------------------------------------------------------------
  */
 
-#include <string>
 #include <thread>
 
 #include "bolt/common/base/Counters.h"
@@ -312,6 +311,7 @@ Task::Task(
     std::function<void(std::exception_ptr)> onError)
     : uuid_{makeUuid()},
       taskId_(taskId),
+      sparkTaskAttemptId_(memorypressure::extractSparkTaskAttemptId(taskId)),
       destination_(destination),
       mode_(mode),
       memoryArbitrationPriority_(memoryArbitrationPriority),
@@ -330,6 +330,20 @@ Task::Task(
   maybeInitTrace();
 }
 
+Task::MemoryPressureSnapshot Task::memoryPressureSnapshot() const {
+  return memorypressure::snapshot(
+      memoryPressureWatermarkBytes(), sparkTaskAttemptId_);
+}
+
+std::optional<Task::ScopedMemoryExpansionGuard>
+Task::maybeScopedDisableMemoryExpansion() const {
+  return memorypressure::maybeScopedDisableMemoryExpansion(sparkTaskAttemptId_);
+}
+
+std::string Task::memoryPressureDetails() const {
+  return memorypressure::details();
+}
+
 Task::~Task() {
   folly::json::serialization_opts opts;
   opts.allow_nan_inf = true;
@@ -345,7 +359,7 @@ Task::~Task() {
       }};
   bytedance::bolt::process::ScopedThreadDebugInfo scopedInfo(debugInfoForTask);
 
-  TestValue::adjust("bytedance::bolt::exec::Task::~Task", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::Task::~Task", this);
 
   clearStage = "removeSpillDirectoryIfExists";
   removeSpillDirectoryIfExists();
@@ -1034,6 +1048,7 @@ void Task::resume(std::shared_ptr<Task> self) {
 
   // Get the stats and free the resources of Drivers that were not on thread.
   for (auto& driver : offThreadDrivers) {
+    self->driversClosedByTask_.emplace_back(driver);
     driver->closeByTask();
   }
 }
@@ -1222,7 +1237,7 @@ std::function<void(const bool)> Task::makeFinishDriverCreatorCallback(
 
 std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
     uint32_t splitGroupId) {
-  TestValue::adjust("bytedance::bolt::exec::Task::createDriversLocked", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::Task::createDriversLocked", this);
   const bool groupedExecutionDrivers = (splitGroupId != kUngroupedGroupId);
   auto& splitGroupState = splitGroupStates_[splitGroupId];
   const auto numPipelines = driverFactories_.size();
@@ -1354,8 +1369,8 @@ void Task::removeDriver(std::shared_ptr<Task> self, Driver* driver) {
     if (self->numFinishedDrivers_ == self->numTotalDrivers_) {
       LOG(INFO) << "All drivers (" << self->numFinishedDrivers_
                 << ") finished for task " << self->taskId()
-                << " after running for " << self->timeSinceStartMsLocked()
-                << " ms.";
+                << " after running for "
+                << succinctMillis(self->timeSinceStartMsLocked());
     }
   }
   stateChangeNotifier.notify();
@@ -2063,7 +2078,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
     LOG(INFO) << "Terminating task " << taskId() << " with state "
               << taskStateString(state_) << " after running for "
-              << timeSinceStartMsLocked() << " ms.";
+              << succinctMillis(timeSinceStartMsLocked());
 
     taskCompletionNotifier.activate(
         std::move(taskCompletionPromises_), [&]() { onTaskCompletion(); });
@@ -2097,6 +2112,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
   // Get the stats and free the resources of Drivers that were not on
   // thread.
   for (auto& driver : offThreadDrivers) {
+    driversClosedByTask_.emplace_back(driver);
     driver->closeByTask();
   }
 
@@ -2156,7 +2172,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
     }
   }
 
-  TestValue::adjust("bytedance::bolt::exec::Task::terminate", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::Task::terminate", this);
 
   for (auto& [planNodeId, splits] : remainingRemoteSplits) {
     auto client = getExchangeClient(planNodeId);
@@ -2502,10 +2518,29 @@ std::string Task::toString() const {
   }
 
   if (numRemainingDrivers > 0) {
-    out << "drivers:\n";
+    bool addedCaption{false};
     for (auto& driver : drivers_) {
       if (driver) {
+        if (!addedCaption) {
+          out << "drivers:\n";
+          addedCaption = true;
+        }
         out << driver->toString() << std::endl;
+      }
+    }
+  }
+
+  if (!driversClosedByTask_.empty()) {
+    bool addedCaption{false};
+    for (auto& driver : driversClosedByTask_) {
+      auto zombieDriver = driver.lock();
+      if (zombieDriver) {
+        if (!addedCaption) {
+          out << "zombie drivers:\n";
+          addedCaption = true;
+        }
+        out << zombieDriver->toString()
+            << ", refcount: " << zombieDriver.use_count() - 1 << std::endl;
       }
     }
   }
@@ -2579,8 +2614,9 @@ folly::dynamic Task::toJson() const {
 std::shared_ptr<MergeSource> Task::addLocalMergeSource(
     uint32_t splitGroupId,
     const core::PlanNodeId& planNodeId,
-    const RowTypePtr& rowType) {
-  auto source = MergeSource::createLocalMergeSource();
+    const RowTypePtr& rowType,
+    int queueSize) {
+  auto source = MergeSource::createLocalMergeSource(queueSize);
   splitGroupStates_[splitGroupId].localMergeSources[planNodeId].push_back(
       source);
   return source;
@@ -2717,7 +2753,7 @@ Task::getLocalExchangeQueues(
 }
 
 void Task::setError(const std::exception_ptr& exception) {
-  TestValue::adjust("bytedance::bolt::exec::Task::setError", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::Task::setError", this);
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
     if (not isRunningLocked()) {
@@ -2754,7 +2790,7 @@ std::string Task::errorMessage() const {
 }
 
 StopReason Task::enter(ThreadState& state, uint64_t nowMicros) {
-  TestValue::adjust("bytedance::bolt::exec::Task::enter", &state);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::Task::enter", &state);
   std::lock_guard<std::timed_mutex> l(mutex_);
   BOLT_CHECK(state.isEnqueued);
   state.isEnqueued = false;
@@ -2964,7 +3000,7 @@ StopReason Task::shouldStopLocked() {
 
 ContinueFuture Task::requestPause() {
   std::lock_guard<std::timed_mutex> l(mutex_);
-  TestValue::adjust("bytedance::bolt::exec::Task::requestPauseLocked", this);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::Task::requestPauseLocked", this);
   pauseRequested_ = true;
   return makeFinishFutureLocked("Task::requestPause");
 }
@@ -3204,6 +3240,8 @@ uint64_t Task::MemoryReclaimer::reclaimTask(
   if (task->isCancelled()) {
     return 0;
   }
+
+  task->recordMemoryPressureWatermarkBytes(task->pool()->currentBytes());
 
   uint64_t reclaimedBytes{0};
   reclaimedBytes = memory::MemoryReclaimer::reclaim(

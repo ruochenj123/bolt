@@ -132,25 +132,9 @@ bool NegatedFloatingPointValues<T>::testDoubleRange(
     double min,
     double max,
     bool hasNull) const {
-  // If inner range is completely disjoint with [min, max], then negated range
-  // completely contains [min, max]
-  if (!nonNegated_->testDoubleRange(min, max, hasNull)) {
-    return true;
-  }
-
-  // If inner range partially overlaps with [min, max], then negated range also
-  // partially overlaps
-  if (min < nonNegated_->min() || max > nonNegated_->max()) {
-    return true;
-  }
-
-  // If null is allowed and present, the range may pass
-  if (hasNull && nullAllowed_) {
-    return true;
-  }
-
-  // Inner range completely contains [min, max], so negated range is disjoint
-  return false;
+  // it is not possible to exclude an entire range based on a few blacklisted
+  // points.
+  return true;
 }
 
 template <typename T>

@@ -38,14 +38,4 @@ add_executable(
 
 add_test(bolt_core_test bolt_core_test)
 
-target_link_libraries(
-  bolt_core_test
-  PRIVATE bolt_core
-          bolt_exception
-          bolt_exec_test_lib
-          bolt_presto_types
-          bolt_type
-          bolt_vector_test_lib
-          GTest::gtest
-          GTest::gtest_main
-)
+target_link_libraries(bolt_core_test PRIVATE bolt_gtest_main)

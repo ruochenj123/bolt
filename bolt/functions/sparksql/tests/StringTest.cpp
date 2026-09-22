@@ -28,6 +28,7 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/functions/sparksql/tests/SparkFunctionBaseTest.h"
 #include "bolt/type/Type.h"
@@ -303,7 +304,7 @@ class StringTest : public SparkFunctionBaseTest {
   }
 };
 
-TEST_F(StringTest, Ascii) {
+TEST_F(StringTest, ascii) {
   EXPECT_EQ(ascii(std::string("\0", 1)), 0);
   EXPECT_EQ(ascii(" "), 32);
   EXPECT_EQ(ascii("😋"), 128523);
@@ -352,7 +353,36 @@ TEST_F(StringTest, bitLengthVarbinary) {
   EXPECT_EQ(bitLength("\U0001F408"), 32);
 }
 
-TEST_F(StringTest, Chr) {
+TEST_F(StringTest, octetLength) {
+  const auto octetLength = [&](const std::optional<std::string>& arg) {
+    return evaluateOnce<int32_t>("octet_length(c0)", arg);
+  };
+
+  EXPECT_EQ(octetLength(std::nullopt), std::nullopt);
+  EXPECT_EQ(octetLength(""), 0);
+  EXPECT_EQ(octetLength(std::string("\0", 1)), 1);
+  EXPECT_EQ(octetLength("123"), 3);
+  EXPECT_EQ(octetLength("😋"), 4);
+  EXPECT_EQ(octetLength(kWomanFacepalmingLightSkinTone), 17);
+
+  const std::string largeInput(1'048'576, 'a');
+  EXPECT_EQ(octetLength(largeInput), 1'048'576);
+}
+
+TEST_F(StringTest, octetLengthVarbinary) {
+  const auto octetLength = [&](const std::optional<std::string>& arg) {
+    return evaluateOnce<int32_t, std::string>(
+        "octet_length(c0)", {arg}, {VARBINARY()});
+  };
+
+  EXPECT_EQ(octetLength(std::nullopt), std::nullopt);
+  EXPECT_EQ(octetLength(""), 0);
+  EXPECT_EQ(octetLength("123"), 3);
+  EXPECT_EQ(octetLength(std::string("\0\xff", 2)), 2);
+  EXPECT_EQ(octetLength("😋"), 4);
+}
+
+TEST_F(StringTest, chr) {
   EXPECT_EQ(chr(-16), "");
   EXPECT_EQ(chr(0), std::string("\0", 1));
   EXPECT_EQ(chr(0x100), std::string("\0", 1));
@@ -444,7 +474,7 @@ TEST_F(StringTest, levenshtein) {
   EXPECT_EQ(levenshtein("世界千世", "大a界b", 3), -1);
 }
 
-TEST_F(StringTest, Instr) {
+TEST_F(StringTest, instr) {
   EXPECT_EQ(instr("SparkSQL", "SQL"), 6);
   EXPECT_EQ(instr(std::nullopt, "SQL"), std::nullopt);
   EXPECT_EQ(instr("SparkSQL", std::nullopt), std::nullopt);
@@ -464,7 +494,7 @@ TEST_F(StringTest, Instr) {
       10);
 }
 
-TEST_F(StringTest, LengthString) {
+TEST_F(StringTest, lengthString) {
   EXPECT_EQ(length(""), 0);
   EXPECT_EQ(length(std::string("\0", 1)), 1);
   EXPECT_EQ(length("1"), 1);
@@ -484,7 +514,7 @@ TEST_F(StringTest, lengthVarbinary) {
   EXPECT_EQ(lengthVarbinary("1234567890abdef"), 15);
 }
 
-TEST_F(StringTest, MD5) {
+TEST_F(StringTest, md5) {
   EXPECT_EQ(md5(std::nullopt), std::nullopt);
   EXPECT_EQ(md5(""), "d41d8cd98f00b204e9800998ecf8427e");
   EXPECT_EQ(md5("Infinity"), "eb2ac5b04180d8d6011a016aeb8f75b3");
@@ -751,9 +781,7 @@ TEST_F(StringTest, repeat) {
   EXPECT_EQ(stringRepeat("abab", -1), "");
   EXPECT_EQ(stringRepeat("", 2), "");
   EXPECT_EQ(stringRepeat("123\u6570", 2), "123\u6570123\u6570");
-  BOLT_ASSERT_USER_THROW(
-      stringRepeat("hh", 524289),
-      "Result size must be less than or equal to 1048576");
+  EXPECT_EQ(stringRepeat("hh", 524289), std::string(1048578, 'h'));
   BOLT_ASSERT_USER_THROW(
       stringRepeat(std::string(214749, 'l'), 10000),
       "integer overflow: 214749 * 10000");
@@ -1140,6 +1168,9 @@ TEST_F(StringTest, rpad) {
   // Invalid UTF-8 chars
   EXPECT_EQ(invalidString + "x", rpad(invalidString, 8, "x"));
   EXPECT_EQ("abc" + invalidPadString, rpad("abc", 6, invalidPadString));
+
+  BOLT_ASSERT_THROW(rpad("abc", -1, "x"), "pad size must be in the range");
+  BOLT_ASSERT_THROW(rpad("abc", 5, ""), "padString must not be empty");
 }
 
 TEST_F(StringTest, lpad) {
@@ -1173,6 +1204,9 @@ TEST_F(StringTest, lpad) {
   // Invalid UTF-8 chars
   EXPECT_EQ("x" + invalidString, lpad(invalidString, 8, "x"));
   EXPECT_EQ(invalidPadString + "abc", lpad("abc", 6, invalidPadString));
+
+  BOLT_ASSERT_THROW(lpad("abc", -1, "x"), "pad size must be in the range");
+  BOLT_ASSERT_THROW(lpad("abc", 5, ""), "padString must not be empty");
 }
 
 TEST_F(StringTest, left) {
@@ -1584,6 +1618,80 @@ TEST_F(StringTest, lower) {
   // Ligatures.
   EXPECT_EQ(lower("ß ﬁ ﬃ ﬀ ﬆ ῗ"), "ß ﬁ ﬃ ﬀ ﬆ ῗ");
 }
+
+TEST_F(StringTest, lowerGreekSigmaCompatibility) {
+  struct TestCase {
+    int32_t id;
+    std::string input;
+    std::string defaultExpected;
+    std::string sparkExpected;
+  };
+
+  const std::vector<TestCase> testCases = {
+      {1, "Σ", "σ", "σ"},
+      {2, "ΣΣ", "σς", "σς"},
+      {3, "ΣΣ8", "σς8", "σς8"},
+      {4, "ΣΣ8I", "σς8i", "σσ8i"},
+      {5, "ΣΣI", "σσi", "σσi"},
+      {6, "AΣ", "aς", "aς"},
+      {7, "AΣ8", "aς8", "aς8"},
+      {8, "AΣ8B", "aς8b", "aσ8b"},
+      {9, "ΣA", "σa", "σa"},
+      {10, "8Σ", "8σ", "8σ"},
+      {11, "8Σ8", "8σ8", "8σ8"},
+      {12, "AΣ.", "aς.", "aς."},
+      {13, "AΣ-B", "aς-b", "aσ-b"},
+      {14, "AΣ_B", "aς_b", "aσ_b"},
+      {15,
+       "prefix ΣΣ46URZHBLJJ8",
+       "prefix σς46urzhbljj8",
+       "prefix σσ46urzhbljj8"},
+      {16,
+       "ΣΣ8IBLMR5OIM8 suffix",
+       "σς8iblmr5oim8 suffix",
+       "σσ8iblmr5oim8 suffix"},
+      {17, "ΣΑΛΑΤΑ", "σαλατα", "σαλατα"},
+      {18, "ΘΑΛΑΣΣΙΝΟΣ", "θαλασσινος", "θαλασσινος"},
+      {19, "ΟΣ", "ος", "ος"},
+      {20, "ΟΣ8", "ος8", "ος8"},
+      {21, "ΟΣΑ", "οσα", "οσα"},
+      {22, "σςΣ", "σςς", "σςς"},
+      {23, "Σ Σ", "σ σ", "σ σ"},
+      {24, "Σ-Σ", "σ-σ", "σ-ς"},
+      {25, "Σ.Σ", "σ.ς", "σ.ς"},
+      {26, "AΣ1B", "aς1b", "aσ1b"},
+      {27, "AΣ1", "aς1", "aς1"},
+      {28, "σς", "σς", "σς"},
+      {29, "AΣ@b", "aς@b", "aς@b"},
+      {30, "A@Σ", "a@σ", "a@σ"},
+      {31, "AΣ AΣ AΣ AΣ AΣ", "aς aς aς aς aς", "aς aς aς aς aς"},
+      {32, "AΣ²B", "aς²b", "aσ²b"},
+      {33, "AΣ·B", "aσ·b", "aς·b"},
+      {34, "AΣ가B", "aς가b", "aσ가b"},
+      {35, "AΣ㐀B", "aς㐀b", "aσ㐀b"},
+      {36, "AΣ\u200BB", "aσ\u200Bb", "aσ\u200Bb"},
+      {37, "AΣ\u202FB", "aς\u202Fb", "aς\u202Fb"},
+      {38, "A1-Σ", "a1-σ", "a1-σ"},
+      // Georgian Mkhedruli letters are cased in both ICU 74 and ByteOpenJDK
+      // 17.0.9.
+      {39, "AΣა", "aσა", "aσა"},
+      // Supplementary cased characters must be recognized without truncation.
+      {40, "AΣ𐐅", "aσ𐐭", "aσ𐐭"},
+  };
+
+  for (const auto& testCase : testCases) {
+    SCOPED_TRACE(testing::Message() << "id=" << testCase.id);
+    const auto& expected =
+        kSparkCompatible ? testCase.sparkExpected : testCase.defaultExpected;
+    EXPECT_EQ(lower(testCase.input), expected);
+  }
+
+  // The common production shape is a long word containing a sparse sigma.
+  const auto longInput = std::string(32'768, 'A') + "ΣB";
+  const auto longExpected = std::string(32'768, 'a') + "σb";
+  EXPECT_EQ(lower(longInput), longExpected);
+}
+
 TEST_F(StringTest, upper) {
   // Empty strings.
   EXPECT_EQ(upper(""), "");

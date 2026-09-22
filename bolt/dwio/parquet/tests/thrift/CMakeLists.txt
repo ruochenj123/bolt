@@ -29,7 +29,4 @@ add_executable(bolt_dwio_parquet_thrift_test ThriftTransportTest.cpp)
 
 add_test(bolt_dwio_parquet_thrift_test bolt_dwio_parquet_thrift_test)
 
-target_link_libraries(
-  bolt_dwio_parquet_thrift_test arrow::libarrow thrift::thrift bolt_dwio_common GTest::gtest
-  GTest::gtest_main
-)
+target_link_libraries(bolt_dwio_parquet_thrift_test PRIVATE bolt_gtest_main)

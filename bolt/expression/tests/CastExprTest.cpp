@@ -28,6 +28,8 @@
  * --------------------------------------------------------------------------
  */
 
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include <limits>
 #include "bolt/buffer/Buffer.h"
 #include "bolt/common/base/BoltException.h"
@@ -86,6 +88,13 @@ class CastExprTest : public functions::test::CastBaseTest {
   void setFlinkCompatible(bool value) {
     auto config = queryCtx_->queryConfig().rawConfigsCopy();
     config[core::QueryConfig::kEnableFlinkCompatible] = std::to_string(value);
+    queryCtx_->testingOverrideConfigUnsafe(std::move(config));
+  }
+
+  void setCastStringToFloatingPointTrimControlChars(bool value) {
+    auto config = queryCtx_->queryConfig().rawConfigsCopy();
+    config[core::QueryConfig::kCastStringToFloatingPointTrimControlChars] =
+        std::to_string(value);
     queryCtx_->testingOverrideConfigUnsafe(std::move(config));
   }
 
@@ -417,17 +426,11 @@ TEST_F(CastExprTest, basics) {
       "string", {1, 2, 3, 100, -100}, {"1", "2", "3", "100", "-100"});
   testCast<std::string, int8_t>(
       "tinyint", {"1", "2", "3", "100", "-100"}, {1, 2, 3, 100, -100});
-#ifndef SPARK_COMPATIBLE
+  const auto expectedIntegers = ::bytedance::bolt::kSparkCompatible
+      ? std::vector<std::optional<int>>{1, 2, 3, 100, -100, 1, -2}
+      : std::vector<std::optional<int>>{2, 3, 4, 100, -100, 1, -2};
   testCast<double, int>(
-      "int",
-      {1.888, 2.5, 3.6, 100.44, -100.101, 1.0, -2.0},
-      {2, 3, 4, 100, -100, 1, -2});
-#else
-  testCast<double, int>(
-      "int",
-      {1.888, 2.5, 3.6, 100.44, -100.101, 1.0, -2.0},
-      {1, 2, 3, 100, -100, 1, -2});
-#endif
+      "int", {1.888, 2.5, 3.6, 100.44, -100.101, 1.0, -2.0}, expectedIntegers);
 
   testCast<double, double>(
       "double",
@@ -443,7 +446,7 @@ TEST_F(CastExprTest, basics) {
        1.0,
        -2.0,
        0.0008547008547008547,
-       0.0009165902841429881}, // add 2 cases for scientifc notation
+       0.0009165902841429881}, // add 2 cases for scientific notation
       {"1.888",
        "2.5",
        "3.6",
@@ -500,7 +503,7 @@ TEST_F(CastExprTest, basics) {
        std::numeric_limits<float>::quiet_NaN()});
 
   gflags::FlagSaver flagSaver;
-  FLAGS_experimental_enable_legacy_cast = true;
+  FLAGS_bolt_experimental_enable_legacy_cast = true;
   testCast<double, std::string>(
       "string",
       {1.888, 2.5, 3.6, 100.44, -100.101, 1.0, -2.0},
@@ -594,7 +597,9 @@ TEST_F(CastExprTest, realAndDoubleToString) {
           "NaN",
       });
 
-#ifndef SPARK_COMPATIBLE
+  if (::bytedance::bolt::kSparkCompatible) {
+    return;
+  }
   setLegacyCast(true);
   testCast<double, std::string>(
       "string",
@@ -680,7 +685,6 @@ TEST_F(CastExprTest, realAndDoubleToString) {
           "NaN",
           "NaN",
       });
-#endif
 }
 
 TEST_F(CastExprTest, stringToDouble) {
@@ -720,6 +724,60 @@ TEST_F(CastExprTest, stringToDouble) {
        std::numeric_limits<double>::quiet_NaN(),
        std::numeric_limits<double>::quiet_NaN()});
 
+  // Without trimming control chars, control-char-prefixed strings fail.
+  setCastStringToFloatingPointTrimControlChars(false);
+  testInvalidCast<std::string>(
+      "double",
+      {std::string(
+          "\x03"
+          "4.5",
+          4)},
+      "Unable to convert string to floating point value");
+
+  // With trimming enabled, leading/trailing bytes 0x00-0x20 are stripped.
+  setCastStringToFloatingPointTrimControlChars(true);
+  testCast<std::string, float>(
+      "real",
+      {std::string(
+           "\x03"
+           "4.5",
+           4),
+       std::string("5.5\x05", 4),
+       "6.5"},
+      {4.5f, 5.5f, 6.5f});
+  testCast<std::string, double>(
+      "double",
+      {std::string(
+           "\x01"
+           "1.5",
+           4),
+       std::string("2.5\x1f", 4),
+       std::string("\x0f -3.5 \x1e", 8),
+       std::string(
+           "\x03\0"
+           "4",
+           3),
+       std::string(
+           "\x05\0"
+           "5",
+           3)},
+      {1.5, 2.5, -3.5, 4, 5});
+  // Control chars (including NUL) in the middle are still errors.
+  testInvalidCast<std::string>(
+      "double",
+      {std::string(
+          "1\x0f"
+          "2",
+          3)},
+      "Non-whitespace character found after end of conversion");
+  testInvalidCast<std::string>(
+      "double",
+      {std::string(
+          "1\0"
+          "2",
+          3)},
+      "Non-whitespace character found after end of conversion");
+
   testInvalidCast<std::string>("double", {"f"}, "Empty input string");
   testInvalidCast<std::string>(
       "double",
@@ -748,15 +806,6 @@ TEST_F(CastExprTest, stringToTimestamp) {
       "1970-01-01 00:00:00",
       "2000-01-01 12:21:56",
       "1970-01-01 00:00:00-02:00",
-#ifdef SPARK_COMPATIBLE
-      "1970-01-01 05:30:01",
-      "1970-01-01 05:30",
-      "1970-01-01 05",
-      "1970-01-01",
-      "1970-01",
-      "1970",
-#endif
-      std::nullopt,
   };
   std::vector<std::optional<Timestamp>> expected{
       Timestamp(0, 0),
@@ -764,40 +813,49 @@ TEST_F(CastExprTest, stringToTimestamp) {
       Timestamp(0, 0),
       Timestamp(946729316, 0),
       Timestamp(7200, 0),
-#ifdef SPARK_COMPATIBLE
-      Timestamp(19801, 0),
-      Timestamp(19800, 0),
-      Timestamp(18000, 0),
-      Timestamp(0, 0),
-      Timestamp(0, 0),
-      Timestamp(0, 0),
-#endif
-      std::nullopt,
   };
 
-#ifdef SPARK_COMPATIBLE
-  std::vector<std::optional<std::string>> inputOutOfRange{
-      "1970-01-32 00:00:00",
-      "1970-01-01 00-00-00",
-      "1970-01-01 25:00:00",
-  };
-  std::vector<std::optional<std::string>> inputEmptyString{
-      "",
-  };
-  std::vector<std::optional<Timestamp>> expectedException{
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-  };
-  testInvalidCast<std::string>("timestamp", inputOutOfRange, "");
-  testInvalidCast<std::string>("timestamp", inputEmptyString, "");
-#endif
+  if (::bytedance::bolt::kSparkCompatible) {
+    input.insert(
+        input.end(),
+        {"1970-01-01 05:30:01",
+         "1970-01-01 05:30",
+         "1970-01-01 05",
+         "1970-01-01",
+         "1970-01",
+         "1970"});
+    expected.insert(
+        expected.end(),
+        {Timestamp(19801, 0),
+         Timestamp(19800, 0),
+         Timestamp(18000, 0),
+         Timestamp(0, 0),
+         Timestamp(0, 0),
+         Timestamp(0, 0)});
+  }
+  input.push_back(std::nullopt);
+  expected.push_back(std::nullopt);
+
+  if (::bytedance::bolt::kSparkCompatible) {
+    std::vector<std::optional<std::string>> inputOutOfRange{
+        "1970-01-32 00:00:00",
+        "1970-01-01 00-00-00",
+        "1970-01-01 25:00:00",
+    };
+    std::vector<std::optional<std::string>> inputEmptyString{
+        "",
+    };
+    testInvalidCast<std::string>("timestamp", inputOutOfRange, "");
+    testInvalidCast<std::string>("timestamp", inputEmptyString, "");
+  }
 
   testCast<std::string, Timestamp>("timestamp", input, expected);
 }
 
-#ifndef SPARK_COMPATIBLE
 TEST_F(CastExprTest, timestampToString) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   setLegacyCast(false);
   testCast<Timestamp, std::string>(
       "string",
@@ -852,7 +910,28 @@ TEST_F(CastExprTest, timestampToString) {
           std::nullopt,
       });
 }
-#endif
+
+TEST_F(CastExprTest, timestampToStringFlinkCompatible) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
+  setLegacyCast(false);
+  setFlinkCompatible(true);
+  testCast<Timestamp, std::string>(
+      "string",
+      {
+          Timestamp(946729316, 0),
+          Timestamp(946729316, 123),
+          Timestamp(946729316, 129900000),
+          Timestamp(946729316, 999999999),
+      },
+      {
+          "2000-01-01 12:21:56.000",
+          "2000-01-01 12:21:56.000000123",
+          "2000-01-01 12:21:56.1299",
+          "2000-01-01 12:21:56.999999999",
+      });
+}
 
 TEST_F(CastExprTest, dateToTimestamp) {
   testCast<int32_t, Timestamp>(
@@ -871,6 +950,23 @@ TEST_F(CastExprTest, dateToTimestamp) {
       },
       DATE(),
       TIMESTAMP());
+}
+
+TEST_F(CastExprTest, numericToTimestampSemantics) {
+  queryCtx_->testingOverrideConfigUnsafe({
+      {core::QueryConfig::kThrowExceptionWhenCastIntToTimestamp, "true"},
+  });
+
+  auto input = makeRowVector({makeFlatVector<int32_t>({1})});
+  if (::bytedance::bolt::kSparkCompatible) {
+    auto result =
+        evaluate<SimpleVector<Timestamp>>("cast(c0 as timestamp)", input);
+    EXPECT_EQ(result->valueAt(0), Timestamp(1, 0));
+  } else {
+    BOLT_ASSERT_THROW(
+        evaluate("cast(c0 as timestamp)", input),
+        "unsupported type conversion from INTEGER to TIMESTAMP");
+  }
 }
 
 TEST_F(CastExprTest, timestampToDate) {
@@ -908,8 +1004,10 @@ TEST_F(CastExprTest, timestampToDate) {
       DATE());
 }
 
-#ifndef SPARK_COMPATIBLE
 TEST_F(CastExprTest, timestampInvalid) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   testUnsupportedCast<int8_t>(
       "timestamp", {12}, "Conversion to Timestamp is not supported");
   testUnsupportedCast<int16_t>(
@@ -929,10 +1027,11 @@ TEST_F(CastExprTest, timestampInvalid) {
       {"2012-Oct-01"},
       "Unable to parse timestamp value: \"2012-Oct-01\"");
 }
-#endif
 
-#ifndef SPARK_COMPATIBLE
 TEST_F(CastExprTest, timestampAdjustToTimezone) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   setTimezone("America/Los_Angeles");
 
   // Expect unix epochs to be converted to LA timezone (8h offset).
@@ -956,46 +1055,44 @@ TEST_F(CastExprTest, timestampAdjustToTimezone) {
           std::nullopt,
           Timestamp(957164400, 0),
       });
+
+  // Presto keeps rejecting nonexistent local times.
+  testInvalidCast<std::string>(
+      "timestamp", {"2019-03-10 02:30:00"}, "Cannot cast");
+  testTryCast<std::string, Timestamp>(
+      "timestamp", {"2019-03-10 02:30:00"}, {std::nullopt});
+
+  setTimezone("America/Toronto");
+  testInvalidCast<int32_t>("timestamp", {-18539}, "Cannot cast", DATE());
+  testTryCast<int32_t, Timestamp>(
+      "timestamp", {-18539}, {std::nullopt}, DATE());
 }
-#endif
 
 TEST_F(CastExprTest, date) {
-  testCast<std::string, int32_t>(
-      "date",
-      {"1970-01-01",
-       "2020-01-01",
-       "2135-11-09",
-       "1969-12-27",
-       "1812-04-15",
-       "1920-01-02",
-       "12345-12-18",
-       "1970-1-2",
-       "1970-01-2",
-       "1970-1-02",
-       "+1970-01-02",
-#ifndef SPARK_COMPATIBLE
-       "-1-1-1",
-#endif
-       " 1970-01-01",
-       std::nullopt},
-      {0,
-       18262,
-       60577,
-       -5,
-       -57604,
-       -18262,
-       3789742,
-       1,
-       1,
-       1,
-       1,
-#ifndef SPARK_COMPATIBLE
-       -719893,
-#endif
-       0,
-       std::nullopt},
-      VARCHAR(),
-      DATE());
+  std::vector<std::optional<std::string>> input{
+      "1970-01-01",
+      "2020-01-01",
+      "2135-11-09",
+      "1969-12-27",
+      "1812-04-15",
+      "1920-01-02",
+      "12345-12-18",
+      "1970-1-2",
+      "1970-01-2",
+      "1970-1-02",
+      "+1970-01-02"};
+  std::vector<std::optional<int32_t>> expected{
+      0, 18262, 60577, -5, -57604, -18262, 3789742, 1, 1, 1, 1};
+  if (!::bytedance::bolt::kSparkCompatible) {
+    input.push_back("-1-1-1");
+    expected.push_back(-719893);
+  }
+  input.push_back(" 1970-01-01");
+  input.push_back(std::nullopt);
+  expected.push_back(0);
+  expected.push_back(std::nullopt);
+
+  testCast<std::string, int32_t>("date", input, expected, VARCHAR(), DATE());
 }
 
 TEST_F(CastExprTest, invalidDate) {
@@ -1016,8 +1113,10 @@ TEST_F(CastExprTest, invalidDate) {
   testUnsupportedCast<double>(
       "date", {12.99}, "Cast from DOUBLE to DATE is not supported", DOUBLE());
 
-// Parsing ill-formated dates.
-#ifndef SPARK_COMPATIBLE
+  // Parsing ill-formatted dates.
+  if (::bytedance::bolt::kSparkCompatible) {
+    return;
+  }
   testInvalidCast<std::string>(
       "date",
       {"2012-Oct-23"},
@@ -1085,11 +1184,12 @@ TEST_F(CastExprTest, invalidDate) {
       {" 1970-01-01 "},
       "Unable to parse date value: \" 1970-01-01 \"",
       VARCHAR());
-#endif
 }
 
-#ifndef SPARK_COMPATIBLE
 TEST_F(CastExprTest, primitiveInvalidCornerCases) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   // To integer.
   {
     // Overflow.
@@ -1190,18 +1290,65 @@ TEST_F(CastExprTest, primitiveInvalidCornerCases) {
         "Non-whitespace character found after end of conversion");
   }
 }
-#endif
+
+TEST_F(CastExprTest, floatingPointToIntegralBoundaries) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
+
+  const auto testBoundaries = [&]() {
+    testCast<float, int32_t>(
+        "integer",
+        {0x1.fffffep30f, -0x1p31f},
+        {2'147'483'520, std::numeric_limits<int32_t>::min()});
+    testTryCast<float, int32_t>(
+        "integer",
+        {0x1.fffffep30f, 0x1p31f, -0x1p31f, -0x1.000002p31f},
+        {2'147'483'520,
+         std::nullopt,
+         std::numeric_limits<int32_t>::min(),
+         std::nullopt});
+    testInvalidCast<float>("integer", {0x1p31f}, "Cannot cast");
+
+    testCast<double, int64_t>(
+        "bigint",
+        {0x1.fffffffffffffp62, -0x1p63},
+        {9'223'372'036'854'774'784LL, std::numeric_limits<int64_t>::min()});
+    testTryCast<double, int64_t>(
+        "bigint",
+        {0x1.fffffffffffffp62, 0x1p63, -0x1p63, -0x1.0000000000001p63},
+        {9'223'372'036'854'774'784LL,
+         std::nullopt,
+         std::numeric_limits<int64_t>::min(),
+         std::nullopt});
+    testInvalidCast<double>("bigint", {0x1p63}, "Cannot cast");
+
+    testTryCast<float, int64_t>(
+        "bigint",
+        {0x1.fffffep62f, 0x1p63f, -0x1p63f, -0x1.000002p63f},
+        {9'223'371'487'098'961'920LL,
+         std::nullopt,
+         std::numeric_limits<int64_t>::min(),
+         std::nullopt});
+    testInvalidCast<float>("bigint", {0x1p63f}, "Cannot cast");
+  };
+
+  setCastIntByTruncate(false);
+  testBoundaries();
+
+  setCastIntByTruncate(true);
+  testBoundaries();
+}
 
 TEST_F(CastExprTest, primitiveValidCornerCases) {
   // To integer.
   {
     testCast<double, int8_t>("tinyint", {127.1}, {127});
     testCast<double, int64_t>("bigint", {12345.12}, {12345});
-#ifndef SPARK_COMPATIBLE
-    testCast<double, int64_t>("bigint", {12345.67}, {12346});
-#else
-    testCast<double, int64_t>("bigint", {12345.67}, {12345});
-#endif
+    testCast<double, int64_t>(
+        "bigint",
+        {12345.67},
+        {::bytedance::bolt::kSparkCompatible ? 12345 : 12346});
     testCast<std::string, int8_t>("tinyint", {"+1"}, {1});
   }
 
@@ -1249,22 +1396,20 @@ TEST_F(CastExprTest, primitiveValidCornerCases) {
 }
 
 TEST_F(CastExprTest, truncateVsRound) {
-// Testing round cast from double to int.
-#ifndef SPARK_COMPATIBLE
+  // Testing round cast from double to int.
+  const auto expectedIntegers = ::bytedance::bolt::kSparkCompatible
+      ? std::vector<std::optional<int>>{1, 2, 3, 100, -100}
+      : std::vector<std::optional<int>>{2, 3, 4, 100, -100};
   testCast<double, int>(
-      "int", {1.888, 2.5, 3.6, 100.44, -100.101}, {2, 3, 4, 100, -100});
-#else
-  testCast<double, int>(
-      "int", {1.888, 2.5, 3.6, 100.44, -100.101}, {1, 2, 3, 100, -100});
-#endif
+      "int", {1.888, 2.5, 3.6, 100.44, -100.101}, expectedIntegers);
   testCast<int8_t, int32_t>("int", {111, 2, 3, 10, -10}, {111, 2, 3, 10, -10});
   testCast<int32_t, int8_t>("tinyint", {2, 3}, {2, 3});
-#ifndef SPARK_COMPATIBLE
-  testInvalidCast<int32_t>(
-      "tinyint",
-      {1111111, 1000, -100101},
-      "Cannot cast INTEGER '1111111' to TINYINT. Overflow during arithmetic conversion: (signed char) 1111111");
-#endif
+  if (!::bytedance::bolt::kSparkCompatible) {
+    testInvalidCast<int32_t>(
+        "tinyint",
+        {1111111, 1000, -100101},
+        "Cannot cast INTEGER '1111111' to TINYINT. Overflow during arithmetic conversion: (signed char) 1111111");
+  }
 }
 
 TEST_F(CastExprTest, nullInputs) {
@@ -1328,53 +1473,53 @@ TEST_F(CastExprTest, errorHandling) {
        127,
        -128});
 
-#ifdef SPARK_COMPATIBLE
-  testCast<double, int>(
-      "integer",
-      {1e12, 2.5, 3.6, 100.44, -100.101},
-      {std::numeric_limits<int>::max(), 2, 3, 100, -100});
-  testTryCast<double, int>(
-      "integer",
-      {1e12, 2.5, 3.6, 100.44, -100.101},
-      {std::nullopt, 2, 3, 100, -100});
-#else
-  ASSERT_THROW(
-      (testCast<double, int>(
-          "integer",
-          {1e12, 2.5, 3.6, 100.44, -100.101},
-          {std::nullopt, 2, 3, 100, -100})),
-      BoltException);
-  testTryCast<double, int>(
-      "integer",
-      {1e12, 2.5, 3.6, 100.44, -100.101},
-      {std::nullopt, 2, 3, 100, -100});
-#endif
+  if (::bytedance::bolt::kSparkCompatible) {
+    testCast<double, int>(
+        "integer",
+        {1e12, 2.5, 3.6, 100.44, -100.101},
+        {std::numeric_limits<int>::max(), 2, 3, 100, -100});
+    testTryCast<double, int>(
+        "integer",
+        {1e12, 2.5, 3.6, 100.44, -100.101},
+        {std::nullopt, 2, 3, 100, -100});
+  } else {
+    ASSERT_THROW(
+        (testCast<double, int>(
+            "integer",
+            {1e12, 2.5, 3.6, 100.44, -100.101},
+            {std::nullopt, 2, 3, 100, -100})),
+        BoltException);
+    testTryCast<double, int>(
+        "integer",
+        {1e12, 2.5, 3.6, 100.44, -100.101},
+        {std::nullopt, 2, 3, 100, -100});
+  }
 
-#ifndef SPARK_COMPATIBLE
-  setCastIntByTruncate(false);
-  testCast<double, int>(
-      "int", {1.888, 2.5, 3.6, 100.44, -100.101}, {2, 3, 4, 100, -100});
+  if (!::bytedance::bolt::kSparkCompatible) {
+    setCastIntByTruncate(false);
+    testCast<double, int>(
+        "int", {1.888, 2.5, 3.6, 100.44, -100.101}, {2, 3, 4, 100, -100});
 
-  testInvalidCast<std::string>(
-      "tinyint",
-      {"1abc", "2", "3", "100", "-100"},
-      "Non-whitespace character found after end of conversion");
+    testInvalidCast<std::string>(
+        "tinyint",
+        {"1abc", "2", "3", "100", "-100"},
+        "Non-whitespace character found after end of conversion");
 
-  testInvalidCast<std::string>(
-      "tinyint",
-      {"1", "2", "3", "100", "-100.5"},
-      "Non-whitespace character found after end of conversion");
-#endif
+    testInvalidCast<std::string>(
+        "tinyint",
+        {"1", "2", "3", "100", "-100.5"},
+        "Non-whitespace character found after end of conversion");
+  }
 }
 
 TEST_F(CastExprTest, allowDecimal) {
   setCastIntByTruncate(true);
-#ifdef SPARK_COMPATIBLE
-  testCast<std::string, int32_t>(
-      "int",
-      {"-.", "0.0", "125.5", "-128.3", "3.61335e+9"},
-      {0, 0, 125, -128, std::nullopt});
-#endif
+  if (::bytedance::bolt::kSparkCompatible) {
+    testCast<std::string, int32_t>(
+        "int",
+        {"-.", "0.0", "125.5", "-128.3", "3.61335e+9"},
+        {0, 0, 125, -128, std::nullopt});
+  }
 
   testTryCast<std::string, int32_t>(
       "int",
@@ -1457,32 +1602,32 @@ TEST_F(CastExprTest, mapCast) {
 
   // Nulls in result keys are not allowed.
   {
-#ifndef SPARK_COMPATIBLE
-    BOLT_ASSERT_THROW(
-        testCast(
-            inputMap,
-            makeMapVector<Timestamp, int64_t>(
-                kVectorSize,
-                sizeAt,
-                [](auto /*row*/) { return Timestamp(); },
-                valueAt,
-                nullEvery(3),
-                nullEvery(7)),
-            false),
-        "");
+    if (!::bytedance::bolt::kSparkCompatible) {
+      BOLT_ASSERT_THROW(
+          testCast(
+              inputMap,
+              makeMapVector<Timestamp, int64_t>(
+                  kVectorSize,
+                  sizeAt,
+                  [](auto /*row*/) { return Timestamp(); },
+                  valueAt,
+                  nullEvery(3),
+                  nullEvery(7)),
+              false),
+          "");
 
-    BOLT_ASSERT_THROW(
-        testCast(
-            inputMap,
-            makeMapVector<Timestamp, int64_t>(
-                kVectorSize,
-                sizeAt,
-                [](auto /*row*/) { return Timestamp(); },
-                valueAt,
-                [](auto row) { return row % 3 == 0 || row % 5 != 0; }),
-            true),
-        "");
-#endif
+      BOLT_ASSERT_THROW(
+          testCast(
+              inputMap,
+              makeMapVector<Timestamp, int64_t>(
+                  kVectorSize,
+                  sizeAt,
+                  [](auto /*row*/) { return Timestamp(); },
+                  valueAt,
+                  [](auto row) { return row % 3 == 0 || row % 5 != 0; }),
+              true),
+          "");
+    }
   }
 
   // Make sure that the output of map cast has valid(copyable) data even for
@@ -1523,7 +1668,9 @@ TEST_F(CastExprTest, mapCast) {
     }
   }
 
-#ifndef SPARK_COMPATIBLE
+  if (::bytedance::bolt::kSparkCompatible) {
+    return;
+  }
   // Error handling.
   {
     auto data = makeRowVector(
@@ -1550,7 +1697,6 @@ TEST_F(CastExprTest, mapCast) {
     ASSERT_TRUE(result->isNullAt(0));
     ASSERT_TRUE(result->isNullAt(1));
   }
-#endif
 }
 
 TEST_F(CastExprTest, arrayCast) {
@@ -1612,7 +1758,9 @@ TEST_F(CastExprTest, arrayCast) {
     }
   }
 
-#ifndef SPARK_COMPATIBLE
+  if (::bytedance::bolt::kSparkCompatible) {
+    return;
+  }
   // Error handling.
   {
     auto data =
@@ -1644,7 +1792,6 @@ TEST_F(CastExprTest, arrayCast) {
     });
     testCast(data, expected, true);
   }
-#endif
 }
 
 TEST_F(CastExprTest, rowCast) {
@@ -1696,7 +1843,9 @@ TEST_F(CastExprTest, rowCast) {
     testCast(rowVector, expectedRowVector);
   }
 
-#ifndef SPARK_COMPATIBLE
+  if (::bytedance::bolt::kSparkCompatible) {
+    return;
+  }
   // Error handling.
   {
     auto data = makeRowVector(
@@ -1748,7 +1897,6 @@ TEST_F(CastExprTest, rowCast) {
     expected->setNull(1, true);
     testCast(data, expected, true);
   }
-#endif
 }
 
 TEST_F(CastExprTest, nulls) {
@@ -1777,12 +1925,12 @@ TEST_F(CastExprTest, testNullOnFailure) {
   // nullOnFailure is true, so we should return null instead of throwing.
   testCast(input, tryExpected, true);
 
-#ifdef SPARK_COMPATIBLE
-  testCast(input, expected, false);
-#else
-  // nullOnFailure is false, so we should throw.
-  EXPECT_THROW(testCast(input, expected, false), BoltUserError);
-#endif
+  if (::bytedance::bolt::kSparkCompatible) {
+    testCast(input, expected, false);
+  } else {
+    // nullOnFailure is false, so we should throw.
+    EXPECT_THROW(testCast(input, expected, false), BoltUserError);
+  }
 }
 
 TEST_F(CastExprTest, toString) {
@@ -1796,8 +1944,10 @@ TEST_F(CastExprTest, toString) {
 }
 
 // this test case also run in SparkCastExprTest
-#ifndef SPARK_COMPATIBLE
 TEST_F(CastExprTest, decimalToIntegral) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   testDecimalToIntegralCasts<int64_t>();
   testDecimalToIntegralCasts<int32_t>();
   testDecimalToIntegralCasts<int16_t>();
@@ -1805,17 +1955,22 @@ TEST_F(CastExprTest, decimalToIntegral) {
 }
 
 TEST_F(CastExprTest, decimalToIntegralOutOfBounds) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   testDecimalToIntegralCastsOutOfBounds<TypeKind::INTEGER>();
   testDecimalToIntegralCastsOutOfBounds<TypeKind::SMALLINT>();
   testDecimalToIntegralCastsOutOfBounds<TypeKind::TINYINT>();
 }
 
 TEST_F(CastExprTest, decimalToIntegralOutOfBoundsSetNullOnFailure) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   testDecimalToIntegralCastsOutOfBoundsSetNullOnFailure<TypeKind::INTEGER>();
   testDecimalToIntegralCastsOutOfBoundsSetNullOnFailure<TypeKind::SMALLINT>();
   testDecimalToIntegralCastsOutOfBoundsSetNullOnFailure<TypeKind::TINYINT>();
 }
-#endif
 
 TEST_F(CastExprTest, decimalToFloat) {
   testDecimalToFloatCasts<float>();
@@ -1823,9 +1978,10 @@ TEST_F(CastExprTest, decimalToFloat) {
 }
 
 TEST_F(CastExprTest, decimalToFloatDiff) {
-#ifdef SPARK_COMPATIBLE
+  if (!::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   testDecimalToFloatCastsDiff<float>();
-#endif
 }
 
 TEST_F(CastExprTest, decimalToBool) {
@@ -1862,41 +2018,34 @@ TEST_F(CastExprTest, decimalToVarchar) {
        DecimalUtil::kShortDecimalMax,
        std::nullopt},
       DECIMAL(18, 18));
-  testCast(
-      shortFlat,
-      makeNullableFlatVector<StringView>(
-          {"-0.999999999999999999",
-#ifdef SPARK_COMPATIBLE
-           "-3E-18",
-           "0E-18",
-           "5.5E-17",
-#else
-           "-0.000000000000000003",
-           "0.000000000000000000",
-           "0.000000000000000055",
-#endif
-           "0.999999999999999999",
-           std::nullopt}));
+  const auto expectedShortFlat = makeNullableFlatVector<StringView>(
+      {"-0.999999999999999999",
+       ::bytedance::bolt::kSparkCompatible ? "-3E-18" : "-0.000000000000000003",
+       ::bytedance::bolt::kSparkCompatible ? "0E-18" : "0.000000000000000000",
+       ::bytedance::bolt::kSparkCompatible ? "5.5E-17" : "0.000000000000000055",
+       "0.999999999999999999",
+       std::nullopt});
+  testCast(shortFlat, expectedShortFlat);
 
-#ifdef SPARK_COMPATIBLE
-  auto shortFlatForScientific = makeNullableFlatVector<int64_t>(
-      {DecimalUtil::kShortDecimalMin,
-       -3,
-       0,
-       55,
-       DecimalUtil::kShortDecimalMax,
-       std::nullopt},
-      DECIMAL(18, 10));
-  testCast(
-      shortFlatForScientific,
-      makeNullableFlatVector<StringView>(
-          {"-99999999.9999999999",
-           "-3E-10",
-           "0E-10",
-           "5.5E-9",
-           "99999999.9999999999",
-           std::nullopt}));
-#endif
+  if (::bytedance::bolt::kSparkCompatible) {
+    auto shortFlatForScientific = makeNullableFlatVector<int64_t>(
+        {DecimalUtil::kShortDecimalMin,
+         -3,
+         0,
+         55,
+         DecimalUtil::kShortDecimalMax,
+         std::nullopt},
+        DECIMAL(18, 10));
+    testCast(
+        shortFlatForScientific,
+        makeNullableFlatVector<StringView>(
+            {"-99999999.9999999999",
+             "-3E-10",
+             "0E-10",
+             "5.5E-9",
+             "99999999.9999999999",
+             std::nullopt}));
+  }
 
   auto longFlat = makeNullableFlatVector<int128_t>(
       {DecimalUtil::kLongDecimalMin,
@@ -1915,25 +2064,25 @@ TEST_F(CastExprTest, decimalToVarchar) {
            "-0.00001",
            "12089258196146291747.06175",
            std::nullopt}));
-#ifdef SPARK_COMPATIBLE
-  auto longFlatForScientific = makeNullableFlatVector<int128_t>(
-      {DecimalUtil::kLongDecimalMin,
-       0,
-       DecimalUtil::kLongDecimalMax,
-       HugeInt::build(0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull),
-       HugeInt::build(0xffff, 0xffffffffffffffff),
-       std::nullopt},
-      DECIMAL(38, 10));
-  testCast(
-      longFlatForScientific,
-      makeNullableFlatVector<StringView>(
-          {"-9999999999999999999999999999.9999999999",
-           "0E-10",
-           "9999999999999999999999999999.9999999999",
-           "-1E-10",
-           "120892581961462.9174706175",
-           std::nullopt}));
-#endif
+  if (::bytedance::bolt::kSparkCompatible) {
+    auto longFlatForScientific = makeNullableFlatVector<int128_t>(
+        {DecimalUtil::kLongDecimalMin,
+         0,
+         DecimalUtil::kLongDecimalMax,
+         HugeInt::build(0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull),
+         HugeInt::build(0xffff, 0xffffffffffffffff),
+         std::nullopt},
+        DECIMAL(38, 10));
+    testCast(
+        longFlatForScientific,
+        makeNullableFlatVector<StringView>(
+            {"-9999999999999999999999999999.9999999999",
+             "0E-10",
+             "9999999999999999999999999999.9999999999",
+             "-1E-10",
+             "120892581961462.9174706175",
+             std::nullopt}));
+  }
 
   auto longFlatForZero = makeNullableFlatVector<int128_t>({0}, DECIMAL(25, 0));
   testCast(longFlatForZero, makeNullableFlatVector<StringView>({"0"}));
@@ -2040,6 +2189,20 @@ TEST_F(CastExprTest, decimalToDecimal) {
           {DecimalUtil::kLongDecimalMin}, DECIMAL(38, 0)),
       makeNullableFlatVector<int128_t>({std::nullopt}, DECIMAL(38, 1)),
       "Cannot cast DECIMAL '-99999999999999999999999999999999999999' to DECIMAL(38, 1)");
+}
+
+TEST_F(CastExprTest, integerToBinary) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
+  testInvalidCast<int8_t>(
+      "varbinary", {12}, "Cannot cast TINYINT to VARBINARY.");
+  testInvalidCast<int16_t>(
+      "varbinary", {12}, "Cannot cast SMALLINT to VARBINARY.");
+  testInvalidCast<int32_t>(
+      "varbinary", {12}, "Cannot cast INTEGER to VARBINARY.");
+  testInvalidCast<int64_t>(
+      "varbinary", {12}, "Cannot cast BIGINT to VARBINARY.");
 }
 
 TEST_F(CastExprTest, integerToDecimal) {
@@ -2200,7 +2363,9 @@ TEST_F(CastExprTest, varcharToDecimal) {
           {StringView(fractionRoundDown), StringView(fractionRoundDownExp)}),
       makeConstant<int128_t>(DecimalUtil::kLongDecimalMax, 2, DECIMAL(38, 38)));
 
-#ifndef SPARK_COMPATIBLE
+  if (::bytedance::bolt::kSparkCompatible) {
+    return;
+  }
   // Overflows when parsing whole digits.
   testThrow<std::string>(
       VARCHAR(),
@@ -2317,23 +2482,24 @@ TEST_F(CastExprTest, varcharToDecimal) {
       DECIMAL(12, 2),
       {"-3E-"},
       "Cannot cast VARCHAR '-3E-' to DECIMAL(12, 2). Value is not a number. The exponent part only contains sign.");
-#endif
 }
 
 TEST_F(CastExprTest, castArrayError) {
-#ifdef SPARK_COMPATIBLE
+  if (!::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   auto arrayVector = makeNullableArrayVector<StringView>(
       {{{"1"_sv, ""_sv, "3"_sv, "4"_sv}},
-       // {{"5a"_sv}},  // it is ok, but it is disabled due to the UT framework
-       // issue
-       {{}},
+       // {{"5a"_sv}},  // it is ok, but it is disabled due to the UT
+       // framework issue
+       emptyArray,
        {{"6"_sv, "7"_sv}},
        std::nullopt});
   auto input = makeRowVector({arrayVector});
   auto expected = makeNullableArrayVector<int64_t>(
       {{{1, std::nullopt, 3, 4}},
        // {{std::nullopt}},  UT framework issue.
-       {{}},
+       emptyArray,
        {{6, 7}},
        std::nullopt});
 
@@ -2344,18 +2510,19 @@ TEST_F(CastExprTest, castArrayError) {
 
   //   for (auto i = 0; i < arrayVector->size(); i++) {
   //     std::cout << "Input:\t" << input->toString(i) << std::endl;
-  //     std::cout << "Result:\t" << result->toString(arrayVector->size() - 1 -
-  //     i)
+  //     std::cout << "Result:\t" << result->toString(arrayVector->size() - 1
+  //     - i)
   //               << std::endl;
   //     std::cout << "Expected:\t" << expected->toString(i) << std::endl;
   //   }
   auto indices = test::makeIndicesInReverse(expected->size(), pool());
   assertEqualVectors(wrapInDictionary(indices, expected), result);
-#endif
 }
 
 TEST_F(CastExprTest, castMapError) {
-#ifdef SPARK_COMPATIBLE
+  if (!::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   auto mapVector = makeNullableMapVector<int32_t, StringView>({
       std::nullopt,
       {{{1, std::nullopt}}},
@@ -2394,11 +2561,12 @@ TEST_F(CastExprTest, castMapError) {
 
   auto indices = test::makeIndicesInReverse(expected->size(), pool());
   assertEqualVectors(wrapInDictionary(indices, expected), result);
-#endif
 }
 
 TEST_F(CastExprTest, castStructOnError) {
-#ifdef SPARK_COMPATIBLE
+  if (!::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   auto rowVector = makeRowVector(
       {makeNullableFlatVector<StringView>(
            {"1.23", std::nullopt, "", "abc"}, VARCHAR()),
@@ -2426,13 +2594,14 @@ TEST_F(CastExprTest, castStructOnError) {
   auto result = evaluate(castExpr, input);
   auto indices = test::makeIndicesInReverse(expected->size(), pool());
   assertEqualVectors(wrapInDictionary(indices, expected), result);
-#endif
 }
 
-#ifndef SPARK_COMPATIBLE
 TEST_F(CastExprTest, castInTry) {
+  if (::bytedance::bolt::kSparkCompatible) {
+    GTEST_SKIP();
+  }
   // Test try(cast(array(varchar) as array(bigint))) whose input vector is
-  // wrapped in dictinary encoding. The row of ["2a"] should trigger an error
+  // wrapped in dictionary encoding. The row of ["2a"] should trigger an error
   // during casting and the try expression should turn this error into a null
   // at this row.
   auto input = makeRowVector({makeNullableArrayVector<StringView>(
@@ -2477,7 +2646,6 @@ TEST_F(CastExprTest, castInTry) {
   evaluateAndVerifyCastInTryDictEncoding(
       ARRAY(ARRAY(VARCHAR())), ARRAY(ARRAY(BIGINT())), nested, nestedExpected);
 }
-#endif
 
 TEST_F(CastExprTest, doubleToDecimal) {
   // Double to short decimal.
@@ -2742,7 +2910,7 @@ TEST_F(CastExprTest, complexTypeToString) {
   // basic array / map / struct
   {
     auto arrayVector = makeNullableArrayVector<int>(
-        {{{0, 1}}, {{}}, {{2, std::nullopt, 3}}, std::nullopt});
+        {{{0, 1}}, emptyArray, {{2, std::nullopt, 3}}, std::nullopt});
     testCast(
         arrayVector,
         makeNullableFlatVector<StringView>(
@@ -2751,7 +2919,7 @@ TEST_F(CastExprTest, complexTypeToString) {
     auto mapVector = makeNullableMapVector<int32_t, double>(
         {{{{1, 1.25}, {3, std::nullopt}, {2, 4.5}}},
          std::nullopt,
-         {{}},
+         emptyArray,
          {{{5, 13.25}, {6, 1e7}}}},
         MAP(INTEGER(), DOUBLE()));
     testCast(
@@ -2774,102 +2942,97 @@ TEST_F(CastExprTest, complexTypeToString) {
             {123456789, -333333333, std::nullopt, 0}, DECIMAL(9, 2)),
     });
 
-#ifndef SPARK_COMPATIBLE
     testCast(
         rowVector,
         makeFlatVector<StringView>(
-            {"{null, 2000-01-01 00:00:00.000, 1234567.89}",
+            {::bytedance::bolt::kSparkCompatible
+                 ? "{null, 2000-01-01 00:00:00, 1234567.89}"
+                 : "{null, 2000-01-01 00:00:00.000, 1234567.89}",
              "{first time, null, -3333333.33}",
-             "{1.1380000, 2269-12-29 00:00:00.000, null}",
-             "{last time, 4969-12-04 00:00:00.000, 0.00}"}));
-#else
-
-    testCast(
-        rowVector,
-        makeFlatVector<StringView>(
-            {"{null, 2000-01-01 00:00:00, 1234567.89}",
-             "{first time, null, -3333333.33}",
-             "{1.1380000, 2269-12-29 00:00:00, null}",
-             "{last time, 4969-12-04 00:00:00, 0.00}"}));
-#endif
+             ::bytedance::bolt::kSparkCompatible
+                 ? "{1.1380000, 2269-12-29 00:00:00, null}"
+                 : "{1.1380000, 2269-12-29 00:00:00.000, null}",
+             ::bytedance::bolt::kSparkCompatible
+                 ? "{last time, 4969-12-04 00:00:00, 0.00}"
+                 : "{last time, 4969-12-04 00:00:00.000, 0.00}"}));
   }
 
-#ifdef SPARK_COMPATIBLE
-  // legacy map / struct
-  {
-    setLegacyCastComplexTypeToString(true);
+  if (::bytedance::bolt::kSparkCompatible) {
+    // legacy map / struct
+    {
+      setLegacyCastComplexTypeToString(true);
 
-    auto mapVector = makeNullableMapVector<int32_t, double>(
-        {{{{1, 1.25}, {2, std::nullopt}, {3, 4.5}}},
-         std::nullopt,
-         {{}},
-         {{{5, 13.25}, {6, 1e7}}}},
-        MAP(INTEGER(), DOUBLE()));
-    testCast(
-        mapVector,
-        makeNullableFlatVector<StringView>(
-            {"[1 -> 1.25, 2 ->, 3 -> 4.5]",
-             std::nullopt,
-             "[]",
-             "[5 -> 13.25, 6 -> 1.0E7]"}));
+      auto mapVector = makeNullableMapVector<int32_t, double>(
+          {{{{1, 1.25}, {2, std::nullopt}, {3, 4.5}}},
+           std::nullopt,
+           emptyArray,
+           {{{5, 13.25}, {6, 1e7}}}},
+          MAP(INTEGER(), DOUBLE()));
+      testCast(
+          mapVector,
+          makeNullableFlatVector<StringView>(
+              {"[1 -> 1.25, 2 ->, 3 -> 4.5]",
+               std::nullopt,
+               "[]",
+               "[5 -> 13.25, 6 -> 1.0E7]"}));
 
-    auto rowVector = makeRowVector({
-        makeNullableFlatVector<StringView>(
-            {std::nullopt, "first time", "1.1380000", "last time"}),
-        makeNullableFlatVector<Timestamp>(
-            {Timestamp(946684800, 0),
-             std::nullopt,
-             Timestamp(9466848000, 0),
-             Timestamp(94668480000, 0)}),
-        makeNullableFlatVector<int64_t>(
-            {123456789, -333333333, std::nullopt, 0}, DECIMAL(9, 2)),
-    });
+      auto rowVector = makeRowVector({
+          makeNullableFlatVector<StringView>(
+              {std::nullopt, "first time", "1.1380000", "last time"}),
+          makeNullableFlatVector<Timestamp>(
+              {Timestamp(946684800, 0),
+               std::nullopt,
+               Timestamp(9466848000, 0),
+               Timestamp(94668480000, 0)}),
+          makeNullableFlatVector<int64_t>(
+              {123456789, -333333333, std::nullopt, 0}, DECIMAL(9, 2)),
+      });
 
-    testCast(
-        rowVector,
-        makeFlatVector<StringView>(
-            {"[, 2000-01-01 00:00:00, 1234567.89]",
-             "[first time,, -3333333.33]",
-             "[1.1380000, 2269-12-29 00:00:00,]",
-             "[last time, 4969-12-04 00:00:00, 0.00]"}));
+      testCast(
+          rowVector,
+          makeFlatVector<StringView>(
+              {"[, 2000-01-01 00:00:00, 1234567.89]",
+               "[first time,, -3333333.33]",
+               "[1.1380000, 2269-12-29 00:00:00,]",
+               "[last time, 4969-12-04 00:00:00, 0.00]"}));
+    }
+    {
+      setLegacyCastComplexTypeToString(false);
+      auto mapVector = makeNullableMapVector<int32_t, double>(
+          {{{{1, 1.25}, {2, std::nullopt}, {3, 4.5}}},
+           std::nullopt,
+           emptyArray,
+           {{{5, 13.25}, {6, 1e7}}}},
+          MAP(INTEGER(), DOUBLE()));
+      testCast(
+          mapVector,
+          makeNullableFlatVector<StringView>(
+              {"{1 -> 1.25, 2 -> null, 3 -> 4.5}",
+               std::nullopt,
+               "{}",
+               "{5 -> 13.25, 6 -> 1.0E7}"}));
+
+      auto rowVector = makeRowVector({
+          makeNullableFlatVector<StringView>(
+              {std::nullopt, "first time", "1.1380000", "last time"}),
+          makeNullableFlatVector<Timestamp>(
+              {Timestamp(946684800, 0),
+               std::nullopt,
+               Timestamp(9466848000, 0),
+               Timestamp(94668480000, 0)}),
+          makeNullableFlatVector<int64_t>(
+              {123456789, -333333333, std::nullopt, 0}, DECIMAL(9, 2)),
+      });
+
+      testCast(
+          rowVector,
+          makeFlatVector<StringView>(
+              {"{null, 2000-01-01 00:00:00, 1234567.89}",
+               "{first time, null, -3333333.33}",
+               "{1.1380000, 2269-12-29 00:00:00, null}",
+               "{last time, 4969-12-04 00:00:00, 0.00}"}));
+    }
   }
-  {
-    setLegacyCastComplexTypeToString(false);
-    auto mapVector = makeNullableMapVector<int32_t, double>(
-        {{{{1, 1.25}, {2, std::nullopt}, {3, 4.5}}},
-         std::nullopt,
-         {{}},
-         {{{5, 13.25}, {6, 1e7}}}},
-        MAP(INTEGER(), DOUBLE()));
-    testCast(
-        mapVector,
-        makeNullableFlatVector<StringView>(
-            {"{1 -> 1.25, 2 -> null, 3 -> 4.5}",
-             std::nullopt,
-             "{}",
-             "{5 -> 13.25, 6 -> 1.0E7}"}));
-
-    auto rowVector = makeRowVector({
-        makeNullableFlatVector<StringView>(
-            {std::nullopt, "first time", "1.1380000", "last time"}),
-        makeNullableFlatVector<Timestamp>(
-            {Timestamp(946684800, 0),
-             std::nullopt,
-             Timestamp(9466848000, 0),
-             Timestamp(94668480000, 0)}),
-        makeNullableFlatVector<int64_t>(
-            {123456789, -333333333, std::nullopt, 0}, DECIMAL(9, 2)),
-    });
-
-    testCast(
-        rowVector,
-        makeFlatVector<StringView>(
-            {"{null, 2000-01-01 00:00:00, 1234567.89}",
-             "{first time, null, -3333333.33}",
-             "{1.1380000, 2269-12-29 00:00:00, null}",
-             "{last time, 4969-12-04 00:00:00, 0.00}"}));
-  }
-#endif
 
   // nested complex type, like map(map)
   {
@@ -2916,7 +3079,7 @@ TEST_F(CastExprTest, complexTypeToString) {
     // array(array(bigint))
     using array_type = std::optional<std::vector<std::optional<int64_t>>>;
     array_type array1 = {{1, 2}};
-    array_type array2 = {{}};
+    array_type array2 = emptyArray;
     array_type array3 = {{1, 100, 2}};
 
     auto nestedArray =
@@ -2929,17 +3092,15 @@ TEST_F(CastExprTest, complexTypeToString) {
         {std::nullopt, std::nullopt, std::nullopt, std::nullopt},
         2,
         ARRAY(UNKNOWN()));
-    BOLT_ASSERT_THROW(
-        testCast(
-            unknownArray,
-            makeFlatVector<StringView>({"[null, null]", "[null, null]"})),
-        "");
+    testCast(
+        unknownArray,
+        makeFlatVector<StringView>({"[null, null]", "[null, null]"}));
 
     // map(bigint, array(bigint))
     auto mapOfArray = createMapOfArraysVector<int64_t, int64_t>(
         {{{1, {{2}}}, {2, std::nullopt}},
          {{3, {{4, std::nullopt, 6}}}},
-         {{7, {{8, 9, 10}}}, {11, {{}}}}});
+         {{7, {{8, 9, 10}}}, {11, emptyArray}}});
     testCast(
         mapOfArray,
         makeFlatVector<StringView>(
@@ -2994,14 +3155,11 @@ TEST_F(CastExprTest, complexTypeToString) {
          })});
     testCast(
         rowNested,
-        makeFlatVector<StringView>({
-#ifndef SPARK_COMPATIBLE
-            "{{1 -> 10, 2 -> 20}, [0, 1], {2000-01-01 00:00:00.000, 1234567.89}}",
-#else
-            "{{1 -> 10, 2 -> 20}, [0, 1], {2000-01-01 00:00:00, 1234567.89}}",
-#endif
-            "{{3 -> 30, 4 -> 40}, [null, 3], {null, -3333333.33}}",
-        }));
+        makeFlatVector<StringView>(
+            {::bytedance::bolt::kSparkCompatible
+                 ? "{{1 -> 10, 2 -> 20}, [0, 1], {2000-01-01 00:00:00, 1234567.89}}"
+                 : "{{1 -> 10, 2 -> 20}, [0, 1], {2000-01-01 00:00:00.000, 1234567.89}}",
+             "{{3 -> 30, 4 -> 40}, [null, 3], {null, -3333333.33}}"}));
 
     auto rowOfUnknownChildren = makeRowVector({
         makeFlatUnknownVector(2),
@@ -3135,21 +3293,22 @@ TEST_F(CastExprTest, complexTypeToString) {
          mapOfMap,
          mapOfRow,
          rowNested});
-    testCast(
-        finalRowVector,
-#ifndef SPARK_COMPATIBLE
-        makeFlatVector<StringView>(
+    const auto expected = [&]() {
+      if (!::bytedance::bolt::kSparkCompatible) {
+        return makeFlatVector<StringView>(
             {"{[null, [1, 100, 2]], [], [], {3 -> [4, 5, 6, 1, 2]}, {1 -> {2 -> 3, 4 -> 5}}, {1 -> {2, 3}, 3 -> {4, 5}}, {{1 -> 10, 2 -> 20}, [0, 1], {2000-01-01 00:00:00.000, 1234567.89}}}",
              "{[[1, 100, 2], [315]], [{1 -> 11, 3 -> 10}, {0 -> 10, 2 -> 11}, {1 -> 11, 1 -> 10}], [null, null], {5 -> [4, null, 1, 2]}, {0 -> {2 -> 3, 4 -> 5}}, {0 -> {2, 3}, 3 -> {null, null}}, {{3 -> 30, 4 -> 40, 9 -> 90}, [2, 3, 4], {null, -3333333.33}}}",
              "{[[1, 100, null]], [{0 -> null}, {0 -> 10}], [{2, red}, null, {1, blue}], {}, {1 -> {2 -> 3, 4 -> null}}, {1 -> {2, null}, 3 -> {null, 5}}, {{5 -> null, 6 -> 60}, [6, null, 7], {2269-12-29 00:00:00.000, null}}}",
-             "{[[315]], [{}, {2 -> 10}], [{1, green}, {null, red}], {7 -> null}, {6 -> null}, {6 -> {7, 8}}, {{7 -> null}, [null, null], {4969-12-04 00:00:00.000, 0.00}}}"}));
-#else
-        makeFlatVector<StringView>(
+             "{[[315]], [{}, {2 -> 10}], [{1, green}, {null, red}], {7 -> null}, {6 -> null}, {6 -> {7, 8}}, {{7 -> null}, [null, null], {4969-12-04 00:00:00.000, 0.00}}}"});
+      } else {
+        return makeFlatVector<StringView>(
             {"{[null, [1, 100, 2]], [], [], {3 -> [4, 5, 6, 1, 2]}, {1 -> {2 -> 3, 4 -> 5}}, {1 -> {2, 3}, 3 -> {4, 5}}, {{1 -> 10, 2 -> 20}, [0, 1], {2000-01-01 00:00:00, 1234567.89}}}",
              "{[[1, 100, 2], [315]], [{1 -> 11, 3 -> 10}, {0 -> 10, 2 -> 11}, {1 -> 11, 1 -> 10}], [null, null], {5 -> [4, null, 1, 2]}, {0 -> {2 -> 3, 4 -> 5}}, {0 -> {2, 3}, 3 -> {null, null}}, {{3 -> 30, 4 -> 40, 9 -> 90}, [2, 3, 4], {null, -3333333.33}}}",
              "{[[1, 100, null]], [{0 -> null}, {0 -> 10}], [{2, red}, null, {1, blue}], {}, {1 -> {2 -> 3, 4 -> null}}, {1 -> {2, null}, 3 -> {null, 5}}, {{5 -> null, 6 -> 60}, [6, null, 7], {2269-12-29 00:00:00, null}}}",
-             "{[[315]], [{}, {2 -> 10}], [{1, green}, {null, red}], {7 -> null}, {6 -> null}, {6 -> {7, 8}}, {{7 -> null}, [null, null], {4969-12-04 00:00:00, 0.00}}}"}));
-#endif
+             "{[[315]], [{}, {2 -> 10}], [{1, green}, {null, red}], {7 -> null}, {6 -> null}, {6 -> {7, 8}}, {{7 -> null}, [null, null], {4969-12-04 00:00:00, 0.00}}}"});
+      }
+    }();
+    testCast(finalRowVector, expected);
   }
 }
 
@@ -3158,7 +3317,7 @@ TEST_F(CastExprTest, mapCastStringFlinkCompatible) {
     auto mapVector = makeNullableMapVector<int32_t, double>(
         {{{{1, 1.25}, {3, std::nullopt}, {2, 4.5}}},
          std::nullopt,
-         {{}},
+         emptyArray,
          {{{5, 13.25}, {6, 1e7}}}},
         MAP(INTEGER(), DOUBLE()));
     testCast(
@@ -3184,6 +3343,26 @@ TEST_F(CastExprTest, mapCastStringFlinkCompatible) {
             "[]",
             "[{1=11, 3=10}, {0=10, 2=11}, {1=11, 1=10}]",
             "[{0=null}, {0=10}]",
+        }));
+
+    std::vector<std::optional<std::vector<std::optional<Timestamp>>>>
+        arrayOfTimestampData = {
+            std::vector<std::optional<Timestamp>>{
+                Timestamp(946729316, 0),
+                Timestamp(946729316, 123),
+                std::nullopt},
+            std::vector<std::optional<Timestamp>>{
+                Timestamp(946729316, 129900000)},
+            std::nullopt,
+        };
+    auto arrayOfTimestamp = makeNullableArrayVector<Timestamp>(
+        arrayOfTimestampData, ARRAY(TIMESTAMP()));
+    testCast(
+        arrayOfTimestamp,
+        makeNullableFlatVector<StringView>({
+            "[2000-01-01 12:21:56, 2000-01-01 12:21:56.000000123, null]",
+            "[2000-01-01 12:21:56.1299]",
+            std::nullopt,
         }));
   };
 
@@ -3368,7 +3547,7 @@ TEST_F(CastExprTest, dictionaryEncodedNestedInput) {
   // produces a result VARCHAR vector of length 3. If the casting of the ROW
   // vector produces a result ROW<VARCHAR> vector of the length of all rows,
   // i.e., 6, the subsequent call to Expr::addNull() would throw due to the
-  // attempt of accessing the element VARCHAR vector at indices corresonding
+  // attempt of accessing the element VARCHAR vector at indices corresponding
   // to the non-existent ROW at indices 3--5.
   exec::registerVectorFunction(
       "add_dict",
@@ -3413,11 +3592,11 @@ TEST_F(CastExprTest, smallerNonNullRowsSizeThanRows) {
 
 TEST_F(CastExprTest, tryCastDoesNotHideInputsAndExistingErrors) {
   auto testInvalid = [](std::function<void()> func) {
-#ifdef SPARK_COMPATIBLE
-    ASSERT_NO_THROW(func());
-#else
-    ASSERT_THROW(func(), BoltException);
-#endif
+    if (::bytedance::bolt::kSparkCompatible) {
+      ASSERT_NO_THROW(func());
+    } else {
+      ASSERT_THROW(func(), BoltException);
+    }
   };
   auto test = [&](const std::string& castExprThatThrow,
                   const std::string& type,
@@ -3541,6 +3720,92 @@ TEST_F(CastExprTest, skipCastEvaluation) {
         makeNullableFlatVector<StringView>({"1", "1", "1", std::nullopt});
     assertEqualVectors(result, expected);
   }
+}
+
+// Regression test for casting a complex type to VARCHAR when a nested complex
+// child arrives wrapped in a dictionary encoding. Top-level encodings are
+// peeled by CastExpr::apply, and casting an outer ARRAY to VARCHAR recurses
+// (via doCastArrayToVarchar) into its element vector while it is still
+// dictionary-encoded. Before the fix, doCast() dereferenced
+// input.as<RowVector>()/MapVector/ArrayVector unconditionally, which returned
+// nullptr for a dictionary-encoded child and crashed. Results are compared
+// against a deeply-flattened copy of the same logical input so the assertions
+// do not depend on the (build-specific) string format.
+TEST_F(CastExprTest, complexTypeToStringWrappedNestedInput) {
+  auto castWrappedAndFlat = [&](const VectorPtr& elements,
+                                const std::vector<vector_size_t>& offsets,
+                                const std::vector<vector_size_t>& nullArrays) {
+    // Wrap the nested element vector (the child of the outer array) in a
+    // reversing dictionary so it is dictionary-encoded when doCast() recurses
+    // into it while casting the outer array to VARCHAR.
+    auto indices = test::makeIndicesInReverse(elements->size(), pool());
+    auto wrappedElements = BaseVector::wrapInDictionary(
+        nullptr, indices, elements->size(), elements);
+    auto wrappedArray = makeArrayVector(offsets, wrappedElements, nullArrays);
+
+    // Build the logically-equivalent flat input by deep-flattening a copy of
+    // the same reversed elements.
+    VectorPtr flatElements = wrappedElements;
+    BaseVector::flattenVector(flatElements);
+    auto flatArray = makeArrayVector(offsets, flatElements, nullArrays);
+
+    auto wrappedResult =
+        evaluate("cast(c0 as VARCHAR)", makeRowVector({wrappedArray}));
+    auto flatResult =
+        evaluate("cast(c0 as VARCHAR)", makeRowVector({flatArray}));
+    assertEqualVectors(flatResult, wrappedResult);
+  };
+
+  // ARRAY<ROW<...>> where the ROW child is dictionary-encoded.
+  {
+    auto rows = makeRowVector({
+        makeNullableFlatVector<int64_t>({1, std::nullopt, 3, 4, 5}),
+        makeNullableFlatVector<StringView>({"a", "b", std::nullopt, "d", "e"}),
+    });
+    castWrappedAndFlat(rows, {0, 2, 2, 5}, {1});
+  }
+
+  // ARRAY<MAP<...>> where the MAP child is dictionary-encoded.
+  {
+    auto maps = makeNullableMapVector<int32_t, double>(
+        {{{{1, 1.25}, {2, std::nullopt}}},
+         std::nullopt,
+         {{{3, 4.5}}},
+         emptyArray,
+         {{{5, 13.25}, {6, 1e7}}}},
+        MAP(INTEGER(), DOUBLE()));
+    castWrappedAndFlat(maps, {0, 2, 3, 5}, {});
+  }
+
+  // ARRAY<ARRAY<...>> where the inner ARRAY child is dictionary-encoded.
+  {
+    auto inner = makeNullableArrayVector<int32_t>(
+        {{{0, 1}}, emptyArray, {{2, std::nullopt, 3}}, std::nullopt, {{4}}});
+    castWrappedAndFlat(inner, {0, 2, 5, 5}, {2});
+  }
+}
+
+// Regression test for casting a complex type to VARCHAR when a nested complex
+// child is constant-encoded (all outer array elements reference the same inner
+// complex element). Exercises the constant-mapping branch of
+// doCastWrappedComplexToVarchar.
+TEST_F(CastExprTest, complexTypeToStringConstantNestedInput) {
+  auto rowElement = makeRowVector({
+      makeNullableFlatVector<int64_t>({7, std::nullopt, 9}),
+      makeFlatVector<StringView>({"x", "y", "z"}),
+  });
+  // Constant-encode the ROW child so all outer array elements point to row 1.
+  auto constElements = BaseVector::wrapInConstant(3, 1, rowElement);
+  auto wrappedArray = makeArrayVector({0, 2, 3}, constElements);
+
+  VectorPtr flatElements = constElements;
+  BaseVector::flattenVector(flatElements);
+  auto flatArray = makeArrayVector({0, 2, 3}, flatElements);
+
+  auto wrappedResult =
+      evaluate("cast(c0 as VARCHAR)", makeRowVector({wrappedArray}));
+  auto flatResult = evaluate("cast(c0 as VARCHAR)", makeRowVector({flatArray}));
+  assertEqualVectors(flatResult, wrappedResult);
 }
 } // namespace
 } // namespace bytedance::bolt::test

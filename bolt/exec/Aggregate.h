@@ -257,7 +257,7 @@ class Aggregate {
     BOLT_NYI("toIntermediate not supported");
   }
 
-  /// does the acumulator type support serialize and deserialize
+  /// does the accumulator type support serialize and deserialize
   /// memory after serialize
   ///   ------<accumulator>---- // fix part
   ///           --------------- // extra variable memory
@@ -406,7 +406,7 @@ class Aggregate {
   void destroyAccumulator(char* group) const {
     auto accumulator = value<T>(group);
     std::destroy_at(accumulator);
-    memset(accumulator, 0, sizeof(T));
+    ::memset(static_cast<void*>(accumulator), 0, sizeof(T));
   }
 
   template <typename T>

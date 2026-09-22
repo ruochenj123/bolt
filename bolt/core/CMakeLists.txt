@@ -29,30 +29,36 @@ if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
 
-add_library(bolt_config Config.cpp Context.cpp)
-target_link_libraries(bolt_config bolt_exception Folly::folly)
+bolt_add_library(bolt_config Config.cpp Context.cpp)
+target_link_libraries(
+  bolt_config
+  bolt_exception
+  Folly::folly
+)
 
-add_library(
+bolt_add_library(
   bolt_core Expressions.cpp PlanFragment.cpp PlanNode.cpp QueryConfig.cpp QueryCtx.cpp
             SimpleFunctionMetadata.cpp
 )
 
 target_link_libraries(
   bolt_core
-  PUBLIC bolt_arrow_bridge
-         bolt_caching
-         bolt_config
-         bolt_common_config
-         bolt_connector
-         bolt_exception
-         bolt_expression_functions
-         bolt_memory
-         bolt_type_base
-         bolt_vector
-         Boost::headers
-         Folly::folly
-         fmt::fmt
-  PRIVATE bolt_encode
+  PUBLIC
+    bolt_arrow_bridge
+    bolt_caching
+    bolt_config
+    bolt_common_config
+    bolt_connector
+    bolt_exception
+    bolt_expression_functions
+    bolt_memory
+    bolt_type_base
+    bolt_vector
+    Boost::headers
+    Folly::folly
+    fmt::fmt
+  PRIVATE
+    bolt_encode
 )
 
 if(${BOLT_ENABLE_TORCH})
@@ -70,5 +76,10 @@ endif()
 if(${BOLT_ENABLE_CUDF})
   target_compile_definitions(bolt_core PRIVATE BOLT_HAS_CUDF=1)
   target_include_directories(bolt_core SYSTEM PRIVATE ${cudf_INCLUDE_DIRS})
-  target_link_libraries(bolt_core PRIVATE bolt_cudf_exec cudf::cudf)
+  target_link_libraries(
+    bolt_core
+    PRIVATE
+      bolt_cudf_exec
+      cudf::cudf
+  )
 endif()

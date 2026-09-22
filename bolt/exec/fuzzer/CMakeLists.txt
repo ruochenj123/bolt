@@ -25,52 +25,40 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_fuzzer_util DuckQueryRunner.cpp PrestoQueryRunner.cpp)
+bolt_add_library(bolt_fuzzer_util DuckQueryRunner.cpp PrestoQueryRunner.cpp)
 
 target_link_libraries(
-  bolt_fuzzer_util bolt_core bolt_exec_test_lib cpr::cpr bolt_type_parser Folly::folly
+  bolt_fuzzer_util
+  bolt_core
+  bolt_exec_test_lib
+  cpr::cpr
+  bolt_type_parser
+  Folly::folly
 )
 
-add_library(bolt_aggregation_fuzzer_base AggregationFuzzerBase.cpp)
+add_library(bolt_fuzzer_flags STATIC FuzzerFlags.cpp)
+target_link_libraries(bolt_fuzzer_flags PRIVATE gflags::gflags)
+
+add_library(bolt_aggregation_fuzzer_base STATIC AggregationFuzzerBase.cpp)
 
 target_link_libraries(
   bolt_aggregation_fuzzer_base
-  bolt_exec_test_lib
-  bolt_temp_path
-  bolt_common_base
-  bolt_file
-  bolt_hive_connector
-  bolt_dwio_dwrf_reader
-  bolt_dwio_dwrf_writer
-  bolt_type
-  bolt_vector_fuzzer
-  bolt_fuzzer_util
-  bolt_expression_test_utility
-  bolt_vector
-  bolt_core
+  bolt_testutils
+  bolt_fuzzer_flags
 )
 
-add_library(bolt_aggregation_fuzzer AggregationFuzzer.cpp)
+add_library(bolt_aggregation_fuzzer STATIC AggregationFuzzer.cpp)
 
 target_link_libraries(
   bolt_aggregation_fuzzer
-  bolt_type
-  bolt_vector_fuzzer
-  bolt_exec_test_lib
-  bolt_expression_test_utility
+  bolt_testutils
   bolt_aggregation_fuzzer_base
-  bolt_fuzzer_util
 )
 
-add_library(bolt_window_fuzzer WindowFuzzer.cpp)
+add_library(bolt_window_fuzzer STATIC WindowFuzzer.cpp)
 
 target_link_libraries(
   bolt_window_fuzzer
-  bolt_fuzzer_util
-  bolt_type
-  bolt_vector_fuzzer
-  bolt_exec_test_lib
-  bolt_expression_test_utility
+  bolt_testutils
   bolt_aggregation_fuzzer_base
-  bolt_temp_path
 )

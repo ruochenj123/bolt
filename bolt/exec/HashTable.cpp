@@ -103,6 +103,7 @@ HashTable<ignoreNullKeys>::HashTable(
         isJoinBuild,
         hasProbedFlag,
         hashMode_ != HashMode::kHash,
+        false /*useListRowIndex*/,
         pool);
     hybridData_ =
         std::make_unique<HybridContainer>(keys, dependentTypes, rows_.get());
@@ -116,6 +117,7 @@ HashTable<ignoreNullKeys>::HashTable(
         isJoinBuild,
         hasProbedFlag,
         hashMode_ != HashMode::kHash,
+        false /*useListRowIndex*/,
         pool,
         stringArena);
   }
@@ -1007,7 +1009,7 @@ bool HashTable<ignoreNullKeys>::canApplyParallelJoinBuild() const {
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::parallelJoinBuild() {
-  TestValue::adjust(
+  BOLT_TEST_ADJUST(
       "bytedance::bolt::exec::HashTable::parallelJoinBuild", rows_->pool());
   BOLT_CHECK_LE(1 + otherTables_.size(), std::numeric_limits<uint8_t>::max());
   const uint8_t numPartitions = 1 + otherTables_.size();
@@ -1429,7 +1431,7 @@ void HashTable<ignoreNullKeys>::rehash(bool initNormalizedKeys) {
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::setHashMode(HashMode mode, int32_t numNew) {
   BOLT_CHECK_NE(hashMode_, HashMode::kHash);
-  TestValue::adjust("bytedance::bolt::exec::HashTable::setHashMode", &mode);
+  BOLT_TEST_ADJUST("bytedance::bolt::exec::HashTable::setHashMode", &mode);
   if (mode == HashMode::kArray) {
     const auto bytes = capacity_ * tableSlotSize();
     const auto numPages = memory::AllocationTraits::numPages(bytes);
@@ -1528,14 +1530,14 @@ void HashTable<ignoreNullKeys>::enableRangeWhereCan(
     return rangeMultipliers[i] < rangeMultipliers[j];
   });
 
-  auto calculateNewMultipler = [&]() {
-    uint64_t multipler = 1;
+  auto calculateNewMultiplier = [&]() {
+    uint64_t multiplier = 1;
     for (auto i = 0; i < rangeSizes.size(); ++i) {
       // NOLINT
-      multipler =
-          safeMul(multipler, useRange[i] ? rangeSizes[i] : distinctSizes[i]);
+      multiplier =
+          safeMul(multiplier, useRange[i] ? rangeSizes[i] : distinctSizes[i]);
     }
-    return multipler;
+    return multiplier;
   };
 
   // Switch distinct to range if the cardinality increase does not overflow
@@ -1543,7 +1545,7 @@ void HashTable<ignoreNullKeys>::enableRangeWhereCan(
   for (auto i = 0; i < rangeSizes.size(); ++i) {
     if (!useRange[indices[i]]) {
       useRange[indices[i]] = true;
-      auto newProduct = calculateNewMultipler();
+      auto newProduct = calculateNewMultiplier();
       if (newProduct == VectorHasher::kRangeTooLarge) {
         useRange[indices[i]] = false;
         return;

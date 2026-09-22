@@ -32,6 +32,7 @@
 #include <arrow/array.h>
 #include <arrow/c/bridge.h>
 #include <arrow/io/interfaces.h>
+#include <arrow/memory_pool.h>
 #include <arrow/record_batch.h>
 #include <arrow/table.h>
 #include <arrow/util/thread_pool.h>
@@ -145,9 +146,11 @@ constexpr int64_t DEFAULT_PARQUET_BLOCK_SIZE = 128 * 1024 * 1024; // 128M
 
 std::shared_ptr<WriterProperties::Builder> getArrowParquetWriterOptionsBuilder(
     const parquet::WriterOptions& options,
-    const std::unique_ptr<DefaultFlushPolicy>& flushPolicy) {
+    const std::unique_ptr<DefaultFlushPolicy>& flushPolicy,
+    arrow::MemoryPool* arrowPool) {
   auto builder = std::make_shared<WriterProperties::Builder>();
   WriterProperties::Builder* properties = builder.get();
+  properties->memory_pool(arrowPool);
   if (!options.enableDictionary) {
     properties = properties->disable_dictionary();
   }
@@ -177,6 +180,7 @@ std::shared_ptr<WriterProperties::Builder> getArrowParquetWriterOptionsBuilder(
   }
   properties = properties->encoding(options.encoding);
   properties = properties->data_pagesize(options.dataPageSize);
+  properties = properties->max_rows_per_page(options.maxRowsPerDataPage);
   for (const auto& [path, dataPageSize] : options.columnDataPageSizeMap) {
     properties = properties->data_pagesize(path, dataPageSize);
   }
@@ -229,6 +233,7 @@ std::string WriterOptionsToString(const WriterOptions& options) {
   oss << "]" << std::endl;
 
   oss << "  dataPageSize: " << options.dataPageSize << std::endl;
+  oss << "  maxRowsPerDataPage: " << options.maxRowsPerDataPage << std::endl;
   oss << "  columnDataPageSizeMap: {";
   for (const auto& [key, value] : options.columnDataPageSizeMap) {
     oss << key << ": " << value << ", ";
@@ -379,9 +384,10 @@ std::shared_ptr<::arrow::Field> updateFieldNameRecursive(
 } // namespace
 
 std::shared_ptr<WriterProperties::Builder>
-WriterOptions::getWriterPropertiesBuilder() const {
+WriterOptions::getWriterPropertiesBuilder(arrow::MemoryPool* arrowPool) const {
   auto defaultFlushPolicy = std::make_unique<DefaultFlushPolicy>();
-  return getArrowParquetWriterOptionsBuilder(*this, defaultFlushPolicy);
+  return getArrowParquetWriterOptionsBuilder(
+      *this, defaultFlushPolicy, arrowPool);
 }
 
 std::shared_ptr<ArrowWriterProperties::Builder>
@@ -441,11 +447,13 @@ Writer::Writer(
       generalPool_{pool_->addLeafChild(".general")},
       exportPool_{pool_->addLeafChild(".exportArrow")},
       arrowPool_(arrowPool),
+      metrics_(std::make_shared<WriterMetricsCollector>()),
       stream_(std::make_shared<ArrowDataBufferSink>(
           std::move(sink),
           *generalPool_,
           options.bufferFlushThresholdBytes,
-          options.bufferGrowRatio)),
+          options.bufferGrowRatio,
+          metrics_)),
       arrowContext_(std::make_shared<ArrowContext>()),
       schema_(std::move(schema)),
       arrowSchemaFromHive_(std::move(arrowSchema)),
@@ -468,7 +476,9 @@ Writer::Writer(
   options_.timestampTimeZone =
       options.parquetWriteTimestampTimeZone.value_or("UTC");
   arrowContext_->properties =
-      getArrowParquetWriterOptionsBuilder(options, flushPolicy_)->build();
+      getArrowParquetWriterOptionsBuilder(options, flushPolicy_, arrowPool_)
+          ->writer_metrics(metrics_)
+          ->build();
   arrowContext_->arrowWriterProperties =
       options.getArrowWriterPropertiesBuilder()->build();
   setMemoryReclaimers();
@@ -506,6 +516,10 @@ void Writer::flush() {
 }
 
 void Writer::flush(int64_t rowsInCurrentRowGroup) {
+  if (enableFlushBasedOnBlockSize_ && arrowContext_->writer) {
+    PARQUET_THROW_NOT_OK(arrowContext_->writer->Flush());
+    return;
+  }
   if (arrowContext_->stagingRows > 0) {
     createFileWriterIfNotExist();
 
@@ -556,6 +570,12 @@ void Writer::writeRecordBatch(
     LOG(WARNING) << "Slow WriteRecordBatch detected: " << writeTimeMs
                  << "ms for " << recordBatch->num_rows() << " rows";
   }
+  VLOG(5) << "ParquetWriter::writeRecordBatch, rows: "
+          << recordBatch->num_rows() << ", arrow pool allocated memory: "
+          << succinctBytes(arrowPool_->bytes_allocated())
+          << ", arrow pool peak memory: "
+          << succinctBytes(arrowPool_->max_memory()) << ", memory stats: "
+          << arrowContext_->writer->memoryStats().toString();
   PARQUET_THROW_NOT_OK(stream_->Flush());
 }
 
@@ -572,6 +592,27 @@ void Writer::createFileWriterIfNotExist() {
   }
 }
 
+void Writer::initializeArrowSchema(const VectorPtr& data) {
+  BOLT_CHECK_NULL(arrowContext_->schema);
+
+  WriterMetricTimer timer(&metrics_->writeRecodeWallNanos);
+  ArrowSchema schema;
+  exportToArrow(data, schema, options_, {}, exportPool_.get());
+  auto arrowSchema = ::arrow::ImportSchema(&schema).ValueOrDie();
+
+  std::vector<std::shared_ptr<::arrow::Field>> fields;
+  fields.reserve(schema_->size());
+  for (auto i = 0; i < schema_->size(); ++i) {
+    fields.push_back(updateFieldNameRecursive(
+        arrowSchema->fields()[i],
+        *schema_->childAt(i),
+        (arrowSchemaFromHive_ ? arrowSchemaFromHive_->fields()[i]
+                              : arrowSchema->fields()[i]),
+        schema_->nameOf(i)));
+  }
+  arrowContext_->schema = ::arrow::schema(std::move(fields));
+}
+
 dwio::common::StripeProgress getStripeProgress(
     uint64_t stagingRows,
     int64_t stagingBytes) {
@@ -579,9 +620,7 @@ dwio::common::StripeProgress getStripeProgress(
       .stripeRowCount = stagingRows, .stripeSizeEstimate = stagingBytes};
 }
 
-void Writer::splitWriteRecordBatch(
-    const VectorPtr& data,
-    std::shared_ptr<::arrow::Schema> arraySchemaPtr) {
+void Writer::splitWriteRecordBatch(const VectorPtr& data) {
   vector_size_t rowNumPerBatch = data->size();
   if (rowNumPerBatch > minBatchSize_) {
     auto exportSize =
@@ -601,17 +640,19 @@ void Writer::splitWriteRecordBatch(
   while (offset < dataSize) {
     auto size = std::min<vector_size_t>(dataSize - offset, rowNumPerBatch);
 
-    ArrowArray array;
-    exportToArrow(
-        offset == 0 && size == dataSize ? data : data->slice(offset, size),
-        array,
-        exportPool_.get(),
-        options_);
+    std::shared_ptr<::arrow::RecordBatch> recordBatch;
+    {
+      WriterMetricTimer timer(&metrics_->writeRecodeWallNanos);
+      ArrowArray array;
+      exportToArrow(
+          offset == 0 && size == dataSize ? data : data->slice(offset, size),
+          array,
+          exportPool_.get(),
+          options_);
 
-    PARQUET_ASSIGN_OR_THROW(
-        auto recordBatch, ::arrow::ImportRecordBatch(&array, arraySchemaPtr));
-    if (!arrowContext_->schema) {
-      arrowContext_->schema = recordBatch->schema();
+      PARQUET_ASSIGN_OR_THROW(
+          recordBatch,
+          ::arrow::ImportRecordBatch(&array, arrowContext_->schema));
     }
     writeRecordBatch(recordBatch);
     offset += size;
@@ -633,40 +674,25 @@ void Writer::write(const VectorPtr& data) {
       data->type()->equivalent(*schema_),
       "The file schema type should be equal with the input rowvector type.");
 
-  ArrowSchema schema;
-  exportToArrow(data, schema, options_, {}, exportPool_.get());
-
-  // Convert the arrow schema to Schema and then update the column names based
-  // on schema_.
-  auto arrowSchema = ::arrow::ImportSchema(&schema).ValueOrDie();
-  std::vector<std::shared_ptr<::arrow::Field>> newFields;
-  auto childSize = schema_->size();
-  for (auto i = 0; i < childSize; i++) {
-    newFields.push_back(updateFieldNameRecursive(
-        arrowSchema->fields()[i],
-        *schema_->childAt(i),
-        (arrowSchemaFromHive_ ? arrowSchemaFromHive_->fields()[i]
-                              : arrowSchema->fields()[i]),
-        schema_->nameOf(i)));
+  if (!arrowContext_->schema) {
+    initializeArrowSchema(data);
+    if (enableRowGroupAlignedWrite_ || !enableFlushBasedOnBlockSize_) {
+      arrowContext_->stagingChunks.resize(arrowContext_->schema->num_fields());
+    }
   }
 
   if (!enableRowGroupAlignedWrite_ && enableFlushBasedOnBlockSize_) {
-    splitWriteRecordBatch(data, ::arrow::schema(newFields));
+    splitWriteRecordBatch(data);
     return;
   }
 
-  ArrowArray array;
-  exportToArrow(data, array, exportPool_.get(), options_);
-  PARQUET_ASSIGN_OR_THROW(
-      auto recordBatch,
-      ::arrow::ImportRecordBatch(&array, ::arrow::schema(newFields)));
-  if (!arrowContext_->schema) {
-    arrowContext_->schema = recordBatch->schema();
-    for (int colIdx = 0; colIdx < arrowContext_->schema->num_fields();
-         colIdx++) {
-      arrowContext_->stagingChunks.push_back(
-          std::vector<std::shared_ptr<::arrow::Array>>());
-    }
+  std::shared_ptr<::arrow::RecordBatch> recordBatch;
+  {
+    WriterMetricTimer timer(&metrics_->writeRecodeWallNanos);
+    ArrowArray array;
+    exportToArrow(data, array, exportPool_.get(), options_);
+    PARQUET_ASSIGN_OR_THROW(
+        recordBatch, ::arrow::ImportRecordBatch(&array, arrowContext_->schema));
   }
 
   auto bytes = data->estimateFlatSize();
@@ -712,6 +738,7 @@ void Writer::close() {
     return;
   }
 
+  WriterMetricTimer timer(&metrics_->writeFinalizeWallNanos);
   flush();
   if (!arrowContext_->writer) {
     createEmptyFile();
@@ -724,18 +751,16 @@ void Writer::close() {
   closed_ = true;
 }
 
+dwio::common::WriterMetrics Writer::metrics() const {
+  return metrics_->snapshot();
+}
+
 void Writer::createEmptyFile() {
-  BOLT_CHECK_NULL(arrowContext_->schema);
   BOLT_CHECK_NULL(arrowContext_->writer);
-  ArrowSchema arrowSchema;
-  exportToArrow(
-      BaseVector::create(
-          std::static_pointer_cast<const Type>(schema_), 0, exportPool_.get()),
-      arrowSchema,
-      options_,
-      {},
-      exportPool_.get());
-  arrowContext_->schema = ::arrow::ImportSchema(&arrowSchema).ValueOrDie();
+  if (!arrowContext_->schema) {
+    initializeArrowSchema(BaseVector::create(
+        std::static_pointer_cast<const Type>(schema_), 0, exportPool_.get()));
+  }
   createFileWriterIfNotExist();
 }
 

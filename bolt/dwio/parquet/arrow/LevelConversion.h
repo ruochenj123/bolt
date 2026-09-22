@@ -174,11 +174,16 @@ struct PARQUET_EXPORT ValidityBitmapInputOutput {
   int64_t values_read = 0;
   // Input/Output. The number of nulls encountered.
   int64_t null_count = 0;
-  // Output only. The validity bitmap to populate. Maybe be null only
-  // for DefRepLevelsToListInfo (if all that is needed is list offsets).
+  // Output only. The validity bitmap to populate. May be null when callers only
+  // need list offsets or list lengths, and do not need list validity.
   uint8_t* valid_bits = NULLPTR;
   // Input only, offset into valid_bits to start at.
   int64_t valid_bits_offset = 0;
+};
+
+struct PARQUET_EXPORT ListLengthsState {
+  int32_t current_length = 0;
+  bool has_open_list = false;
 };
 
 //  Converts def_levels to validity bitmaps for non-list arrays and structs that
@@ -190,6 +195,15 @@ void PARQUET_EXPORT DefLevelsToBitmap(
     int64_t num_def_levels,
     LevelInfo level_info,
     ValidityBitmapInputOutput* output);
+
+// Computes values_read and whether all produced values are valid using the
+// same semantics as DefLevelsToBitmap, without writing a validity bitmap.
+bool PARQUET_EXPORT DefLevelsAreAllValid(
+    const int16_t* def_levels,
+    int64_t num_def_levels,
+    LevelInfo level_info,
+    int64_t values_read_upper_bound,
+    int64_t* values_read);
 
 // Reconstructs a validity bitmap and list offsets for a list arrays based on
 // def/rep levels. The first element of offsets will not be modified if
@@ -213,6 +227,61 @@ void PARQUET_EXPORT DefRepLevelsToList(
     LevelInfo level_info,
     ValidityBitmapInputOutput* output,
     int64_t* offsets);
+
+// Reconstructs a validity bitmap and list lengths directly. This is equivalent
+// to calling DefRepLevelsToList with int32 offsets and converting adjacent
+// offsets to lengths, but avoids one extra pass over the output.
+//
+// Lengths must be sized to values_read_upper_bound.
+void PARQUET_EXPORT DefRepLevelsToListLengths(
+    const int16_t* def_levels,
+    const int16_t* rep_levels,
+    int64_t num_def_levels,
+    LevelInfo level_info,
+    ValidityBitmapInputOutput* output,
+    int32_t* lengths);
+
+// Incremental variant of DefRepLevelsToListLengths. Keeps the current list
+// open across calls unless finalize is true. output->values_read reports only
+// finalized lengths produced by this call. A validity bit for the open list
+// may be written at valid_bits_offset + values_read.
+void PARQUET_EXPORT DefRepLevelsToListLengths(
+    const int16_t* def_levels,
+    const int16_t* rep_levels,
+    int64_t num_def_levels,
+    LevelInfo level_info,
+    ValidityBitmapInputOutput* output,
+    int32_t* lengths,
+    ListLengthsState* state,
+    bool finalize);
+
+// Reconstructs list lengths/list validity and the validity bitmap of a direct
+// nullable struct parent in one pass over the same def/rep levels. Returns
+// false if the two LevelInfo values do not describe a supported direct
+// struct -> list relationship.
+bool PARQUET_EXPORT DefRepLevelsToListLengthsAndStructBitmap(
+    const int16_t* def_levels,
+    const int16_t* rep_levels,
+    int64_t num_def_levels,
+    LevelInfo list_level_info,
+    LevelInfo struct_level_info,
+    ValidityBitmapInputOutput* list_output,
+    int32_t* lengths,
+    ValidityBitmapInputOutput* struct_output);
+
+// Incremental variant for a direct struct -> list relationship. Keeps the
+// current list open across calls unless finalize is true.
+bool PARQUET_EXPORT DefRepLevelsToListLengthsAndStructBitmap(
+    const int16_t* def_levels,
+    const int16_t* rep_levels,
+    int64_t num_def_levels,
+    LevelInfo list_level_info,
+    LevelInfo struct_level_info,
+    ValidityBitmapInputOutput* list_output,
+    int32_t* lengths,
+    ValidityBitmapInputOutput* struct_output,
+    ListLengthsState* state,
+    bool finalize);
 
 // Reconstructs a validity bitmap for a struct every member is a list or has
 // a list descendant.  See documentation on DefLevelsToBitmap for when more

@@ -25,6 +25,10 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_dwio_parquet_arrow_thrift_lib parquet_types.cpp)
+bolt_add_library(bolt_dwio_parquet_arrow_thrift_lib parquet_types.cpp)
 
-target_link_libraries(bolt_dwio_parquet_arrow_thrift_lib arrow::arrow Boost::headers)
+target_link_libraries(
+  bolt_dwio_parquet_arrow_thrift_lib
+  arrow::arrow
+  Boost::headers
+)

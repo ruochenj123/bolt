@@ -21,7 +21,8 @@ This will ensure the smooth & credible experience for code contribution
 Bolt focuses on the physical execution layer of DBMS while providing first-class and high performance support for popular frameworks and storage formats.
 
 Frameworks:
-* [Apache Gluten](https://github.com/apache/incubator-gluten/discussions/10929#discussioncomment-15037342) for Spark
+* [Apache Gluten](https://github.com/apache/gluten#bolt-backend) for Apache Spark
+* RFC for [PrestoDB](https://github.com/prestodb/rfcs/pull/59)  
 * [OpenSearch](https://github.com/opensearch-project/sql/issues/4812?open_in_browser=true) for ElasticSearch
 * Flink (Coming Soon)
 * ...
@@ -53,31 +54,60 @@ git clone https://github.com/bytedance/bolt.git
 cd bolt
 ```
 
-### Using Conan as the package manager
-[Conan](https://conan.io/) is an open source and multi-platform package manager.
-We provide scripts to help developers setup and install Bolt dependencies.
-
+### Setup Develop Env
+We provide scripts to help developers configure the environment and install dependencies.
 ```shell
 scripts/setup-dev-env.sh
 ```
 
-This script only exports conan recipes to local cache. For the first time, dependencies will be built from source and installed into local cache. You can setup your own [conan server](https://docs.conan.io/2/reference/conan_server.html#conan-server) to accelerate building.
+Bolt uses [Conan](https://conan.io/) as its dependency management tool, which is an open source and multi-platform package manager.
+
+This script exports conan recipes to local cache. For the first time, dependencies will be built from source and installed into local cache. You can setup your own [conan server](https://docs.conan.io/2/reference/conan_server.html#conan-server) to accelerate building.
 
 ### Building Bolt
+#### Building Bolt for Presto
 
 Run `make` in the root directory to compile the sources. For development, use
 `make debug` to build a non-optimized debug version, or `make release` to build
 an optimized version.  Use `make unittest` to build and run tests.
 
 ```shell
-# building bolt for spark
-make release_spark
+make release
 
 # In main branch, by default, BUILD_VERSION is main.
-make release_spark BUILD_VERSION=main
+make release BUILD_VERSION=main
 ```
 
-### Importing Bolt as a library
+#### Building Bolt as an [Apache Gluten](https://gluten.apache.org/) Backend
+
+Bolt is now available as a backend in Apache Gluten. The integration was merged via [apache/gluten#12454](https://github.com/apache/gluten/pull/12454).
+
+For the latest prerequisites and standard build instructions, see the [Bolt Backend](https://github.com/apache/gluten#bolt-backend) section in the Apache Gluten repository.
+
+To validate local Bolt changes with Gluten, first build Bolt in Spark-compatible mode and export it to the local Conan cache:
+
+```shell
+# In the Bolt repository
+make release_spark
+make export_release
+```
+
+Then clone the official Apache Gluten repository and build the Bolt backend and Gluten JAR:
+
+```shell
+git clone https://github.com/apache/gluten.git
+cd gluten
+
+make release
+make arrow
+
+# Select the target matching your Spark version.
+# For example, build the Spark 3.5 package:
+make jar_spark35
+```
+
+#### Building Bolt for other system
+You can use the `make release && make export_release` command to compile and export Bolt, and then use conan to reference Bolt. Below is a conanfile example that references Bolt as a third-party dependency.
 
 ```python
 # Take gluten for example:
@@ -95,7 +125,7 @@ contribute to the project.
 
 ## Community
 
-WIP
+* [Please join our Slack channel and ask in `#dev`](https://join.slack.com/t/bolt-lib/shared_invite/zt-3okvtb6fr-7jUlaI2AiGCOYdoxhNL6Pw).
 
 ## License
 

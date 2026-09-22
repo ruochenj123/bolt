@@ -35,6 +35,8 @@
 #include <common/base/CheckedArithmetic.h>
 #include <fmt/format.h>
 #include <sys/types.h>
+#include <unicode/ucnv.h>
+#include <unicode/unistr.h>
 #include <codecvt>
 #include <cstdint>
 #include <cstdlib>
@@ -60,6 +62,14 @@ namespace {
 // the dependency on DWRF.
 constexpr int64_t MAX_NANOS = 1'000'000'000;
 
+std::string utf32ToUtf8(const std::u32string& utf32) {
+  icu::UnicodeString ustr = icu::UnicodeString::fromUTF32(
+      reinterpret_cast<const UChar32*>(utf32.data()), utf32.size());
+
+  std::string result;
+  ustr.toUTF8String(result);
+  return result;
+}
 // Structure to help temporary changes to Options. This objects saves the
 // current state of the Options object, and restores it when it's destructed.
 // For instance, if you would like to temporarily disable nulls for a particular
@@ -312,7 +322,7 @@ T randDecimal(
     bool isLongDecimal) {
   BOLT_CHECK(
       isShortDecimal != isLongDecimal,
-      "Can only geneate either a short decimal or a long decimal.");
+      "Can only generate either a short decimal or a long decimal.");
 
   bool generateSpecialValues = rand<bool>(rng);
 
@@ -593,7 +603,6 @@ StringView randString(
     FuzzerGenerator& rng,
     const VectorFuzzer::Options& opts,
     std::string& buf,
-    std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t>& converter,
     const bool doStringIncrementalGeneration,
     T& reusablePartBuffer,
     const size_t reusablePartLength) {
@@ -624,7 +633,7 @@ StringView randString(
     // Randomly generate the entire string.
     fillBuffer(wbuf, 0, stringLength, rng, opts);
   }
-  buf.append(converter.to_bytes(wbuf));
+  buf.append(utf32ToUtf8(wbuf));
   return StringView(buf);
 }
 
@@ -637,16 +646,9 @@ VectorPtr fuzzConstantPrimitiveImpl(
     const VectorFuzzer::Options& opts) {
   using TCpp = typename TypeTraits<kind>::NativeType;
   if constexpr (std::is_same_v<TCpp, StringView>) {
-    std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
     std::string buf;
     auto stringView = randString(
-        rng,
-        opts,
-        buf,
-        converter,
-        opts.enableStringIncrementalGeneration,
-        "",
-        0);
+        rng, opts, buf, opts.enableStringIncrementalGeneration, "", 0);
 
     return std::make_shared<ConstantVector<TCpp>>(
         pool, size, false, type, std::move(stringView));
@@ -676,8 +678,6 @@ void fuzzFlatPrimitiveImpl(
 
   auto flatVector = vector->as<TFlat>();
   std::string strBuf;
-
-  std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> converter;
 
   // Randomly generate a reusable part (substring) to prepare for incremental
   // string generation.
@@ -722,7 +722,6 @@ void fuzzFlatPrimitiveImpl(
               rng,
               opts,
               strBuf,
-              converter,
               doStringIncrementalGeneration,
               reusablePartBuffer,
               reusablePartLength);
@@ -1268,7 +1267,7 @@ VectorPtr VectorFuzzer::normalizeMapKeys(
       vector_size_t idx = rawOffsets[i] + j;
       uint64_t hash = keys->hashValueAt(idx);
 
-      // If we find the same hash (either same key value or hash colision), we
+      // If we find the same hash (either same key value or hash collision), we
       // cut it short by reducing this element's map size. This should not
       // happen frequently.
       auto it = set.find(hash);

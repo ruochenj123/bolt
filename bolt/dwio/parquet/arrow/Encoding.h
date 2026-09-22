@@ -42,6 +42,7 @@
 #include "bolt/dwio/parquet/arrow/Exception.h"
 #include "bolt/dwio/parquet/arrow/Platform.h"
 #include "bolt/dwio/parquet/arrow/Types.h"
+#include "dwio/common/exception/Exceptions.h"
 
 namespace arrow {
 
@@ -187,6 +188,10 @@ class Encoder {
   virtual std::shared_ptr<::arrow::Buffer> FlushValues() = 0;
   virtual Encoding::type encoding() const = 0;
 
+  virtual void testSinkResize0() {
+    BOLT_UNREACHABLE();
+  }
+
   virtual void Put(const ::arrow::Array& values) = 0;
 
   virtual ::arrow::MemoryPool* memory_pool() const = 0;
@@ -240,7 +245,7 @@ class DictEncoder : virtual public TypedEncoder<DType> {
   /// bytes. Use EstimatedDataEncodedSize() to size buffer.
   virtual int WriteIndices(uint8_t* buffer, int buffer_len) = 0;
 
-  virtual int dict_encoded_size() const = 0;
+  virtual int64_t dict_encoded_size() const = 0;
 
   virtual int bit_width() const = 0;
 

@@ -43,6 +43,12 @@
 #endif
 namespace bytedance::bolt::core {
 
+/// Direct access to HashTable from HashJoinNode would introduce a dependency
+/// cycle. We resolved this by defining an OpaqueHashTable interface,
+/// effectively decoupling the node logic from the specific table
+/// implementation.
+struct OpaqueHashTable;
+
 typedef std::string PlanNodeId;
 
 /**
@@ -538,13 +544,8 @@ class TableScanNode : public PlanNode {
     rowCount_ = rowCount;
   }
 
-  // Make sure call existRowCount before call getRowCount
-  uint64_t getRowCount() const {
-    return rowCount_.value();
-  }
-
-  bool existRowCount() const {
-    return rowCount_.has_value();
+  int64_t getRowCount() const {
+    return rowCount_;
   }
 
   folly::dynamic serialize() const override;
@@ -559,7 +560,7 @@ class TableScanNode : public PlanNode {
   const std::
       unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
           assignments_;
-  std::optional<uint64_t> rowCount_;
+  int64_t rowCount_ = 0;
 };
 
 using TableScanNodePtr = std::shared_ptr<const TableScanNode>;
@@ -1146,6 +1147,10 @@ class LocalMergeNode : public PlanNode {
     return "LocalMerge";
   }
 
+  bool canSpill(const QueryConfig& queryConfig) const override {
+    return !sortingKeys_.empty() && queryConfig.localMergeSpillEnabled();
+  }
+
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
@@ -1700,7 +1705,10 @@ class HashJoinNode : public AbstractJoinNode {
       TypedExprPtr filter,
       PlanNodePtr left,
       PlanNodePtr right,
-      RowTypePtr outputType)
+      RowTypePtr outputType,
+      bool useHashTableCache = false,
+      bool joinHasNullKeys = false,
+      std::shared_ptr<OpaqueHashTable> reusableHashTable = nullptr)
       : AbstractJoinNode(
             id,
             joinType,
@@ -1710,7 +1718,10 @@ class HashJoinNode : public AbstractJoinNode {
             std::move(left),
             std::move(right),
             std::move(outputType)),
-        nullAware_{nullAware} {
+        nullAware_{nullAware},
+        useHashTableCache_{useHashTableCache},
+        joinHasNullKeys_{joinHasNullKeys},
+        reusableHashTable_(std::move(reusableHashTable)) {
     if (nullAware) {
       BOLT_USER_CHECK(
           isNullAwareSupported(joinType),
@@ -1769,6 +1780,27 @@ class HashJoinNode : public AbstractJoinNode {
     return nullAware_;
   }
 
+  /// Returns whether hash table caching is enabled for broadcast joins.
+  /// Only used by Presto-on-Spark.
+  bool useHashTableCache() const {
+    return useHashTableCache_;
+  }
+
+  bool joinHasNullKeys() const {
+    return joinHasNullKeys_;
+  }
+
+  std::shared_ptr<OpaqueHashTable> reusableHashTable() const {
+    return reusableHashTable_;
+  }
+
+  /// For tests only.
+  void setReusableHashTable(
+      std::shared_ptr<OpaqueHashTable> reusableHashTable) const {
+    reusableHashTable_ = std::move(reusableHashTable);
+    useHashTableCache_ = true;
+  }
+
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
@@ -1777,6 +1809,9 @@ class HashJoinNode : public AbstractJoinNode {
   void addDetails(std::stringstream& stream) const override;
 
   const bool nullAware_;
+  mutable bool useHashTableCache_;
+  const bool joinHasNullKeys_;
+  mutable std::shared_ptr<OpaqueHashTable> reusableHashTable_;
 };
 
 /// Represents inner/outer/semi/anti merge joins. Translates to an
@@ -1999,6 +2034,15 @@ class OrderByNode : public PlanNode {
         sortingKeys.size(),
         sortingOrders.size(),
         "Number of sorting keys and sorting orders in OrderBy must be the same");
+    // Reject duplicate sorting keys.
+    std::unordered_set<std::string> uniqueKeys;
+    for (const auto& sortKey : sortingKeys) {
+      BOLT_USER_CHECK_NOT_NULL(sortKey, "Sorting key cannot be null");
+      BOLT_USER_CHECK(
+          uniqueKeys.insert(sortKey->name()).second,
+          "Duplicate sorting keys are not allowed: {}",
+          sortKey->name());
+    }
   }
 
   const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {

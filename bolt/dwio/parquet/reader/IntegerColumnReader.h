@@ -31,6 +31,7 @@
 #pragma once
 
 #include "bolt/dwio/common/SelectiveIntegerColumnReader.h"
+#include "bolt/dwio/parquet/reader/ParquetReaderCast.h"
 namespace bytedance::bolt::parquet {
 
 class IntegerColumnReader : public dwio::common::SelectiveIntegerColumnReader {
@@ -46,13 +47,20 @@ class IntegerColumnReader : public dwio::common::SelectiveIntegerColumnReader {
             scanSpec,
             std::move(fileType)) {
     switch (requestedType->type()->kind()) {
-      case TypeKind::VARCHAR:
+      case TypeKind::VARCHAR: {
+        makeCastExpr(fileType_->type()->isDate() ? INTEGER() : nullptr);
+        break;
+      }
       case TypeKind::VARBINARY: {
         makeCastExpr();
         break;
       }
       default:
         break;
+    }
+    if (params.disableFloatingPointToVarcharMetadataFilter() &&
+        isReaderCastFilterMismatch(fileType_->type(), requestedType->type())) {
+      formatData_->as<ParquetData>().disableTypeDependentMetadataFilters();
     }
   }
 
@@ -76,22 +84,7 @@ class IntegerColumnReader : public dwio::common::SelectiveIntegerColumnReader {
     return numValues;
   }
 
-  void getValues(const RowSet& rows, VectorPtr* result) override {
-    bool needConvertion = (castExprSet_ && castExprSet_->size() != 0);
-    auto& requestedType = needConvertion ? fileType_->type() : requestedType_;
-    auto& fileType = static_cast<const ParquetTypeWithId&>(*fileType_);
-    auto logicalType = fileType.logicalType_;
-    if (logicalType.has_value() && logicalType.value().__isset.INTEGER &&
-        !logicalType.value().INTEGER.isSigned) {
-      getUnsignedIntValues(rows, requestedType, result);
-    } else {
-      getIntValues(rows, requestedType, result);
-    }
-
-    if (needConvertion) {
-      doCastEvaluate(result);
-    }
-  }
+  void getValues(const RowSet& rows, VectorPtr* result) override;
 
   void read(
       int64_t offset,

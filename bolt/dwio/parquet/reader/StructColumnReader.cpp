@@ -51,9 +51,18 @@ StructColumnReader::StructColumnReader(
           fileType,
           params,
           scanSpec) {
-  auto& childSpecs = scanSpec_->stableChildren();
+  if (fileType->isDCMap() || fileType->type()->isVariant()) {
+    // scanSpec for DCMap is a map, but we read it as a Struct.
+    // scanSpec for Variant is a primitive, but we read it as a Struct.
+    // manually add Struct type to scanSpec.
+    // remove children from previous fileType or original Map type
+    // which may not be applicable to current fileType
+    scanSpec_->removeAllChildFields();
+    scanSpec_->addAllChildFields(*(fileType->type()));
+  }
   const bool useColumnNames =
       columnReaderOptions.useColumnNamesForColumnMapping_;
+  const auto& childSpecs = scanSpec_->stableChildren();
   std::vector<column_index_t> missingFields;
   for (int i = childSpecs.size() - 1; i >= 0; --i) {
     auto childSpec = childSpecs[i];
@@ -79,7 +88,9 @@ StructColumnReader::StructColumnReader(
       continue;
     }
     auto childFileType = fileType_->childByName(fieldName);
-    auto childRequestedType = requestedType_->childByName(fieldName);
+    auto childRequestedType = childFileType->isDCMap()
+        ? fileType_->childByName(fieldName)
+        : requestedType_->childByName(fieldName);
     addChild(ParquetColumnReader::build(
         columnReaderOptions,
         childRequestedType,
@@ -161,6 +172,23 @@ StructColumnReader::findBestLeaf() {
   return best;
 }
 
+namespace {
+void releaseRowGroupReaderRecursive(
+    dwio::common::SelectiveColumnReader* reader) {
+  reader->scanState().clear();
+  reader->formatData().as<ParquetData>().releaseRowGroupReader();
+  for (auto* child : reader->children()) {
+    if (child != nullptr) {
+      releaseRowGroupReaderRecursive(child);
+    }
+  }
+}
+} // namespace
+
+void StructColumnReader::releaseRowGroupReader() {
+  releaseRowGroupReaderRecursive(this);
+}
+
 void StructColumnReader::read(
     int64_t offset,
     const RowSet& rows,
@@ -240,19 +268,38 @@ void StructColumnReader::setNullsFromRepDefs(PageReader& pageReader) {
     return;
   }
   auto repDefRange = pageReader.repDefRange();
-  int32_t numRepDefs = repDefRange.second - repDefRange.first;
-  dwio::common::ensureCapacity<uint64_t>(
-      nullsInReadRange_, bits::nwords(numRepDefs), &memoryPool_);
-  auto numStructs = pageReader.getLengthsAndNulls(
+  int32_t numRepDefs = pageReader.repDefOutputSize(levelMode_, levelInfo_);
+  auto bits = prepareRepDefNulls(numRepDefs);
+  bits.values_read = pageReader.getLengthsAndNulls(
       levelMode_,
       levelInfo_,
       repDefRange.first,
       repDefRange.second,
       numRepDefs,
       nullptr,
-      nullsInReadRange()->asMutable<uint64_t>(),
+      reinterpret_cast<uint64_t*>(bits.valid_bits),
       0);
-  formatData_->as<ParquetData>().setNulls(nullsInReadRange(), numStructs);
+  setNullsFromRepDefOutput(bits);
+}
+
+arrow::ValidityBitmapInputOutput StructColumnReader::prepareRepDefNulls(
+    int32_t maxItems) {
+  dwio::common::ensureCapacity<uint64_t>(
+      nullsInReadRange_, bits::nwords(maxItems), &memoryPool_);
+  arrow::ValidityBitmapInputOutput output;
+  output.values_read_upper_bound = maxItems;
+  output.values_read = 0;
+  output.null_count = 0;
+  output.valid_bits =
+      reinterpret_cast<uint8_t*>(nullsInReadRange_->asMutable<uint64_t>());
+  output.valid_bits_offset = 0;
+  return output;
+}
+
+void StructColumnReader::setNullsFromRepDefOutput(
+    const arrow::ValidityBitmapInputOutput& bits) {
+  formatData_->as<ParquetData>().setNulls(
+      nullsInReadRange(), static_cast<int32_t>(bits.values_read));
 }
 
 void StructColumnReader::filterRowGroups(

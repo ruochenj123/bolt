@@ -29,8 +29,11 @@
  */
 
 #pragma once
-
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+#include <arm_sve.h>
+#endif
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -47,9 +50,13 @@
 #include <folly/Conv.h>
 #include <folly/Range.h>
 #include <folly/String.h>
+#include <folly/lang/Bits.h>
+#include <folly/small_vector.h>
 
 #include "bolt/common/base/Exceptions.h"
+#include "bolt/common/base/SimdUtil.h"
 #include "bolt/functions/lib/string/RegexUtils.h"
+#include "bolt/functions/lib/string/SparkLower.h"
 #include "bolt/type/StringView.h"
 
 #if (ENABLE_VECTORIZATION > 0) && !defined(_DEBUG) && !defined(DEBUG)
@@ -84,7 +91,42 @@ static utf8proc_bool utf8proc_char_first_byte(const char* u_input);
 static utf8proc_int32_t utf8proc_codepoint_length(utf8proc_int32_t uc);
 
 FOLLY_ALWAYS_INLINE bool isAscii(const char* str, size_t length) {
-  for (auto i = 0; i < length; i++) {
+  size_t i = 0;
+#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
+  const size_t sveVectorSize = svcntb();
+  const svuint8_t v80 = svdup_u8(0x80);
+  const svbool_t pg = svptrue_b8();
+  for (; i + sveVectorSize <= length; i += sveVectorSize) {
+    svuint8_t v = svld1_u8(pg, reinterpret_cast<const uint8_t*>(str) + i);
+    if (svptest_any(pg, svcmpge(pg, v, v80))) {
+      return false;
+    }
+  }
+#elif defined(__x86_64__) || defined(_M_X64)
+  const auto mask = xsimd::broadcast<uint8_t>(0x80);
+  for (; i + mask.size <= length; i += mask.size) {
+    const auto batch =
+        xsimd::load_unaligned(reinterpret_cast<const uint8_t*>(str) + i);
+#if XSIMD_WITH_AVX && !XSIMD_WITH_AVX512F && !XSIMD_WITH_AVX512CD && \
+    !XSIMD_WITH_AVX512DQ && !XSIMD_WITH_AVX512BW
+    // for avx, only one instruction
+    if (!_mm256_testz_si256(batch, mask)) {
+#else
+    // general impl for sse / avx512
+    if (xsimd::any(batch >= mask)) {
+#endif
+      return false;
+    }
+  }
+#endif
+  constexpr uint64_t kAsciiMask64 = 0x8080808080808080ULL;
+  for (; i + sizeof(uint64_t) <= length; i += sizeof(uint64_t)) {
+    const auto word = folly::loadUnaligned<uint64_t>(str + i);
+    if ((word & kAsciiMask64) != 0) {
+      return false;
+    }
+  }
+  for (; i < length; ++i) {
     if (str[i] & 0x80) {
       return false;
     }
@@ -545,8 +587,8 @@ FOLLY_ALWAYS_INLINE static int64_t findNthInstanceCharIndexFromStart(
 
 /// Replace replaced with replacement in inputString and write results in
 /// outputString. If inPlace=true inputString and outputString are assumed to
-/// tbe the same. When replaced is empty and ignoreEmptyReplaced is false,
-/// replacement is added before and after each charecter. When replaced is
+/// the same. When replaced is empty and ignoreEmptyReplaced is false,
+/// replacement is added before and after each character. When replaced is
 /// empty and ignoreEmptyReplaced is true, the result is the inputString value.
 /// When inputString is empty results is empty.
 /// replace("", "", "x") = ""
@@ -661,7 +703,7 @@ inline static size_t replace(
 
 /// Given a utf8 string, a starting position and length returns the
 /// corresponding underlying byte range [startByteIndex, endByteIndex).
-/// Byte indicies starts from 0, UTF8 character positions starts from 1.
+/// Byte indices starts from 0, UTF8 character positions starts from 1.
 /// If a bad unicode byte is encountered, then we skip that bad byte and
 /// count that as one codepoint.
 template <bool isAscii>
@@ -707,7 +749,11 @@ static std::string codepointToUtf16SurrogatePairs(uint32_t codepoint) {
 
   // Format the surrogate pairs into the buffer using snprintf
   snprintf(
-      buffer, sizeof(buffer), "\\u%04X\\u%04X", highSurrogate, lowSurrogate);
+      buffer,
+      sizeof(buffer),
+      "\\u%04X\\u%04X",
+      static_cast<uint16_t>(highSurrogate),
+      static_cast<uint16_t>(lowSurrogate));
 
   // Create a string from the buffer
   return std::string(buffer);
@@ -984,7 +1030,7 @@ FOLLY_ALWAYS_INLINE static const icu::Locale& getDefaultLocale() {
   return locale;
 }
 
-template <bool isAscii = true>
+template <bool isAscii = true, bool sparkCompatible = false>
 FOLLY_ALWAYS_INLINE static std::string toLower(
     const char* str,
     size_t length,
@@ -1010,31 +1056,43 @@ FOLLY_ALWAYS_INLINE static std::string toLower(
   }
   icu::UnicodeString unicodeStr =
       icu::UnicodeString::fromUTF8({str, static_cast<int32_t>(length)});
+  if constexpr (sparkCompatible) {
+    const auto firstSigmaOffset = unicodeStr.indexOf(0x03A3);
+    if (firstSigmaOffset >= 0) {
+      folly::small_vector<int32_t, 4> sigmaOffsets;
+      auto sigmaOffset = firstSigmaOffset;
+      do {
+        sigmaOffsets.push_back(sigmaOffset);
+        sigmaOffset = unicodeStr.indexOf(0x03A3, sigmaOffset + 1);
+      } while (sigmaOffset >= 0);
+      spark::adjustJavaSigmaInPlace(unicodeStr, sigmaOffsets);
+    }
+  }
   unicodeStr.toLower(locale);
   result.clear();
   unicodeStr.toUTF8String(result);
   return result;
 }
 
-template <bool isAscii = true>
+template <bool isAscii = true, bool sparkCompatible = false>
 FOLLY_ALWAYS_INLINE static std::string toLower(
     const std::string& str,
     const icu::Locale& locale = getDefaultLocale()) {
-  return toLower<isAscii>(str.data(), str.size(), locale);
+  return toLower<isAscii, sparkCompatible>(str.data(), str.size(), locale);
 }
 
-template <bool isAscii = true>
+template <bool isAscii = true, bool sparkCompatible = false>
 FOLLY_ALWAYS_INLINE static std::string toLower(
     const std::string_view& str,
     const icu::Locale& locale = getDefaultLocale()) {
-  return toLower<isAscii>(str.data(), str.size(), locale);
+  return toLower<isAscii, sparkCompatible>(str.data(), str.size(), locale);
 }
 
-template <bool isAscii = true>
+template <bool isAscii = true, bool sparkCompatible = false>
 FOLLY_ALWAYS_INLINE static std::string toLower(
     const StringView& str,
     const icu::Locale& locale = getDefaultLocale()) {
-  return toLower<isAscii>(str.data(), str.size(), locale);
+  return toLower<isAscii, sparkCompatible>(str.data(), str.size(), locale);
 }
 
 template <bool isAscii = true>
@@ -1178,8 +1236,8 @@ utf8proc_codepoint(const char* u_input, const char* end, utf8proc_int32_t* sz) {
 
 /// Return the size in bytes for the char pointed to by u_input.
 /// This function is not part of the original utf8proc, it is a simplified
-/// verion of utf8proc_codepoint. It assumes a valid utf8 input otherwise output
-/// is undefined.
+/// version of utf8proc_codepoint. It assumes a valid utf8 input otherwise
+/// output is undefined.
 FOLLY_ALWAYS_INLINE utf8proc_int32_t utf8proc_char_length(const char* u_input) {
   const unsigned char* u = (const unsigned char*)u_input;
   unsigned char u0 = u[0];
@@ -1213,7 +1271,7 @@ utf8proc_char_first_byte(const char* u_input) {
 
 /// Return the size in bytes for the char represented by the input code point.
 /// The output is not undefined if uc is invalid. Its implemented to match
-/// the space writen by utf8proc_encode_char for invalid inputs case.
+/// the space written by utf8proc_encode_char for invalid inputs case.
 FOLLY_ALWAYS_INLINE utf8proc_int32_t
 utf8proc_codepoint_length(utf8proc_int32_t uc) {
   if (uc < 0x00) {

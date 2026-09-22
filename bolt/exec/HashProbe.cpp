@@ -81,8 +81,8 @@ RowTypePtr makeTableType(
 
 // Copy values from 'rows' of 'table' according to 'projections' in
 // 'result'. Reuses 'result' children where possible.
-// 'allowSorting': If false, disables sorting even if the hybridData supports it.
-// This is needed when the caller also has probe-side columns that won't be
+// 'allowSorting': If false, disables sorting even if the hybridData supports
+// it. This is needed when the caller also has probe-side columns that won't be
 // reordered - we must keep build-side and probe-side in the same order.
 void extractColumns(
     BaseHashTable* table,
@@ -333,7 +333,7 @@ void HashProbe::setupSpillRestorForRangePartition(
     matchFlagType_ = ROW({"col_matchflag"}, {BOOLEAN()});
   }
   // if this is the last range partition, set reuseSpillReader_ to false
-  // since next parition should be normal hash partition
+  // since next partition should be normal hash partition
   bool isLastOne = restoredPartitionId->isLastSubRangePartition();
   reuseSpillReader_ = !isLastOne;
   probeRangePartition_ = true;
@@ -851,7 +851,7 @@ void HashProbe::addInput(RowVectorPtr input) {
 }
 
 void HashProbe::prepareOutput(vector_size_t size) {
-  // Try to re-use memory for the output vectors that contain build-side data.
+  // Try to reuse memory for the output vectors that contain build-side data.
   // We expect output vectors containing probe-side data to be null (reset in
   // clearProjectedOutput(). BaseVector::prepareForReuse keeps null
   // children unmodified and makes non-null (build side) children reusable.
@@ -972,7 +972,8 @@ void HashProbe::fillOutput(vector_size_t size) {
       // get dictionary raw value
       RowVectorPtr dictOutput = std::static_pointer_cast<RowVector>(
           BaseVector::create(outputType_, numDistinct, pool()));
-      // Disable sorting when there are probe columns to keep build and probe in sync.
+      // Disable sorting when there are probe columns to keep build and probe in
+      // sync.
       const bool hasProbeColumns = !projectedInputColumns_.empty();
       extractColumns(
           table_.get(),
@@ -994,7 +995,8 @@ void HashProbe::fillOutput(vector_size_t size) {
             size, indexBuffer, dictOutput->childAt(projection.outputChannel));
       }
     } else {
-      // Disable sorting when there are probe columns to keep build and probe in sync.
+      // Disable sorting when there are probe columns to keep build and probe in
+      // sync.
       const bool hasProbeColumns = !projectedInputColumns_.empty();
       extractColumns(
           table_.get(),
@@ -1637,7 +1639,7 @@ RowVectorPtr HashProbe::getOutput() {
   }
 }
 
-void HashProbe::fillFilterInput(vector_size_t size) {
+RowVectorPtr HashProbe::fillFilterInput(vector_size_t size) {
   std::vector<VectorPtr> filterColumns(filterInputType_->size());
   for (auto projection : filterInputProjections_) {
     if (std::any_of(
@@ -1677,11 +1679,12 @@ void HashProbe::fillFilterInput(vector_size_t size) {
       filterColumns,
       /*allowSorting=*/false);
 
-  filterInput_ = std::make_shared<RowVector>(
+  return std::make_shared<RowVector>(
       pool(), filterInputType_, nullptr, size, std::move(filterColumns));
 }
 
 void HashProbe::prepareFilterRowsForNullAwareJoin(
+    const RowVector* filterInput,
     vector_size_t numRows,
     bool filterPropagateNulls) {
   BOLT_CHECK_LE(numRows, kBatchSize);
@@ -1690,12 +1693,21 @@ void HashProbe::prepareFilterRowsForNullAwareJoin(
         BaseVector::create<RowVector>(filterInputType_, kBatchSize, pool());
   }
 
+  if (FOLLY_UNLIKELY(!filterInputRows_.hasSelections())) {
+    BOLT_CHECK_NULL(filterInput);
+    if (filterPropagateNulls) {
+      nullFilterInputRows_.resizeFill(numRows, false);
+    }
+    return;
+  }
+  BOLT_CHECK_NOT_NULL(filterInput);
+
   if (filterPropagateNulls) {
     nullFilterInputRows_.resizeFill(numRows, false);
     auto* rawNullRows = nullFilterInputRows_.asMutableRange().bits();
     for (auto& projection : filterInputProjections_) {
       filterInputColumnDecodedVector_.decode(
-          *filterInput_->childAt(projection.outputChannel), filterInputRows_);
+          *filterInput->childAt(projection.outputChannel), filterInputRows_);
       if (filterInputColumnDecodedVector_.mayHaveNulls()) {
         SelectivityVector nullsInActiveRows(numRows);
         memcpy(
@@ -1778,7 +1790,8 @@ void HashProbe::applyFilterOnTableRowsForNullAwareJoin(
 
       // For single container, extract directly without sorting.
       // For multiple containers, sort by containerId for better cache locality.
-      // const bool useSorting = hybridData->shouldUseSorting();
+      // Never reorder here: the filter result is consumed in 'data' order,
+      // so the extracted build columns must stay aligned with it.
       const bool useSorting = false;
       const char* const* extractRows = data;
       std::vector<HybridRowId>* extractRowIds = &outputRowIds;
@@ -1925,16 +1938,20 @@ int32_t HashProbe::evalFilter(int32_t numRows) {
     filterInputRows_.updateBounds();
   }
 
-  fillFilterInput(numRows);
+  if (FOLLY_LIKELY(filterInputRows_.hasSelections())) {
+    auto filterInput = fillFilterInput(numRows);
+    if (nullAware_) {
+      prepareFilterRowsForNullAwareJoin(
+          filterInput.get(), numRows, filterPropagateNulls);
+    }
 
-  if (nullAware_) {
-    prepareFilterRowsForNullAwareJoin(numRows, filterPropagateNulls);
+    EvalCtx evalCtx(operatorCtx_->execCtx(), filter_.get(), filterInput.get());
+    filter_->eval(0, 1, true, filterInputRows_, evalCtx, filterResult_);
+
+    decodedFilterResult_.decode(*filterResult_[0], filterInputRows_);
+  } else if (nullAware_) {
+    prepareFilterRowsForNullAwareJoin(nullptr, numRows, filterPropagateNulls);
   }
-
-  EvalCtx evalCtx(operatorCtx_->execCtx(), filter_.get(), filterInput_.get());
-  filter_->eval(0, 1, true, filterInputRows_, evalCtx, filterResult_);
-
-  decodedFilterResult_.decode(*filterResult_[0], filterInputRows_);
 
   int32_t numPassed = 0;
   if (isLeftJoin(joinType_) || isFullJoin(joinType_)) {
@@ -2282,7 +2299,7 @@ void HashProbe::mergeAndSpillProbeMatchFlags() {
 void HashProbe::resetHashTable() {
   // [morsel] Under morsel-driven mode, not all drivers for a pipeline are
   // created at init phase, and the actual number of drivers might change
-  // dynamicly. Therefore, we cannot reset hash table once one hashProbe
+  // dynamically. Therefore, we cannot reset hash table once one hashProbe
   // operator finishes. Otherwise, the task might hang.
   if (operatorCtx_->task()->numDrivers(operatorCtx_->driverCtx()) == 1 &&
       isFinished() &&

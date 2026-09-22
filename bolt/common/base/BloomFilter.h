@@ -41,7 +41,7 @@
 #include <xxhash.h>
 namespace bytedance::bolt {
 // BloomFilter filter with groups of 64 bits, of which 4 are set. The hash
-// number has 4 6 bit fields that selct the bits in the word and the
+// number has 4 6 bit fields that select the bits in the word and the
 // remaining bits select the word in the filter. With 8 bits per
 // expected entry, we get ~2% false positives. 'hashInput' determines
 // if the value added or checked needs to be hashed. If this is false,
@@ -75,6 +75,20 @@ class BloomFilter {
   // folly::hasher<InputType>()(value).
   bool mayContain(uint64_t value) const {
     return test(bits_.data(), bits_.size(), value);
+  }
+
+  /// Tests an input value directly on a serialized bloom filter.
+  /// For the implementation V1, this API involves no copy of the bloom
+  /// filter data.
+  static bool mayContain(const char* serializedBloom, uint64_t value) {
+    common::InputByteStream stream(serializedBloom);
+    const auto version = stream.read<int8_t>();
+    BOLT_USER_CHECK_EQ(kBloomFilterV1, version);
+    const auto size = stream.read<int32_t>();
+    BOLT_USER_CHECK_GT(size, 0);
+    const uint64_t* bloomBits =
+        reinterpret_cast<const uint64_t*>(serializedBloom + stream.offset());
+    return test(bloomBits, size, value);
   }
 
   void merge(const char* serialized) {
@@ -145,7 +159,7 @@ class BloomFilter {
     return mask == (bloom[index] & mask);
   }
 
-  const int8_t kBloomFilterV1 = 1;
+  static constexpr int8_t kBloomFilterV1 = 1;
   std::vector<uint64_t, Allocator> bits_;
 };
 

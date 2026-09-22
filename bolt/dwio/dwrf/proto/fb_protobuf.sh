@@ -26,10 +26,9 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-
 set -e
 
 (
-    "${PROTOC:-protoc}" dwrf_schema.proto --cpp_out="$INSTALL_DIR"
-    "${PROTOC:-protoc}" orc_schema.proto --cpp_out="$INSTALL_DIR"
+  "${PROTOC:-protoc}" dwrf_schema.proto --cpp_out="$INSTALL_DIR"
+  "${PROTOC:-protoc}" orc_schema.proto --cpp_out="$INSTALL_DIR"
 )

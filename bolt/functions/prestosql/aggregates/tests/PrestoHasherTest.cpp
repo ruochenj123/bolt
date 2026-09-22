@@ -34,6 +34,9 @@
 #include "bolt/functions/prestosql/types/TimestampWithTimeZoneType.h"
 #include "bolt/type/tz/TimeZoneMap.h"
 #include "bolt/vector/tests/utils/VectorTestBase.h"
+
+using bytedance::bolt::test::emptyArray;
+
 namespace bytedance::bolt::aggregate::test {
 template <typename T>
 using limits = std::numeric_limits<T>;
@@ -305,7 +308,7 @@ TEST_F(PrestoHasherTest, arrays) {
        {{10, 11}},
        {{12, std::nullopt}},
        std::nullopt,
-       {{}}});
+       emptyArray});
 
   assertHash(
       baseArrayVector,
@@ -332,7 +335,7 @@ TEST_F(PrestoHasherTest, arrays) {
       {{std::nullopt}},
       {{1, 2, 3}},
       {{1024, std::nullopt, -99, -999}},
-      {{}},
+      emptyArray,
       {{std::nullopt, -1}},
   });
 
@@ -410,8 +413,8 @@ TEST_F(PrestoHasherTest, timestampWithTimezone) {
         std::vector<std::optional<int64_t>> timestamps;
         std::vector<std::optional<int16_t>> timeZoneIds;
         auto size = timestampWithTimeZones.size();
-        BufferPtr nulls =
-            AlignedBuffer::allocate<uint64_t>(bits::nwords(size), pool());
+        BufferPtr nulls = AlignedBuffer::allocate<uint64_t>(
+            bits::nwords(static_cast<uint64_t>(size)), pool());
         auto rawNulls = nulls->asMutable<uint64_t>();
         timestamps.reserve(size);
         timeZoneIds.reserve(size);

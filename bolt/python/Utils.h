@@ -37,10 +37,10 @@
 #include "bolt/expression/VectorFunction.h"
 #include "bolt/vector/ComplexVector.h"
 
-namespace facebook::bolt {
+namespace bytedance::bolt {
 class BaseVector;
 using VectorPtr = std::shared_ptr<BaseVector>;
-} // namespace facebook::bolt
+} // namespace bytedance::bolt
 
 namespace bolt::python {
 std::vector<std::shared_ptr<bytedance::bolt::exec::FunctionSignature>>
@@ -82,11 +82,11 @@ ReturnType pyTry(
   }
 }
 
-// Get object name/type  (`__name__') as string with gracefull error
+// Get object name/type  (`__name__') as string with graceful error
 // handling.
 std::string pyTypeStr(const pybind11::object& obj);
 
-// Get object type name (`__class__.__name__') as string with gracefull error
+// Get object type name (`__class__.__name__') as string with graceful error
 // handling.
 std::string pyInstanceTypeStr(const pybind11::object& obj);
 

@@ -25,18 +25,21 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-set(BENCHMARK_DEPENDENCIES_NO_FUNC
-    bolt_functions_test_lib
-    bolt_exec
-    bolt_exec_test_lib
-    gflags::gflags
-    Folly::folly
-    ${FOLLY_BENCHMARK}
-    bolt_benchmark_builder
+set(
+  BENCHMARK_DEPENDENCIES_NO_FUNC
+  bolt_testutils
+  bolt_exec
+  gflags::gflags
+  Folly::folly
+  ${FOLLY_BENCHMARK}
+  bolt_benchmark_builder
 )
 
-set(BENCHMARK_DEPENDENCIES bolt_functions_prestosql bolt_functions_lib bolt_vector_fuzzer
-                           ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+set(
+  BENCHMARK_DEPENDENCIES
+  bolt_functions_prestosql
+  bolt_functions_lib
+  ${BENCHMARK_DEPENDENCIES_NO_FUNC}
 )
 
 add_executable(bolt_functions_prestosql_benchmarks_array_contains ArrayContainsBenchmark.cpp)
@@ -60,7 +63,8 @@ add_executable(
   StringAsciiUTFFunctionBenchmarks.cpp
 )
 target_link_libraries(
-  bolt_functions_prestosql_benchmarks_string_ascii_utf_functions ${BENCHMARK_DEPENDENCIES}
+  bolt_functions_prestosql_benchmarks_string_ascii_utf_functions
+  ${BENCHMARK_DEPENDENCIES}
 )
 
 add_executable(bolt_functions_prestosql_benchmarks_not NotBenchmark.cpp)
@@ -86,130 +90,150 @@ target_link_libraries(bolt_functions_benchmarks_compare ${BENCHMARK_DEPENDENCIES
 
 add_executable(bolt_benchmark_array_writer_with_nulls ArrayWriterBenchmark.cpp)
 target_compile_definitions(bolt_benchmark_array_writer_with_nulls PUBLIC WITH_NULLS=true)
-target_link_libraries(bolt_benchmark_array_writer_with_nulls ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+target_link_libraries(
+  bolt_benchmark_array_writer_with_nulls
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_benchmark_array_writer_no_nulls ArrayWriterBenchmark.cpp)
-target_link_libraries(bolt_benchmark_array_writer_no_nulls ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+target_link_libraries(
+  bolt_benchmark_array_writer_no_nulls
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 target_compile_definitions(bolt_benchmark_array_writer_no_nulls PUBLIC WITH_NULLS=false)
 
 add_executable(bolt_benchmark_nested_array_writer_no_nulls NestedArrayWriterBenchmark.cpp)
-target_link_libraries(bolt_benchmark_nested_array_writer_no_nulls ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+target_link_libraries(
+  bolt_benchmark_nested_array_writer_no_nulls
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 target_compile_definitions(bolt_benchmark_nested_array_writer_no_nulls PUBLIC WITH_NULLS=false)
 
 add_executable(bolt_benchmark_nested_array_writer_with_nulls NestedArrayWriterBenchmark.cpp)
 target_compile_definitions(bolt_benchmark_nested_array_writer_with_nulls PUBLIC WITH_NULLS=true)
 target_link_libraries(
-  bolt_benchmark_nested_array_writer_with_nulls ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+  bolt_benchmark_nested_array_writer_with_nulls
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
 )
 
 add_executable(bolt_benchmark_map_writer_with_nulls MapWriterBenchmarks.cpp)
 target_compile_definitions(bolt_benchmark_map_writer_with_nulls PUBLIC WITH_NULLS=true)
-target_link_libraries(bolt_benchmark_map_writer_with_nulls ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+target_link_libraries(
+  bolt_benchmark_map_writer_with_nulls
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_benchmark_map_writer_no_nulls MapWriterBenchmarks.cpp)
-target_link_libraries(bolt_benchmark_map_writer_no_nulls ${BENCHMARK_DEPENDENCIES_NO_FUNC})
+target_link_libraries(
+  bolt_benchmark_map_writer_no_nulls
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 target_compile_definitions(bolt_benchmark_map_writer_no_nulls PUBLIC WITH_NULLS=false)
 
 add_executable(bolt_functions_benchmarks_row_writer_no_nulls RowWriterBenchmark.cpp)
 target_link_libraries(
-  bolt_functions_benchmarks_row_writer_no_nulls ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+  bolt_functions_benchmarks_row_writer_no_nulls
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
 )
 
 add_executable(bolt_functions_benchmarks_string_writer_no_nulls StringWriterBenchmark.cpp)
 target_link_libraries(
-  bolt_functions_benchmarks_string_writer_no_nulls ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+  bolt_functions_benchmarks_string_writer_no_nulls
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
 )
 
 add_executable(bolt_functions_prestosql_benchmarks_zip ZipBenchmark.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_zip ${BENCHMARK_DEPENDENCIES})
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_zip
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_functions_prestosql_benchmarks_row Row.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_row ${BENCHMARK_DEPENDENCIES})
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_row
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_functions_prestosql_benchmarks_comparisons ComparisonsBenchmark.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_comparisons ${BENCHMARK_DEPENDENCIES})
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_comparisons
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_functions_prestosql_benchmarks_concat ConcatBenchmark.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_concat ${BENCHMARK_DEPENDENCIES})
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_concat
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_functions_prestosql_benchmarks_zip_with ZipWithBenchmark.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_zip_with ${BENCHMARK_DEPENDENCIES})
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_zip_with
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_functions_prestosql_benchmarks_map_zip_with MapZipWithBenchmark.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_map_zip_with ${BENCHMARK_DEPENDENCIES})
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_map_zip_with
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_functions_prestosql_benchmarks_cardinality CardinalityBenchmark.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_cardinality ${BENCHMARK_DEPENDENCIES})
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_cardinality
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_functions_benchmarks_simdjson_function_with_expr JsonExprBenchmark.cpp)
 target_link_libraries(
-  bolt_functions_benchmarks_simdjson_function_with_expr ${BENCHMARK_DEPENDENCIES}
+  bolt_functions_benchmarks_simdjson_function_with_expr
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
 )
 
 add_executable(bolt_functions_prestosql_benchmarks_map_subscript MapSubscriptCachingBenchmark.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_map_subscript ${BENCHMARK_DEPENDENCIES})
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_map_subscript
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)
 
 add_executable(bolt_functions_prestosql_benchmarks_generic GenericBenchmark.cpp)
-target_link_libraries(bolt_functions_prestosql_benchmarks_generic ${BENCHMARK_DEPENDENCIES})
-
-set_target_properties(bolt_benchmark_map_writer_with_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_benchmark_map_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_benchmarks_row_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_benchmarks_string_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_zip PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_row PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_comparisons PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_concat PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_zip_with PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_map_zip_with PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_cardinality PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_benchmarks_simdjson_function_with_expr PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_map_subscript PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_generic PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_array_contains PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_array_min_max PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_array_position PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_array_sum PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_width_bucket PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_string_ascii_utf_functions PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_not PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_date_time PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_bitwise PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_in PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_prestosql_benchmarks_map_input PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_benchmarks_url PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_functions_benchmarks_compare PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_benchmark_array_writer_with_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_benchmark_array_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_benchmark_nested_array_writer_no_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
-
-set_target_properties(bolt_benchmark_nested_array_writer_with_nulls PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix
+target_link_libraries(
+  bolt_functions_prestosql_benchmarks_generic
+  PRIVATE
+    ${BENCHMARK_DEPENDENCIES_NO_FUNC}
+    ${BENCHMARK_DEPENDENCIES}
+)

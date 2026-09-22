@@ -113,9 +113,6 @@ CompanionSignatures::partialFunctionSignatures(
     const std::vector<AggregateFunctionSignaturePtr>& signatures) {
   std::vector<AggregateFunctionSignaturePtr> partialSignatures;
   for (const auto& signature : signatures) {
-    if (!isResultTypeResolvableGivenIntermediateType(signature)) {
-      continue;
-    }
     std::vector<TypeSignature> usedTypes = signature->argumentTypes();
     usedTypes.push_back(signature->intermediateType());
     auto variables = usedTypeVariables(usedTypes, signature->variables());
@@ -137,10 +134,6 @@ std::string CompanionSignatures::partialFunctionName(const std::string& name) {
 
 AggregateFunctionSignaturePtr CompanionSignatures::mergeFunctionSignature(
     const AggregateFunctionSignaturePtr& signature) {
-  if (!isResultTypeResolvableGivenIntermediateType(signature)) {
-    return nullptr;
-  }
-
   std::vector<TypeSignature> usedTypes = {signature->intermediateType()};
   auto variables = usedTypeVariables(usedTypes, signature->variables());
   return std::make_shared<AggregateFunctionSignature>(
@@ -278,7 +271,7 @@ TypeSignature CompanionSignatures::normalizeTypeImpl(
   if (renamedVariables.count(baseName)) {
     return TypeSignature{renamedVariables[baseName], {}};
   }
-  // Variales to be renamed in consistent manner.
+  // Variables to be renamed in consistent manner.
   if (allVariables.count(baseName)) {
     auto normalizedName = fmt::format("T{}", renamedVariables.size());
     renamedVariables[baseName] = normalizedName;

@@ -178,7 +178,7 @@ struct TypeAnalysisResults {
     }
 
     uint32_t computePriority() {
-      // This assumes we wont have signature longer than 1M argument.
+      // This assumes we won't have signature longer than 1M argument.
       return getRank() * 1000000 - concreteCount;
     }
   } stats;
@@ -189,12 +189,12 @@ struct TypeAnalysisResults {
     } else {
       BOLT_CHECK(
           variable == variablesInformation.at(variable.name()),
-          "Cant assign different properties to the same variable {}",
+          "Can't assign different properties to the same variable {}",
           variable.name());
     }
   }
 
-  // String representaion of the type in the FunctionSignatureBuilder.
+  // String representation of the type in the FunctionSignatureBuilder.
   std::ostringstream out;
 
   // Set of generic variables used in the type.
@@ -227,10 +227,12 @@ std::string strToLowerCopy(const std::string& str);
 template <typename T>
 struct TypeAnalysis {
   void run(TypeAnalysisResults& results) {
-    // This should only handle primitives and OPAQUE.
+    // This should only handle primitives, OPAQUE, and VARIANT.
+    // VARIANT is a composite type physically but a leaf type in signatures.
     static_assert(
         SimpleTypeTrait<T>::isPrimitiveType ||
-        SimpleTypeTrait<T>::typeKind == TypeKind::OPAQUE);
+        SimpleTypeTrait<T>::typeKind == TypeKind::OPAQUE ||
+        SimpleTypeTrait<T>::typeKind == TypeKind::VARIANT);
     results.stats.concreteCount++;
     results.out << detail::strToLowerCopy(
         std::string(SimpleTypeTrait<T>::name));

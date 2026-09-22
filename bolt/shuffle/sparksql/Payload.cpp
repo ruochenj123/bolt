@@ -54,6 +54,7 @@ static const Payload::Mode kRowVectorMode = BlockPayload::kRowVector;
 static constexpr int64_t kZeroLengthBuffer = 0;
 static constexpr int64_t kNullBuffer = -1;
 static constexpr int64_t kUncompressedBuffer = -2;
+static constexpr int64_t kCompressedBufferHeaderLength = 2 * sizeof(int64_t);
 
 using RowSizeType = int32_t;
 static constexpr int32_t kRowSizeBytes = sizeof(RowSizeType);
@@ -133,8 +134,8 @@ arrow::Result<std::tuple<uint32_t, uint8_t>> readRowsAndMode(
 arrow::Result<int64_t> compressBuffer(
     const std::shared_ptr<arrow::Buffer>& buffer,
     uint8_t* output,
-    int64_t outputLength,
-    arrow::util::Codec* codec) {
+    int64_t outputRemainingLength,
+    Codec* codec) {
   auto outputPtr = &output;
   if (!buffer) {
     write<int64_t>(outputPtr, kNullBuffer);
@@ -144,13 +145,13 @@ arrow::Result<int64_t> compressBuffer(
     write<int64_t>(outputPtr, kZeroLengthBuffer);
     return sizeof(int64_t);
   }
-  static const int64_t kCompressedBufferHeaderLength = 2 * sizeof(int64_t);
   auto* compressedLengthPtr = advance<int64_t>(outputPtr);
   write(outputPtr, static_cast<int64_t>(buffer->size()));
-  ARROW_ASSIGN_OR_RAISE(
-      auto compressedLength,
-      codec->Compress(
-          buffer->size(), buffer->data(), outputLength, *outputPtr));
+  auto compressedLength = codec->compress(
+      buffer->data(),
+      buffer->size(),
+      *outputPtr,
+      outputRemainingLength - kCompressedBufferHeaderLength);
   if (compressedLength >= buffer->size()) {
     // Write uncompressed buffer.
     memcpy(*outputPtr, buffer->data(), buffer->size());
@@ -164,7 +165,7 @@ arrow::Result<int64_t> compressBuffer(
 arrow::Status compressAndFlush(
     const std::shared_ptr<arrow::Buffer>& buffer,
     arrow::io::OutputStream* outputStream,
-    arrow::util::Codec* codec,
+    Codec* codec,
     arrow::MemoryPool* pool,
     uint64_t& compressTime,
     uint64_t& writeTime) {
@@ -182,16 +183,19 @@ arrow::Status compressAndFlush(
   int64_t compressedSize = 0;
   {
     bytedance::bolt::NanosecondTimer timer(&compressTime);
-    auto maxCompressedLength =
-        codec->MaxCompressedLen(buffer->size(), buffer->data());
+    auto maxCompressedLength = codec->maxCompressedLen(buffer->size());
     ARROW_ASSIGN_OR_RAISE(
         compressed,
         arrow::AllocateResizableBuffer(
-            sizeof(int64_t) * 2 + maxCompressedLength, pool));
+            kCompressedBufferHeaderLength + maxCompressedLength, pool));
     auto output = compressed->mutable_data();
     ARROW_ASSIGN_OR_RAISE(
         compressedSize,
-        compressBuffer(buffer, output, maxCompressedLength, codec));
+        compressBuffer(
+            buffer,
+            output,
+            kCompressedBufferHeaderLength + maxCompressedLength,
+            codec));
   }
 
   {
@@ -201,11 +205,33 @@ arrow::Status compressAndFlush(
   return arrow::Status::OK();
 }
 
+// Allocates a resizable buffer of logical size `size` with `paddedSize` extra
+// SIMD over-read capacity. When `bufferPool` is provided, the buffer is
+// borrowed from the pool (and reused across batches); otherwise it falls back
+// to a fresh arrow::AllocateResizableBuffer, preserving the original behavior.
+arrow::Result<std::shared_ptr<arrow::Buffer>> allocateColumnBuffer(
+    arrow::MemoryPool* pool,
+    ColumnBufferPool* bufferPool,
+    int64_t size,
+    uint32_t paddedSize) {
+  if (bufferPool != nullptr) {
+    ARROW_ASSIGN_OR_RAISE(auto buffer, bufferPool->allocate(size, paddedSize));
+    return buffer;
+  }
+  ARROW_ASSIGN_OR_RAISE(
+      auto buffer, arrow::AllocateResizableBuffer(size + paddedSize, pool));
+  if (paddedSize > 0) {
+    RETURN_NOT_OK(buffer->Resize(size, false));
+  }
+  return buffer;
+}
+
 arrow::Result<std::shared_ptr<arrow::Buffer>> readUncompressedBuffer(
     arrow::io::InputStream* inputStream,
     ByteBuffer** readAheadBuffer,
     arrow::MemoryPool* pool,
-    const uint32_t paddedSize = 0) {
+    const uint32_t paddedSize = 0,
+    ColumnBufferPool* bufferPool = nullptr) {
   int64_t bufferLength;
   if (*readAheadBuffer) {
     RETURN_NOT_OK(internalReadFromCacheOrStream(
@@ -216,39 +242,30 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> readUncompressedBuffer(
   if (bufferLength == kNullBuffer) {
     return nullptr;
   }
+  ARROW_ASSIGN_OR_RAISE(
+      auto buffer,
+      allocateColumnBuffer(pool, bufferPool, bufferLength, paddedSize));
   if (*readAheadBuffer) {
-    ARROW_ASSIGN_OR_RAISE(
-        auto buffer,
-        arrow::AllocateResizableBuffer(bufferLength + paddedSize, pool));
-    if (paddedSize > 0) {
-      RETURN_NOT_OK(buffer->Resize(bufferLength, false));
-    }
     RETURN_NOT_OK(internalReadFromCacheOrStream(
         inputStream,
         readAheadBuffer,
         bufferLength,
         const_cast<uint8_t*>(buffer->data())));
-    return buffer;
   } else {
-    ARROW_ASSIGN_OR_RAISE(
-        auto buffer,
-        arrow::AllocateResizableBuffer(bufferLength + paddedSize, pool));
-    if (paddedSize > 0) {
-      RETURN_NOT_OK(buffer->Resize(bufferLength, false));
-    }
     RETURN_NOT_OK(
         inputStream->Read(bufferLength, const_cast<uint8_t*>(buffer->data())));
-    return buffer;
   }
+  return buffer;
 }
 
 arrow::Result<std::shared_ptr<arrow::Buffer>> readCompressedBuffer(
     arrow::io::InputStream* inputStream,
-    const std::shared_ptr<arrow::util::Codec>& codec,
+    const std::shared_ptr<Codec>& codec,
     arrow::MemoryPool* pool,
     uint64_t& decompressTime,
     ByteBuffer** readAheadBuffer,
-    const uint32_t paddedSize = 0) { // align to bytedance::bolt::simd::kPadding
+    const uint32_t paddedSize = 0, // align to bytedance::bolt::simd::kPadding
+    ColumnBufferPool* bufferPool = nullptr) {
   int64_t compressedLength;
   if (*readAheadBuffer) {
     RETURN_NOT_OK(internalReadFromCacheOrStream(
@@ -273,10 +290,7 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> readCompressedBuffer(
   if (compressedLength == kUncompressedBuffer) {
     ARROW_ASSIGN_OR_RAISE(
         auto uncompressed,
-        arrow::AllocateResizableBuffer(uncompressedLength + paddedSize, pool));
-    if (paddedSize > 0) {
-      RETURN_NOT_OK(uncompressed->Resize(uncompressedLength, false));
-    }
+        allocateColumnBuffer(pool, bufferPool, uncompressedLength, paddedSize));
     if (*readAheadBuffer) {
       RETURN_NOT_OK(internalReadFromCacheOrStream(
           inputStream,
@@ -290,7 +304,8 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> readCompressedBuffer(
     return uncompressed;
   }
   ARROW_ASSIGN_OR_RAISE(
-      auto compressed, arrow::AllocateBuffer(compressedLength, pool));
+      auto compressed,
+      allocateColumnBuffer(pool, bufferPool, compressedLength, paddedSize));
   if (*readAheadBuffer) {
     RETURN_NOT_OK(internalReadFromCacheOrStream(
         inputStream,
@@ -305,15 +320,12 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> readCompressedBuffer(
   bytedance::bolt::NanosecondTimer timer(&decompressTime);
   ARROW_ASSIGN_OR_RAISE(
       auto output,
-      arrow::AllocateResizableBuffer(uncompressedLength + paddedSize, pool));
-  if (paddedSize > 0) {
-    RETURN_NOT_OK(output->Resize(uncompressedLength, false));
-  }
-  RETURN_NOT_OK(codec->Decompress(
-      compressedLength,
+      allocateColumnBuffer(pool, bufferPool, uncompressedLength, paddedSize));
+  codec->decompress(
       compressed->data(),
-      uncompressedLength,
-      const_cast<uint8_t*>(output->data())));
+      compressedLength,
+      const_cast<uint8_t*>(output->data()),
+      uncompressedLength);
   return output;
 }
 
@@ -346,7 +358,7 @@ std::string Payload::toString() const {
 void BlockPayload::concatBuffer(
     std::vector<std::shared_ptr<arrow::Buffer>>& buffers,
     arrow::MemoryPool* pool,
-    arrow::util::Codec* codec,
+    Codec* codec,
     Payload::Mode& mode,
     bool hasComplexType) {
   auto sourceBuffers = std::move(buffers);
@@ -362,7 +374,7 @@ void BlockPayload::concatBuffer(
       result.status().message());
   std::shared_ptr<arrow::Buffer> lengthBuffer = result.MoveValueUnsafe();
   auto lengthBufferPtr = (int64_t*)lengthBuffer->mutable_data();
-  // caculate length
+  // calculate length
   int64_t originalLength = std::accumulate(
       sourceBuffers.begin(),
       hasComplexType ? sourceBuffers.end() - 1 : sourceBuffers.end(),
@@ -415,7 +427,7 @@ arrow::Result<std::unique_ptr<BlockPayload>> BlockPayload::fromBuffers(
     std::vector<std::shared_ptr<arrow::Buffer>> buffers,
     const std::vector<bool>* isValidityBuffer,
     arrow::MemoryPool* pool,
-    arrow::util::Codec* codec,
+    Codec* codec,
     Payload::Mode mode,
     bool hasComplexType) {
   if (mode == Payload::Mode::kRowVector &&
@@ -441,8 +453,7 @@ arrow::Result<std::unique_ptr<BlockPayload>> BlockPayload::fromBuffers(
             if (!buffer) {
               return sum;
             }
-            return sum +
-                codec->MaxCompressedLen(buffer->size(), buffer->data());
+            return sum + codec->maxCompressedLen(buffer->size());
           });
       const auto maxCompressedLength = metadataLength + totalCompressedLength;
       ARROW_ASSIGN_OR_RAISE(
@@ -552,12 +563,13 @@ arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>>
 BlockPayload::deserialize(
     arrow::io::InputStream* inputStream,
     const std::shared_ptr<arrow::Schema>& schema,
-    const std::shared_ptr<arrow::util::Codec>& codec,
+    const std::shared_ptr<Codec>& codec,
     arrow::MemoryPool* pool,
     uint32_t& numRows,
     uint64_t& decompressTime,
     std::optional<uint8_t>& payloadType,
-    ByteBuffer* readAheadBuffer) {
+    ByteBuffer* readAheadBuffer,
+    ColumnBufferPool* bufferPool) {
   static const std::vector<std::shared_ptr<arrow::Buffer>> kEmptyBuffers{};
   std::tuple<uint32_t, uint8_t> rowsAndMode;
   uint8_t type = payloadType.value();
@@ -575,7 +587,13 @@ BlockPayload::deserialize(
         type != Type::kCompressed,
         arrow::Status::Invalid("RowVector mode payload must be compressed"));
     return deserializeRowVectorModeBuffers(
-        inputStream, codec, pool, numRows, decompressTime, &readAheadBuffer);
+        inputStream,
+        codec,
+        pool,
+        numRows,
+        decompressTime,
+        &readAheadBuffer,
+        bufferPool);
   }
 
   auto fields = schema->fields();
@@ -589,10 +607,15 @@ BlockPayload::deserialize(
           pool,
           decompressTime,
           &readAheadBuffer,
-          bytedance::bolt::simd::kPadding);
+          bytedance::bolt::simd::kPadding,
+          bufferPool);
     } else {
       return readUncompressedBuffer(
-          inputStream, &readAheadBuffer, pool, bytedance::bolt::simd::kPadding);
+          inputStream,
+          &readAheadBuffer,
+          pool,
+          bytedance::bolt::simd::kPadding,
+          bufferPool);
     }
   };
 
@@ -640,11 +663,12 @@ BlockPayload::deserialize(
 arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>>
 BlockPayload::deserializeRowVectorModeBuffers(
     arrow::io::InputStream* inputStream,
-    const std::shared_ptr<arrow::util::Codec>& codec,
+    const std::shared_ptr<Codec>& codec,
     arrow::MemoryPool* pool,
     uint32_t& numRows,
     uint64_t& decompressTime,
-    ByteBuffer** readAheadBuffer) {
+    ByteBuffer** readAheadBuffer,
+    ColumnBufferPool* bufferPool) {
   // lengthBuffer
   std::shared_ptr<arrow::Buffer> lengthBuffer, valueBuffer;
   ARROW_ASSIGN_OR_RAISE(
@@ -664,7 +688,8 @@ BlockPayload::deserializeRowVectorModeBuffers(
           pool,
           decompressTime,
           readAheadBuffer,
-          bytedance::bolt::simd::kPadding));
+          bytedance::bolt::simd::kPadding,
+          bufferPool));
   ARROW_RETURN_IF(
       valueBuffer == nullptr,
       arrow::Status::Invalid(
@@ -679,7 +704,7 @@ BlockPayload::deserializeRowVectorModeBuffers(
       uncompressLength != valueBuffer->size(),
       arrow::Status::Invalid(
           "uncompressLength " + std::to_string(uncompressLength) +
-          " stored in lengthBuffer do not equal actual lenght " +
+          " stored in lengthBuffer do not equal actual length " +
           std::to_string(valueBuffer->size())));
   std::vector<std::shared_ptr<arrow::Buffer>> buffers;
   int64_t bufferOffset = 0;
@@ -727,9 +752,18 @@ arrow::Result<std::unique_ptr<InMemoryPayload>> InMemoryPayload::merge(
     std::unique_ptr<InMemoryPayload> append,
     arrow::MemoryPool* pool,
     int64_t rowvectorModeCompressionMinColumns,
-    int64_t rowvectorModeCompressionMaxBufferSize) {
+    int64_t rowvectorModeCompressionMaxBufferSize,
+    bool sourceBuffersResizable) {
   auto mergedRows = source->numRows() + append->numRows();
   auto isValidityBuffer = source->isValidityBuffer();
+
+  auto asResizable =
+      [sourceBuffersResizable](const std::shared_ptr<arrow::Buffer>& buffer) {
+        if (sourceBuffersResizable) {
+          return std::static_pointer_cast<arrow::ResizableBuffer>(buffer);
+        }
+        return std::dynamic_pointer_cast<arrow::ResizableBuffer>(buffer);
+      };
 
   auto numBuffers = append->numBuffers();
   ARROW_RETURN_IF(
@@ -765,8 +799,7 @@ arrow::Result<std::unique_ptr<InMemoryPayload>> InMemoryPayload::merge(
         // Because sourceBuffer can be resized, need to save buffer size in
         // advance.
         auto sourceBufferSize = sourceBuffer->size();
-        auto resizable =
-            std::dynamic_pointer_cast<arrow::ResizableBuffer>(sourceBuffer);
+        auto resizable = asResizable(sourceBuffer);
         auto mergedBytes = arrow::bit_util::BytesForBits(mergedRows);
         if (resizable) {
           // If source is resizable, resize and reuse source.
@@ -804,8 +837,7 @@ arrow::Result<std::unique_ptr<InMemoryPayload>> InMemoryPayload::merge(
         // advance.
         auto sourceBufferSize = sourceBuffer->size();
         auto mergedSize = sourceBufferSize + appendBuffer->size();
-        auto resizable =
-            std::dynamic_pointer_cast<arrow::ResizableBuffer>(sourceBuffer);
+        auto resizable = asResizable(sourceBuffer);
         if (resizable) {
           // If source is resizable, resize and reuse source.
           RETURN_NOT_OK(resizable->Resize(mergedSize + simd::kPadding));
@@ -842,7 +874,7 @@ arrow::Result<std::unique_ptr<InMemoryPayload>> InMemoryPayload::merge(
 arrow::Result<std::unique_ptr<BlockPayload>> InMemoryPayload::toBlockPayload(
     Payload::Type payloadType,
     arrow::MemoryPool* pool,
-    arrow::util::Codec* codec,
+    Codec* codec,
     bool hasComplexType) {
   return BlockPayload::fromBuffers(
       payloadType,
@@ -893,7 +925,7 @@ UncompressedDiskBlockPayload::UncompressedDiskBlockPayload(
     arrow::io::InputStream*& inputStream,
     uint64_t rawSize,
     arrow::MemoryPool* pool,
-    arrow::util::Codec* codec)
+    Codec* codec)
     : Payload(type, numRows, isValidityBuffer),
       inputStream_(inputStream),
       rawSize_(rawSize),
@@ -992,7 +1024,7 @@ arrow::Status RowBlockPayload::deserialize(
     uint8_t* dst,
     int32_t dstSize,
     int32_t& offset,
-    ZstdStreamCodec* codec,
+    AdaptiveParallelZstdCodec* codec,
     std::vector<std::string_view>& outputRows,
     int32_t& remainingOutputLen,
     bool& eof,

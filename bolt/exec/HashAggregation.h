@@ -36,6 +36,10 @@ namespace bytedance::bolt::exec {
 
 class HashAggregation : public Operator {
  public:
+  /// Number of rows emitted after partial aggregation was abandoned.
+  static constexpr std::string_view kAbandonedPartialAggregationRows =
+      "abandonedPartialAggregationRows";
+
   HashAggregation(
       int32_t operatorId,
       DriverCtx* driverCtx,
@@ -114,7 +118,7 @@ class HashAggregation : public Operator {
   const volatile int32_t abandonPartialAggregationMinPct_;
 
   // Min unique rows pct for partial aggregation when memory usage reaches
-  // maximun. If more than this many rows are unique, the partial aggregation is
+  // maximum. If more than this many rows are unique, the partial aggregation is
   // not worthwhile.
   const volatile int32_t abandonPartialAggregationMinFinalPct_;
 

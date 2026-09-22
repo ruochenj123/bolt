@@ -17,6 +17,7 @@
 #pragma once
 
 #include "bolt/connectors/Connector.h"
+#include "bolt/connectors/ConnectorNames.h"
 #include "bolt/connectors/arrow/ArrowMemoryConnectorSplit.h"
 #include "bolt/vector/arrow/Abi.h"
 #include "bolt/vector/arrow/Bridge.h"
@@ -28,7 +29,7 @@ class ArrowMemoryColumnHandle : public ColumnHandle {
   ArrowMemoryColumnHandle(const std::string& name, const TypePtr& dateType)
       : name_(name), dataType_(dateType) {}
 
-  [[nodiscard]] const std::string& getName() const {
+  const std::string& name() const override {
     return name_;
   }
   [[nodiscard]] const TypePtr& getDataType() const {
@@ -42,12 +43,21 @@ class ArrowMemoryColumnHandle : public ColumnHandle {
 
 class ArrowMemoryTableHandle : public ConnectorTableHandle {
  public:
-  ArrowMemoryTableHandle(std::string connectorId)
-      : ConnectorTableHandle(connectorId) {}
+  explicit ArrowMemoryTableHandle(
+      std::string connectorId,
+      std::string tableName = "")
+      : ConnectorTableHandle(connectorId), tableName_(std::move(tableName)) {}
+
+  const std::string& name() const override {
+    return tableName_;
+  }
 
   std::string toString() const override {
     return fmt::format("Arrow connector: {}", connectorId());
   }
+
+ private:
+  const std::string tableName_;
 };
 
 // Each Arrow table consists at least Arrow split. Each split is made up by at
@@ -140,8 +150,6 @@ class ArrowMemoryConnector : public Connector {
 
 class ArrowMemoryConnectorFactory : public ConnectorFactory {
  public:
-  static constexpr const char* FOLLY_NONNULL kArrowMemoryConnectorName =
-      "arrow-memory";
   ArrowMemoryConnectorFactory() : ConnectorFactory(kArrowMemoryConnectorName) {}
 
   explicit ArrowMemoryConnectorFactory(const char* FOLLY_NONNULL connectorName)

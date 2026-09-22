@@ -16,6 +16,9 @@
 
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/functions/flinksql/tests/FlinkFunctionBaseTest.h"
+
+using bytedance::bolt::test::emptyArray;
+
 namespace bytedance::bolt::functions::flinksql::test {
 
 namespace {
@@ -27,6 +30,11 @@ class JsonFunctionsTest : public FlinkFunctionBaseTest {
     queryCtx_->testingOverrideConfigUnsafe(std::move(config));
   }
 };
+
+TEST_F(JsonFunctionsTest, flinkCompatibleConfigEnabled) {
+  setFlinkCompatible(true);
+  EXPECT_TRUE(queryCtx_->queryConfig().enableFlinkCompatible());
+}
 
 TEST_F(JsonFunctionsTest, jsonStrToMap) {
   auto evaluateExpr = [&](std::optional<StringView> json,
@@ -55,12 +63,23 @@ TEST_F(JsonFunctionsTest, jsonStrToMap) {
       evaluateExpr(
           "{\"a\": \"1\", \"b\": {\"c\" : \"2\"}, \"d\": [\"3\", \"4\"]}"),
       {{{"a", "1"}, {"b", "{\"c\":\"2\"}"}, {"d", "[\"3\",\"4\"]"}}});
-  testJsonStrToMap(evaluateExpr("{}"), {{}});
+  testJsonStrToMap(evaluateExpr("{}"), emptyArray);
   testJsonStrToMap(evaluateExpr("{\"a\": null}"), {{{"a", std::nullopt}}});
+  testJsonStrToMap(evaluateExpr("44"), emptyArray);
+  testJsonStrToMap(evaluateExpr("0"), emptyArray);
+  testJsonStrToMap(evaluateExpr("9223372036854775808"), emptyArray);
+  testJsonStrToMap(evaluateExpr("1e400"), emptyArray);
+  testJsonStrToMap(evaluateExpr("true"), emptyArray);
+  testJsonStrToMap(evaluateExpr("null"), emptyArray);
+  testJsonStrToMap(evaluateExpr("[]"), emptyArray);
+  testJsonStrToMap(evaluateExpr("[1e400, {\"a\": \"b\"}]"), emptyArray);
+  BOLT_ASSERT_THROW(evaluateExpr("[{\"bad\\q\": 1}]"), "STRING_ERROR");
+  BOLT_ASSERT_THROW(evaluateExpr("[1e, {\"a\": \"b\"}]"), "NUMBER_ERROR");
+  testJsonStrToMap(evaluateExpr("\"abc\""), emptyArray);
   BOLT_ASSERT_THROW(
       evaluateExpr("{\"a\": \"1}"), "A string is opened, but never closed");
-  BOLT_ASSERT_THROW(
-      evaluateExpr("abc"), "The JSON element does not have the requested type");
+  BOLT_ASSERT_THROW(evaluateExpr("[1,"), "INCOMPLETE_ARRAY_OR_OBJECT");
+  BOLT_ASSERT_THROW(evaluateExpr("abc"), "improper structure");
   testJsonStrToMap(evaluateExpr("  "), std::nullopt);
   BOLT_ASSERT_THROW(evaluateExpr(std::nullopt), "input is null");
 
@@ -70,19 +89,45 @@ TEST_F(JsonFunctionsTest, jsonStrToMap) {
           "{\"a\": \"1\", \"b\": {\"c\" : \"2\"}, \"d\": [\"3\", \"4\"]}",
           false),
       {{{"a", "1"}, {"b", "{\"c\":\"2\"}"}, {"d", "[\"3\",\"4\"]"}}});
-  testJsonStrToMap(evaluateExpr("{}", true), {{}});
+  testJsonStrToMap(evaluateExpr("{}", true), emptyArray);
   testJsonStrToMap(
       evaluateExpr("{\"a\": null}", true), {{{"a", std::nullopt}}});
+  testJsonStrToMap(evaluateExpr("44", true), emptyArray);
+  testJsonStrToMap(evaluateExpr("0", true), emptyArray);
+  testJsonStrToMap(evaluateExpr("9223372036854775808", true), emptyArray);
+  testJsonStrToMap(evaluateExpr("1e400", true), emptyArray);
+  testJsonStrToMap(evaluateExpr("true", true), emptyArray);
+  testJsonStrToMap(evaluateExpr("null", true), emptyArray);
+  testJsonStrToMap(evaluateExpr("[]", true), emptyArray);
+  testJsonStrToMap(evaluateExpr("[1e400, {\"a\": \"b\"}]", true), emptyArray);
+  testJsonStrToMap(evaluateExpr("[{\"bad\\q\": 1}]", true), std::nullopt);
+  testJsonStrToMap(evaluateExpr("[1e, {\"a\": \"b\"}]", true), std::nullopt);
+  testJsonStrToMap(evaluateExpr("\"abc\"", true), emptyArray);
   testJsonStrToMap(evaluateExpr("{\"a\": \"1}", true), std::nullopt);
-  BOLT_ASSERT_THROW(
-      evaluateExpr("abc", false),
-      "The JSON element does not have the requested type");
+  testJsonStrToMap(evaluateExpr("[1,", true), std::nullopt);
+  BOLT_ASSERT_THROW(evaluateExpr("abc", false), "improper structure");
   testJsonStrToMap(evaluateExpr("abc", true), std::nullopt);
   testJsonStrToMap(evaluateExpr("  ", false), std::nullopt);
   testJsonStrToMap(evaluateExpr("  ", true), std::nullopt);
   testJsonStrToMap(evaluateExpr("", false), std::nullopt);
   BOLT_ASSERT_THROW(evaluateExpr(std::nullopt, false), "input is null");
   testJsonStrToMap(evaluateExpr(std::nullopt, true), std::nullopt);
+}
+
+TEST_F(JsonFunctionsTest, jsonStrToMapNonObjectDoesNotReusePreviousValue) {
+  setFlinkCompatible(true);
+  auto jsonVector = makeNullableFlatVector<StringView>(
+      {"{\"a\": \"1\"}", "44", "[]", "{\"b\": \"2\"}"});
+  auto actual = evaluate<MapVector>(
+      "json_str_to_map(c0)",
+      makeRowVector({jsonVector}),
+      SelectivityVector{jsonVector->size()},
+      MAP(VARCHAR(), VARCHAR()));
+  auto expected = makeNullableMapVector(
+      std::vector<std::optional<
+          std::vector<std::pair<StringView, std::optional<StringView>>>>>(
+          {{{{"a", "1"}}}, emptyArray, emptyArray, {{{"b", "2"}}}}));
+  ::bytedance::bolt::test::assertEqualVectors(expected, actual);
 }
 
 TEST_F(JsonFunctionsTest, jsonStrToMapNestedEncoding) {
@@ -141,7 +186,7 @@ TEST_F(JsonFunctionsTest, jsonStrToArray) {
       evaluateExpr("[\"测试组1\", \"测试组2]"),
       "A string is opened, but never closed");
   assertResult(evaluateExpr("[\"测试组1\", \"测试组2]", true), std::nullopt);
-  assertResult(evaluateExpr("[]", true), {{}});
+  assertResult(evaluateExpr("[]", true), emptyArray);
   assertResult(evaluateExpr("", true), std::nullopt);
   assertResult(
       evaluateExpr("[{\"c\":\"2\"}, {\"f\":2}]"),

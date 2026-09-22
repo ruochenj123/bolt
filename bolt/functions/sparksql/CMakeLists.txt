@@ -26,8 +26,9 @@
 # --------------------------------------------------------------------------
 
 add_subdirectory(specialforms)
-add_library(
+bolt_add_library(
   bolt_functions_spark_impl
+  ArrayContains.cpp
   ArrayGetFunction.cpp
   ArraySliceSum.cpp
   ArraySort.cpp
@@ -35,6 +36,7 @@ add_library(
   DecimalArithmetic.cpp
   DecimalCompare.cpp
   DecimalVectorFunctions.cpp
+  FormatNumber.cpp
   Hash.cpp
   ICURegexFunctions.cpp
   In.cpp
@@ -44,13 +46,17 @@ add_library(
   LeastGreatest.cpp
   MakeTimestamp.cpp
   Map.cpp
+  MapFromArrays.cpp
   RegexFunctions.cpp
   # Register.cpp
   # RegisterArithmetic.cpp
   # RegisterCompare.cpp
+  SequenceFunction.cpp
   SplitFunctions.cpp
+  StringSplitSQL.cpp
   String.cpp
   UnscaledValueFunction.cpp
+  VariantEncoding.cpp
 )
 
 target_link_libraries(
@@ -65,7 +71,16 @@ target_link_libraries(
   simdjson::simdjson
 )
 
-set_property(TARGET bolt_functions_spark_impl PROPERTY JOB_POOL_COMPILE high_memory_pool)
+set_property(
+  TARGET
+    bolt_functions_spark_impl
+  PROPERTY
+    JOB_POOL_COMPILE
+      high_memory_pool
+)
+
+# directory for generated version.h
+include_directories("${CMAKE_BINARY_DIR}/gen_cpp")
 
 add_subdirectory(window)
 
@@ -79,7 +94,7 @@ if(${BOLT_BUILD_TESTING})
   add_subdirectory(fuzzer)
 endif()
 
-if(${BOLT_ENABLE_BENCHMARKS})
+if(${BOLT_BUILD_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
 

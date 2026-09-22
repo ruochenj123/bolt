@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(
+bolt_add_library(
   bolt_filter
   Cast.cpp
   Filter.cpp
@@ -33,6 +33,13 @@ find_package(ryu CONFIG REQUIRED)
 
 target_link_libraries(
   bolt_filter
-  PUBLIC bolt_type_headers
-  PRIVATE bolt_common_base bolt_token_extractor bolt_exception re2::re2 xxHash::xxhash ryu::ryu
+  PUBLIC
+    bolt_type_headers
+  PRIVATE
+    bolt_common_base
+    bolt_token_extractor
+    bolt_exception
+    re2::re2
+    xxHash::xxhash
+    ryu::ryu
 )

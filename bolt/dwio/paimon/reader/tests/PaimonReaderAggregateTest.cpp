@@ -47,6 +47,7 @@
 
 #include <folly/init/Init.h>
 #include <algorithm>
+
 using namespace bytedance::bolt;
 // using exec::test::HiveConnectorTestBase;
 using namespace bytedance::bolt;
@@ -69,8 +70,7 @@ class PaimonReaderAggregateTest : public testing::Test,
     leafPool_ = rootPool_->addLeafChild("ParquetTests");
 
     auto hiveConnector =
-        connector::getConnectorFactory(
-            connector::hive::HiveConnectorFactory::kHiveConnectorName)
+        connector::getConnectorFactory(connector::kHiveConnectorName)
             ->newConnector(
                 kHiveConnectorId,
                 std::make_shared<config::ConfigBase>(
@@ -121,6 +121,11 @@ class PaimonReaderAggregateTest : public testing::Test,
 };
 
 const std::string PaimonReaderAggregateTest::kHiveConnectorId = "test-hive";
+
+static std::unordered_map<std::string, RuntimeMetric> getTableScanRuntimeStats(
+    const std::shared_ptr<bytedance::bolt::exec::Task>& task) {
+  return task->taskStats().pipelineStats[0].operatorStats[0].runtimeStats;
+}
 
 TEST_F(PaimonReaderAggregateTest, sumNoPrimaryKey) {
   filesystems::registerLocalFileSystem();
@@ -254,6 +259,7 @@ TEST_F(PaimonReaderAggregateTest, sumNoPrimaryKey) {
 
   result = readTask->next();
   BOLT_CHECK_NULL(result);
+  EXPECT_GT(getTableScanRuntimeStats(readTask)["totalMergeTime"].sum, 0);
 }
 
 TEST_F(PaimonReaderAggregateTest, sumWithPrimaryKey) {
@@ -392,6 +398,7 @@ TEST_F(PaimonReaderAggregateTest, sumWithPrimaryKey) {
 
   result = readTask->next();
   BOLT_CHECK_NULL(result);
+  EXPECT_GT(getTableScanRuntimeStats(readTask)["totalMergeTime"].sum, 0);
 }
 
 TEST_F(PaimonReaderAggregateTest, listAgg) {
@@ -492,6 +499,7 @@ TEST_F(PaimonReaderAggregateTest, listAgg) {
 
   result = readTask->next();
   BOLT_CHECK_NULL(result);
+  EXPECT_GT(getTableScanRuntimeStats(readTask)["totalMergeTime"].sum, 0);
 }
 
 TEST_F(PaimonReaderAggregateTest, listAggDelimiter) {
@@ -592,6 +600,7 @@ TEST_F(PaimonReaderAggregateTest, listAggDelimiter) {
 
   result = readTask->next();
   BOLT_CHECK_NULL(result);
+  EXPECT_GT(getTableScanRuntimeStats(readTask)["totalMergeTime"].sum, 0);
 }
 
 TEST_F(PaimonReaderAggregateTest, collectWithPrimaryKey) {
@@ -732,6 +741,7 @@ TEST_F(PaimonReaderAggregateTest, collectWithPrimaryKey) {
 
   result = readTask->next();
   BOLT_CHECK_NULL(result);
+  EXPECT_GT(getTableScanRuntimeStats(readTask)["totalMergeTime"].sum, 0);
 }
 
 TEST_F(PaimonReaderAggregateTest, collectDistinctWithPrimaryKey) {
@@ -878,6 +888,7 @@ TEST_F(PaimonReaderAggregateTest, collectDistinctWithPrimaryKey) {
 
   result = readTask->next();
   BOLT_CHECK_NULL(result);
+  EXPECT_GT(getTableScanRuntimeStats(readTask)["totalMergeTime"].sum, 0);
 }
 
 } // namespace

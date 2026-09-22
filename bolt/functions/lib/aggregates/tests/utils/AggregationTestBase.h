@@ -155,7 +155,7 @@ class AggregationTestBase : public exec::test::OperatorTestBase {
 
   // Given a list of aggregation expressions, test their equivalent plans using
   // companion functions. For example, suppose we have the following arguments
-  // where c0 and c1 are double colummns.
+  // where c0 and c1 are double columns.
   //   aggregates = {"avg(c0), avg(c1)"}
   //   groupingKeys = {"g0"},
   //   postAggregationProjections = {},
@@ -301,6 +301,15 @@ class AggregationTestBase : public exec::test::OperatorTestBase {
       const std::unordered_map<std::string, std::string>& config = {});
 
   void testAggregationsImpl(
+      std::function<void(exec::test::PlanBuilder&)> makeSource,
+      const std::vector<std::string>& groupingKeys,
+      const std::vector<std::string>& aggregates,
+      const std::vector<std::string>& postAggregationProjections,
+      std::function<std::shared_ptr<exec::Task>(
+          exec::test::AssertQueryBuilder&)> assertResults,
+      const std::unordered_map<std::string, std::string>& config);
+
+  void testStreamingAggregationsImpl(
       std::function<void(exec::test::PlanBuilder&)> makeSource,
       const std::vector<std::string>& groupingKeys,
       const std::vector<std::string>& aggregates,

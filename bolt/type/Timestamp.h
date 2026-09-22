@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -50,7 +51,7 @@ class time_zone;
 
 namespace {
 
-// Assuming tzID is in [1, 1680] range.
+// Assuming tzID is in [1, tz::kMaxFixedOffsetTimeZoneId] range.
 // tzID - PrestoDB time zone ID.
 inline int64_t getPrestoTZOffsetInSeconds(int16_t tzID) {
   // TODO(spershin): Maybe we need something better if we can (we could use
@@ -77,6 +78,15 @@ enum class TimestampPrecision : int8_t {
   kMilliseconds = 3, // 10^3 milliseconds are equal to one second.
   kMicroseconds = 6, // 10^6 microseconds are equal to one second.
   kNanoseconds = 9, // 10^9 nanoseconds are equal to one second.
+};
+
+enum class TimestampGapPolicy {
+  kReject,
+  // Preserve the local time's position within the gap, as LocalDateTime.atZone.
+  kShiftForward,
+  // Clamp seconds to the gap end, for DATE conversion via
+  // LocalDate.atStartOfDay.
+  kNextValidSecond,
 };
 
 struct TimestampToStringOptions {
@@ -296,25 +306,66 @@ struct Timestamp {
     return result;
   }
 
+  /// Truncates fractional seconds to precision decimal digits, in [0, 9].
+  /// Seconds are unchanged, including for timestamps before the Unix epoch.
+  /// The template overload permits constant division in vectorized callers.
+  template <int32_t precision>
+  Timestamp toPrecision() const {
+    static_assert(precision >= 0 && precision <= 9);
+    constexpr uint64_t divisor = [] {
+      uint64_t value = 1;
+      for (int32_t i = precision; i < 9; ++i) {
+        value *= 10;
+      }
+      return value;
+    }();
+    return Timestamp(seconds_, nanos_ / divisor * divisor);
+  }
+
+  Timestamp toPrecision(int32_t precision) const {
+    switch (precision) {
+      case 0:
+        return toPrecision<0>();
+      case 1:
+        return toPrecision<1>();
+      case 2:
+        return toPrecision<2>();
+      case 3:
+        return toPrecision<3>();
+      case 4:
+        return toPrecision<4>();
+      case 5:
+        return toPrecision<5>();
+      case 6:
+        return toPrecision<6>();
+      case 7:
+        return toPrecision<7>();
+      case 8:
+        return toPrecision<8>();
+      case 9:
+        return toPrecision<9>();
+      default:
+        BOLT_USER_FAIL(
+            "Timestamp precision must be between 0 and 9: {}", precision);
+    }
+  }
+
   Timestamp toPrecision(const TimestampPrecision& precision) const {
-    uint64_t nanos = nanos_;
     switch (precision) {
       case TimestampPrecision::kMilliseconds:
-        nanos = nanos / 1'000'000 * 1'000'000;
-        break;
+        return toPrecision<3>();
       case TimestampPrecision::kMicroseconds:
-        nanos = nanos / 1'000 * 1'000;
-        break;
+        return toPrecision<6>();
       case TimestampPrecision::kNanoseconds:
-        break;
+        return toPrecision<9>();
     }
-    return Timestamp(seconds_, nanos);
+    return *this;
   }
 
   /// Due to the limit of std::chrono, throws if timestamp is outside of
   /// [-32767-01-01, 32767-12-31] range.
   /// If allowOverflow is true, integer overflow is allowed in converting
-  /// timestmap to milliseconds.
+  /// timestamp to milliseconds.
   static Timestamp fromMillis(int64_t millis) {
     if (millis >= 0 || millis % 1'000 == 0) {
       return Timestamp(millis / 1'000, (millis % 1'000) * 1'000'000);
@@ -422,6 +473,13 @@ struct Timestamp {
   // If error is not nullptr, it is set to true if the conversion fails.
   void toGMT(const tz::TimeZone& zone, bool* error = nullptr);
 
+  // Resolves overlaps to the earlier instant and handles gaps using gapPolicy.
+  // The nanosecond component is preserved.
+  void toGMT(
+      const tz::TimeZone& zone,
+      TimestampGapPolicy gapPolicy,
+      bool* error = nullptr);
+
   // Same as above, but accepts PrestoDB time zone ID.
   // If error is not nullptr, it is set to true if the conversion fails.
   void toGMT(int16_t tzID, bool* error = nullptr);
@@ -507,8 +565,8 @@ struct Timestamp {
     return tmToString(tm, nanos_, options);
   }
 
-  FOLLY_ALWAYS_INLINE
-  std::string toString(
+  template <bool SkipTrailingZeros>
+  FOLLY_ALWAYS_INLINE std::string toString(
       const TimestampToStringOptions::Precision& precision,
       const tz::TimeZone* tz) const {
     using namespace std::chrono;
@@ -519,13 +577,6 @@ struct Timestamp {
     const auto timeOfDay = duration_cast<seconds>(seconds(localSec) - days);
     const auto ymd = ::date::year_month_day(::date::sys_days(days));
     const auto hhmmss = ::date::time_of_day<seconds>(timeOfDay);
-#ifndef SPARK_COMPATIBLE
-    const auto fracWidth = static_cast<int>(precision);
-    const auto fracValue =
-        precision == TimestampToStringOptions::Precision::kMilliseconds
-        ? nanos_ / 1'000'000
-        : nanos_;
-#endif
     std::ostringstream oss;
     oss << std::setfill('0') << std::setw(4) << static_cast<int>(ymd.year())
         << "-" << std::setw(2) << static_cast<unsigned>(ymd.month()) << "-"
@@ -533,20 +584,29 @@ struct Timestamp {
         << std::setw(2) << hhmmss.hours().count() << ":" << std::setw(2)
         << hhmmss.minutes().count() << ":" << std::setw(2)
         << hhmmss.seconds().count();
-#ifndef SPARK_COMPATIBLE
-    oss << "." << std::setw(fracWidth) << fracValue;
-#else
-    if (nanos_ > 0) {
-      auto nanos = nanos_;
-      while (nanos % 10 == 0) {
-        nanos /= 10;
+    if constexpr (SkipTrailingZeros) {
+      if (nanos_ > 0) {
+        auto nanos = nanos_;
+        while (nanos % 10 == 0) {
+          nanos /= 10;
+        }
+        oss << "." << nanos;
       }
-      oss << "." << nanos;
+    } else {
+      const auto fracWidth = static_cast<int>(precision);
+      const auto fracValue =
+          precision == TimestampToStringOptions::Precision::kMilliseconds
+          ? nanos_ / 1'000'000
+          : nanos_;
+      oss << "." << std::setw(fracWidth) << fracValue;
     }
-#endif
 
     return oss.str();
   }
+
+  std::string toString(
+      const TimestampToStringOptions::Precision& precision,
+      const tz::TimeZone* tz) const;
 
   operator std::string() const {
     return toString();

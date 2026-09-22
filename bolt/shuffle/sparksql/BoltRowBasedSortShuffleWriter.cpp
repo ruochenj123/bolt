@@ -37,6 +37,7 @@
 #include "bolt/type/Type.h"
 #include "bolt/vector/BaseVector.h"
 #include "bolt/vector/ComplexVector.h"
+
 namespace bytedance::bolt::shuffle::sparksql {
 
 arrow::Status BoltRowBasedSortShuffleWriter::init() {
@@ -48,10 +49,7 @@ arrow::Status BoltRowBasedSortShuffleWriter::init() {
   ARROW_ASSIGN_OR_RAISE(
       partitioner_,
       Partitioner::make(
-          options_.partitioning,
-          numPartitions_,
-          options_.startPartitionId,
-          options_.sort_before_repartition));
+          options_.partitioning, numPartitions_, options_.startPartitionId));
   partition2RowCount_.resize(numPartitions_);
   partitionWriter_->setRowFormat(true);
   return arrow::Status::OK();
@@ -60,11 +58,7 @@ arrow::Status BoltRowBasedSortShuffleWriter::init() {
 arrow::Status BoltRowBasedSortShuffleWriter::split(
     bytedance::bolt::RowVectorPtr rv,
     int64_t memLimit) {
-  bytedance::bolt::NanosecondTimer splitTimer(&totalSplitTime_);
   updateInputMetrics(rv);
-  bytedance::bolt::RowVectorPtr strippedRv;
-  uint32_t slicedBatchSize = 0;
-  std::vector<bytedance::bolt::RowVectorPtr> slicedBatches;
   if (bytedance::bolt::RowVector::isComposite(rv)) {
     // from columnar to composite, flush all previous batches
     if (vectorLayout_ == RowVectorLayout::kColumnar) {
@@ -81,12 +75,13 @@ arrow::Status BoltRowBasedSortShuffleWriter::split(
   }
 
   vectorLayout_ = RowVectorLayout::kColumnar;
+  ShuffleColumnarToRowConverter::RowVectorWithStats fullStats;
   {
-    bytedance::bolt::NanosecondTimer timer(&flattenTime_);
-    constexpr uint32_t minBatchSize = 512;
-
-    ensurePartialFlatten(rv, {0});
-    ensureVectorLoaded(rv);
+    {
+      bytedance::bolt::NanosecondTimer timer(&flattenTime_);
+      ensurePartialFlatten(rv, {0});
+      ensureVectorLoaded(rv);
+    }
     BOLT_CHECK(
         rv != nullptr && (options_.partitioning != Partitioning::kSingle) &&
         partitioner_->hasPid());
@@ -95,45 +90,23 @@ arrow::Status BoltRowBasedSortShuffleWriter::split(
       RETURN_NOT_OK(initFromRowVector(*rv));
       isInitialized_ = true;
     }
-
-    // estimate batchSize based on UnsafeRowSize
-    slicedBatchSize = rowConverter_->averageRowSize()
-        ? (options_.recommendedColumn2RowSize / rowConverter_->averageRowSize())
-        : 0;
-
-    if (slicedBatchSize > minBatchSize) {
-      uint32_t numRows = rv->size();
-      uint32_t numBatches = numRows / slicedBatchSize;
-      slicedBatchSize = (numRows - slicedBatchSize * numBatches < 0.2 * numRows)
-          ? (numRows + numBatches - 1) / numBatches
-          : slicedBatchSize;
-      if (numRows > slicedBatchSize) {
-        for (auto i = 0; i < numRows; i += slicedBatchSize) {
-          slicedBatches.emplace_back(
-              std::dynamic_pointer_cast<bytedance::bolt::RowVector>(
-                  rv->slice(i, std::min(slicedBatchSize, numRows - i))));
-        }
-      } else {
-        slicedBatches.push_back(std::move(rv));
-      }
-      // variables' name not accurate, just for reuse
-      combinedVectorNumber_ += slicedBatchSize;
-      ++combineVectorTimes_;
-    } else {
-      slicedBatches.push_back(std::move(rv));
-    }
+    fullStats = rowConverter_->getWithStats(
+        getStrippedRowVectorWrapper(*rv), maxBatchBytes_);
   }
 
-  for (const auto& rv : slicedBatches) {
+  const auto& ranges = fullStats.ranges();
+  auto processBatch =
+      [&](const bytedance::bolt::RowVectorPtr& batch,
+          const ShuffleColumnarToRowConverter::RowVectorWithStats& stats)
+      -> arrow::Status {
     {
       bytedance::bolt::NanosecondTimer timer(&computePidTime_);
-      auto pidArr = getFirstColumnWrapper(*rv);
+      const auto* pidArr = getFirstColumnWrapper(*batch);
       RETURN_NOT_OK(partitioner_->compute(
-          pidArr, rv->size(), row2Partition_, partition2RowCount_));
-      strippedRv = getStrippedRowVectorWrapper(*rv);
+          pidArr, batch->size(), row2Partition_, partition2RowCount_));
     }
-    auto rowVectorWithStats = rowConverter_->getWithStats(strippedRv);
-    if (!boltPool_->maybeReserve(rowVectorWithStats.getTotalMemorySize())) {
+    if (!boltPool_->maybeReserve(stats.getTotalMemorySize()) &&
+        hasEnoughMemoryUsageToSpill()) {
       RETURN_NOT_OK(tryEvict());
       requestSpill_ = false;
     }
@@ -142,8 +115,28 @@ arrow::Status BoltRowBasedSortShuffleWriter::split(
       setSplitState(SplitState::kSplit);
       bytedance::bolt::NanosecondTimer timer(&convertTime_);
       rowConverter_->convert(
-          rowVectorWithStats, row2Partition_, sortedRows_, partitionBytes_);
+          stats, row2Partition_, sortedRows_, partitionBytes_);
     }
+    return arrow::Status::OK();
+  };
+
+  if (ranges.size() == 1) {
+    RETURN_NOT_OK(processBatch(rv, fullStats));
+  } else {
+    LOG(INFO) << "BoltRowBasedSortShuffleWriter slice columnar batch: numRows="
+              << rv->size() << ", totalBytes=" << fullStats.getTotalMemorySize()
+              << ", maxBatchBytes=" << maxBatchBytes_
+              << ", numSlices=" << ranges.size();
+    for (const auto& range : ranges) {
+      auto slicedRv = std::dynamic_pointer_cast<bytedance::bolt::RowVector>(
+          rv->slice(range.offset, range.length));
+      auto slicedStats = rowConverter_->sliceStats(fullStats, range);
+      RETURN_NOT_OK(processBatch(slicedRv, slicedStats));
+    }
+  }
+  if (ranges.size() > 1) {
+    combinedVectorNumber_ += rv->size() / ranges.size();
+    ++combineVectorTimes_;
   }
 
   // under memory pressure
@@ -161,14 +154,16 @@ arrow::Status BoltRowBasedSortShuffleWriter::initFromRowVector(
     const bytedance::bolt::RowVector& rv) {
   // rv is not stripped
   auto&& rowType = getStrippedRowVectorType(rv);
-  rowConverter_ =
-      std::make_unique<ShuffleColumnarToRowConverter>(rowType, boltPool_);
+  rowConverter_ = std::make_unique<ShuffleColumnarToRowConverter>(
+      rowType, boltPool_, options_.rowFormat);
   sortedRows_.resize(numPartitions_);
   partitionBytes_.resize(numPartitions_, 0);
   return arrow::Status::OK();
 }
 
 arrow::Status BoltRowBasedSortShuffleWriter::tryEvict(int64_t) {
+  // add EvictGuard to avoid recursive evict
+  EvictGuard evictGuard{evictState_};
   BOLT_DCHECK(vectorLayout_ != RowVectorLayout::kInvalid);
   if (vectorLayout_ == RowVectorLayout::kColumnar) {
     RETURN_NOT_OK(partitionWriter_->evict(sortedRows_, partitionBytes_, false));
@@ -194,6 +189,10 @@ arrow::Status BoltRowBasedSortShuffleWriter::reclaimFixedSize(
     *actual = 0;
     return arrow::Status::OK();
   }
+  if (!hasEnoughMemoryUsageToSpill()) {
+    *actual = 0;
+    return arrow::Status::OK();
+  }
   EvictGuard evictGuard{evictState_};
   if (splitState_ == SplitState::kInit) {
     auto memoryBefore = partitionBufferSize() + boltPool_->currentBytes();
@@ -212,11 +211,29 @@ arrow::Status BoltRowBasedSortShuffleWriter::reclaimFixedSize(
 }
 
 arrow::Status BoltRowBasedSortShuffleWriter::stop() {
-  bytedance::bolt::NanosecondTimer stopTimer(&stopTime_);
   setSplitState(SplitState::kStop);
-  RETURN_NOT_OK(tryEvict());
   {
-    RETURN_NOT_OK(partitionWriter_->stop(&metrics_));
+    const auto isCompositeVector = vectorLayout_ == RowVectorLayout::kComposite;
+    RETURN_NOT_OK(partitionWriter_->stop(
+        &metrics_,
+        [this, isCompositeVector](uint32_t partitionId) -> arrow::Status {
+          if (partitionId >= sortedRows_.size()) {
+            return arrow::Status::OK();
+          }
+          auto& rows = sortedRows_[partitionId];
+          const auto rawSize = isCompositeVector ? getTotalRowBytes(rows)
+                                                 : partitionBytes_[partitionId];
+          RETURN_NOT_OK(partitionWriter_->writeFinal(
+              partitionId, rows, rawSize, isCompositeVector));
+          partitionBytes_[partitionId] = 0;
+          return arrow::Status::OK();
+        }));
+    if (vectorLayout_ == RowVectorLayout::kColumnar) {
+      rowConverter_->reset();
+    } else if (compositeRowVectorConverter_) {
+      compositeRowVectorConverter_->reset();
+    }
+    boltPool_->release();
     metrics_.useRowBased = 1;
     combinedVectorNumber_ = combineVectorTimes_ > 0
         ? (combinedVectorNumber_ / combineVectorTimes_)

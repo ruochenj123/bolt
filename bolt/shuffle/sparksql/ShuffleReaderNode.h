@@ -116,10 +116,11 @@ class SparkShuffleReader : public bytedance::bolt::exec::SourceOperator {
   std::shared_ptr<BoltArrowMemoryPool> arrowPool_;
 
   std::shared_ptr<arrow::Schema> schema_;
-  std::shared_ptr<arrow::util::Codec> codec_;
+  std::shared_ptr<Codec> codec_;
 
   int32_t batchSize_;
   int32_t shuffleBatchByteSize_;
+  int32_t shuffleBufferSize_;
   int32_t numPartitions_{0};
   ShuffleWriterType shuffleWriterType_{ShuffleWriterType::V1};
   std::string partitioningShortName_;
@@ -129,15 +130,26 @@ class SparkShuffleReader : public bytedance::bolt::exec::SourceOperator {
 
   uint64_t deserializeTime_{0};
   uint64_t decompressTime_{0};
+  uint64_t mergeTime_{0};
+
+  // Metrics for BoltColumnarBatchDeserializer create/destroy overhead.
+  uint64_t deserializerCreateTime_{0};
+  uint64_t deserializerDestroyTime_{0};
+
+  uint64_t totalReadTime_{0};
 
   // for rowbased shuffle
-  std::shared_ptr<ZstdStreamCodec> zstdCodec_{nullptr};
+  std::shared_ptr<AdaptiveParallelZstdCodec> zstdCodec_{nullptr};
   std::shared_ptr<RowBufferPool> rowBufferPool_{nullptr};
   std::shared_ptr<ShuffleRowToColumnarConverter> row2ColConverter_{nullptr};
+
+  std::shared_ptr<ColumnBufferPool> columnBufferPool_{nullptr};
 
   std::unique_ptr<BoltColumnarBatchDeserializer> columnarBatchDeserializer_;
 
   bool isRowBased_ = false;
+
+  bool reuseBufferedInputStream_ = false;
 
   bool finished_ = false;
 };

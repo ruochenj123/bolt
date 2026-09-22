@@ -56,8 +56,10 @@ class Spiller {
     kOrderByInput = 4,
     // Used for order by output processing stage.
     kOrderByOutput = 5,
+    // Used for local merge input processing stage.
+    kLocalMergeInput = 6,
     // Number of spiller types.
-    kNumTypes = 6,
+    kNumTypes = 7,
     // Used for hash probe match flags
     kHashJoinProbeMatchFlag = 7,
   };
@@ -79,8 +81,7 @@ class Spiller {
       Type type,
       RowContainer* container,
       RowTypePtr rowType,
-      int32_t numSortingKeys,
-      const std::vector<CompareFlags>& sortCompareFlags,
+      const std::vector<SpillSortKey>& sortingKeys,
       const common::SpillConfig* spillConfig);
 
   /// type == Type::kAggregateOutput || type == Type::kOrderByOutput
@@ -105,6 +106,14 @@ class Spiller {
       HashBitRange bits,
       const common::SpillConfig* spillConfig,
       uint64_t targetFileSize);
+
+  /// type == Type::kLocalMergeInput
+  Spiller(
+      Type type,
+      RowTypePtr rowType,
+      HashBitRange bits,
+      const std::vector<SpillSortKey>& sortingKeys,
+      const common::SpillConfig* spillConfig);
 
   /// type == Type::kHashJoinBuild
   Spiller(
@@ -225,7 +234,8 @@ class Spiller {
   void setPartitionsSpilled(const SpillPartitionNumSet& partitions) {
     BOLT_CHECK(
         type_ == Spiller::Type::kHashJoinProbe ||
-            type_ == Spiller::Type::kHashJoinProbeMatchFlag,
+            type_ == Spiller::Type::kHashJoinProbeMatchFlag ||
+            type_ == Spiller::Type::kLocalMergeInput,
         "Unexpected spiller type: ",
         typeName(type_));
     for (const auto& partition : partitions) {
@@ -291,18 +301,11 @@ class Spiller {
       RowContainer* container,
       RowTypePtr rowType,
       HashBitRange bits,
-      int32_t numSortingKeys,
-      const std::vector<CompareFlags>& sortCompareFlags,
-      const common::GetSpillDirectoryPathCB& getSpillDirPathCb,
-      const common::UpdateAndCheckSpillLimitCB& updateAndCheckSpillLimitCb,
-      const std::string& fileNamePrefix,
+      const std::vector<SpillSortKey>& sortingKeys,
+      const common::SpillConfig::SpillIOConfig& ioConfig,
       uint64_t targetFileSize,
-      bool spillUringEnabled,
-      uint64_t writeBufferSize,
-      common::CompressionKind compressionKind,
       folly::Executor* executor,
       uint64_t maxSpillRunRows,
-      const std::string& fileCreateConfig,
       common::RowBasedSpillMode rowBasedSpillMode);
 
   // Invoked to spill. If 'startRowIter' is not null, then we only spill rows
@@ -388,7 +391,9 @@ class Spiller {
   // If 'startRowIter' is not null, we prepare runs starting from the offset
   // pointed by 'startRowIter'.
   // The function returns true if it is the last spill run.
-  bool fillSpillRuns(RowContainerIterator* startRowIter = nullptr);
+  bool fillSpillRuns(
+      RowContainerIterator* startRowIter = nullptr,
+      uint64_t maxRowsPerPartition = 0);
 
   // Prepares spill run of a single partition for the spillable data from the
   // rows.
@@ -432,6 +437,8 @@ class Spiller {
   const RowTypePtr rowType_;
   const uint64_t maxSpillRunRows_;
 
+  const std::vector<CompareFlags> compareFlags_;
+
   // True if all rows of spilling partitions are in 'spillRuns_', so
   // that one can start reading these back. This means that the rows
   // that are not written out and deleted will be captured by
@@ -458,7 +465,7 @@ class Spiller {
 
   bool supportSkewPartition_{false};
   bool rangePartitioningApplicable_{false};
-  int32_t skewedVictim_{-1};
+  std::optional<uint32_t> skewedVictim_;
   uint32_t maxRowsPerFile_{0};
   int64_t memoryUsedWhenTriggered_{0};
   int32_t skewFileSizeRatioThreshold_ = 10;
@@ -473,6 +480,24 @@ class Spiller {
 #endif
   RowRowCompare cmp_{nullptr};
 };
+
+class MergeSpiller final : public Spiller {
+ public:
+  MergeSpiller(
+      RowTypePtr rowType,
+      std::optional<SpillPartitionId> parentId,
+      HashBitRange bits,
+      const std::vector<SpillSortKey>& sortingKeys,
+      const common::SpillConfig* spillConfig,
+      folly::Synchronized<common::SpillStats>* spillStats = nullptr)
+      : Spiller(
+            Type::kLocalMergeInput,
+            std::move(rowType),
+            bits,
+            sortingKeys,
+            spillConfig) {}
+};
+
 } // namespace bytedance::bolt::exec
 
 template <>

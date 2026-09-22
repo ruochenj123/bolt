@@ -31,7 +31,9 @@
 #include "bolt/connectors/hive/SplitReader.h"
 #include <cstdint>
 
+#include "bolt/common/base/SparkCompatibility.h"
 #include "bolt/common/caching/CacheTTLController.h"
+#include "bolt/common/testutil/TestValue.h"
 #include "bolt/connectors/hive/HiveConfig.h"
 #include "bolt/connectors/hive/HiveConnectorSplit.h"
 #include "bolt/connectors/hive/HiveConnectorUtil.h"
@@ -40,11 +42,18 @@
 #include "bolt/connectors/hive/TableHandle.h"
 #include "bolt/dwio/common/ReaderFactory.h"
 #include "bolt/dwio/paimon/deletionvectors/DeletionFileReader.h"
+#include "bolt/dwio/parquet/reader/ParquetReaderCast.h"
 #include "bolt/type/Conversions.h"
 
 namespace bytedance::bolt::connector::hive {
 
 namespace {
+template <TypeKind Kind>
+bolt::variant convertPartitionValueFromString(
+    const std::optional<std::string>& value) {
+  return convertFromString<Kind>(value, !::bytedance::bolt::kSparkCompatible);
+}
+
 template <TypeKind kind>
 VectorPtr newConstantFromString(
     const TypePtr& type,
@@ -68,7 +77,7 @@ VectorPtr newConstantFromString(
         pool, size, false, type, StringView(value.value()));
   } else {
     auto copy = bolt::util::Converter<kind>::cast(value.value(), nullptr);
-    // It is guranteed that the value string is in UTC timezone.
+    // It is guaranteed that the value string is in UTC timezone.
     // if constexpr (kind == TypeKind::TIMESTAMP) {
     //   copy.toGMT(Timestamp::defaultTimezone());
     // }
@@ -288,6 +297,13 @@ void SplitReader::prepareSplit(
 
   baseReader_ = dwio::common::getReaderFactory(baseReaderOpts_.getFileFormat())
                     ->createReader(std::move(baseFileInput), baseReaderOpts_);
+
+  BOLT_TEST_ADJUST(
+      "bytedance::bolt::connector::hive::SplitReader::prepareSplit", this);
+
+  validateReaderCastFilter();
+  baseRowReaderOpts_.setDisableFloatingPointToVarcharMetadataFilter(
+      !isPartOfPaimonSplit_);
 
   // Note that this doesn't apply to Hudi tables.
   emptySplit_ = false;
@@ -531,6 +547,9 @@ uint64_t SplitReader::next(int64_t size, VectorPtr& output) {
     rows = baseRowReader_->next(size, output);
   }
   populatePaimonMetadataColumns(output);
+
+  BOLT_TEST_ADJUST("bytedance::bolt::connector::hive::SplitReader::next", this);
+
   return rows;
 }
 
@@ -548,9 +567,22 @@ void SplitReader::populatePaimonMetadataColumns(VectorPtr& output) {
 }
 
 void SplitReader::resetFilterCaches() {
+  validateReaderCastFilter();
   if (baseRowReader_) {
     baseRowReader_->resetFilterCaches();
   }
+}
+
+void SplitReader::validateReaderCastFilter() const {
+  if (isPartOfPaimonSplit_ || !baseReader_ ||
+      baseReaderOpts_.getFileFormat() != dwio::common::FileFormat::PARQUET) {
+    return;
+  }
+  const auto requestedType = hiveTableHandle_->dataColumns()
+      ? hiveTableHandle_->dataColumns()
+      : readerOutputType_;
+  parquet::validateReaderCastFilter(
+      baseReader_->rowType(), requestedType, *scanSpec_, "");
 }
 
 bool SplitReader::emptySplit() const {
@@ -626,7 +658,9 @@ void SplitReader::setPartitionValue(
         }
       } else {
         constValue = BOLT_DYNAMIC_SCALAR_TYPE_DISPATCH(
-            convertFromString, it->second->dataType()->kind(), value);
+            convertPartitionValueFromString,
+            it->second->dataType()->kind(),
+            value);
       }
       setConstantValue(spec, it->second->dataType(), constValue);
     } catch (const std::exception& e) {

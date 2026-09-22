@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <type_traits>
@@ -46,9 +47,11 @@
 #include "bolt/expression/VariadicView.h"
 #include "bolt/type/StringView.h"
 #include "bolt/type/Type.h"
+#include "bolt/type/Variant.h"
 #include "bolt/vector/BaseVector.h"
 #include "bolt/vector/DecodedVector.h"
 #include "bolt/vector/FlatVector.h"
+#include "bolt/vector/VariantVector.h"
 namespace bytedance::bolt::exec {
 
 template <typename T>
@@ -114,6 +117,110 @@ struct VectorReader {
   const DecodedVector& decoded_;
 };
 
+namespace detail {
+
+template <typename TOut>
+const TOut& getDecoded(const DecodedVector& decoded) {
+  auto base = decoded.base();
+  return *base->template as<TOut>();
+}
+
+inline DecodedVector* decode(DecodedVector& decoder, const BaseVector& vector) {
+  decoder.decode(vector);
+  return &decoder;
+}
+} // namespace detail
+
+template <>
+struct VectorReader<Variant> {
+  using exec_in_t = VariantValue;
+  using exec_null_free_in_t = VariantValue;
+
+  explicit VectorReader(const DecodedVector* decoded) : decoded_(*decoded) {
+    auto base = decoded_.base();
+    if (base && base->encoding() == VectorEncoding::Simple::VARIANT) {
+      auto v = base->template as<VariantVector>();
+      if (v) {
+        isVariantVector_ = true;
+        // Use std::optional to avoid heap allocations per batch.
+        valueReader_.emplace(
+            detail::decode(valueDecoder_, *v->valueChildVector()));
+        metadataReader_.emplace(
+            detail::decode(metadataDecoder_, *v->metadataChildVector()));
+      }
+    }
+  }
+
+  exec_in_t operator[](size_t offset) const {
+    if (isVariantVector_) {
+      auto index = decoded_.index(offset);
+      return {(*valueReader_)[index], (*metadataReader_)[index]};
+    }
+    return decoded_.template valueAt<exec_in_t>(offset);
+  }
+
+  exec_null_free_in_t readNullFree(size_t offset) const {
+    if (isVariantVector_) {
+      auto index = decoded_.index(offset);
+      return {
+          valueReader_->readNullFree(index),
+          metadataReader_->readNullFree(index)};
+    }
+    return decoded_.template valueAt<exec_null_free_in_t>(offset);
+  }
+
+  bool isSet(size_t offset) const {
+    return !decoded_.isNullAt(offset);
+  }
+
+  bool mayHaveNulls() const {
+    return decoded_.mayHaveNulls();
+  }
+
+  // These functions can be used to check if any elements in a given row are
+  // NULL. They are not especially fast, so they should only be used when
+  // necessary, and other options, e.g. calling mayHaveNullsRecursive() on the
+  // vector, have already been exhausted.
+  inline bool containsNull(vector_size_t index) const {
+    return decoded_.isNullAt(index);
+  }
+
+  bool containsNull(vector_size_t startIndex, vector_size_t endIndex) const {
+    // Note: This can be optimized for the special case where the underlying
+    // vector is flat using bit operations on the nulls buffer.
+    for (auto index = startIndex; index < endIndex; ++index) {
+      if (containsNull(index)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  inline bool mayHaveNullsRecursive() const {
+    return decoded_.mayHaveNulls();
+  }
+
+  // Scalars don't have children, so this is a no-op.
+  void setChildrenMayHaveNulls() {}
+
+  const BaseVector* baseVector() const {
+    return decoded_.base();
+  }
+
+  const DecodedVector& decoded_;
+  bool isVariantVector_ = false;
+  DecodedVector valueDecoder_;
+  DecodedVector metadataDecoder_;
+  std::optional<VectorReader<Varchar>> valueReader_;
+  std::optional<VectorReader<Varchar>> metadataReader_;
+};
+
+template <>
+struct VectorReader<VariantValue> : public VectorReader<Variant> {
+  using VectorReader<Variant>::VectorReader;
+};
+
 // ConstantVectorReader and FlatVectorReader are optimized for primitive types
 // in constant or flat encoded vectors.  They operate directly on the vector's
 // content avoiding the need to go through the expensive decoding process.
@@ -123,7 +230,7 @@ struct ConstantVectorReader {
 
   std::optional<exec_in_t> value;
 
-  explicit ConstantVectorReader<T>(ConstantVector<exec_in_t>& vector) {
+  explicit ConstantVectorReader(ConstantVector<exec_in_t>& vector) {
     if (!vector.isNullAt(0)) {
       value = *vector.rawValues();
     }
@@ -168,7 +275,7 @@ struct FlatVectorReader {
   const exec_in_t* values;
   FlatVector<exec_in_t>* vector;
 
-  explicit FlatVectorReader<T>(FlatVector<exec_in_t>& baseVector)
+  explicit FlatVectorReader(FlatVector<exec_in_t>& baseVector)
       : values(baseVector.rawValues()), vector(&baseVector) {}
 
   exec_in_t operator[](vector_size_t offset) const {
@@ -273,20 +380,6 @@ struct ConstantFlatVectorReader {
   // We multiply the index by this value to get that mapping.
   vector_size_t indexMultiple_;
 };
-
-namespace detail {
-
-template <typename TOut>
-const TOut& getDecoded(const DecodedVector& decoded) {
-  auto base = decoded.base();
-  return *base->template as<TOut>();
-}
-
-inline DecodedVector* decode(DecodedVector& decoder, const BaseVector& vector) {
-  decoder.decode(vector);
-  return &decoder;
-}
-} // namespace detail
 
 template <typename K, typename V>
 struct VectorReader<Map<K, V>> {

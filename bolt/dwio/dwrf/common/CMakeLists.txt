@@ -26,8 +26,7 @@
 # --------------------------------------------------------------------------
 
 find_package(zstd CONFIG REQUIRED)
-# message(FATAL_ERROR "${zstd_FOUND} ${zstd_INCLUDE_DIRS}")
-add_library(
+bolt_add_library(
   bolt_dwio_dwrf_common
   ByteRLE.cpp
   Common.cpp
@@ -40,8 +39,6 @@ add_library(
   RLEv1.cpp
   RLEv2.cpp
   Statistics.cpp
-  wrap/dwrf-proto-wrapper.cpp
-  wrap/orc-proto-wrapper.cpp
 )
 
 add_dependencies(bolt_dwio_dwrf_common bolt_dwio_dwrf_proto)

@@ -25,13 +25,19 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_exception BoltException.cpp Exceptions.cpp Exceptions.h)
+bolt_add_library(bolt_exception BoltException.cpp Exceptions.cpp Exceptions.h)
 target_link_libraries(
-  bolt_exception PUBLIC bolt_flag_definitions bolt_process Folly::folly fmt::fmt gflags::gflags
-                        glog::glog
+  bolt_exception
+  PUBLIC
+    bolt_common_flags
+    bolt_process
+    Folly::folly
+    fmt::fmt
+    gflags::gflags
+    glog::glog
 )
 
-add_library(
+bolt_add_library(
   bolt_common_base
   BitUtil.cpp
   BloomFilter.cpp
@@ -52,34 +58,44 @@ add_library(
 find_package(ryu CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+install(
+  FILES
+    "${BOLT_GENERATED_BASE_INCLUDE_DIR}/SparkCompatibility.h"
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/bolt/common/base"
+)
+
 add_compile_definitions(FOLLY_HAVE_INT128_T=1)
 target_link_libraries(
   bolt_common_base
-  PUBLIC bolt_exception
-         Folly::folly
-         fmt::fmt
-         xsimd::xsimd
-         cityhash::cityhash
-         xxHash::xxhash
-         ryu::ryu
-         date::date
-         openssl::openssl
-  PRIVATE bolt_common_compression bolt_process bolt_test_util glog::glog
+  PUBLIC
+    bolt_exception
+    Folly::folly
+    fmt::fmt
+    xsimd::xsimd
+    cityhash::cityhash
+    xxHash::xxhash
+    ryu::ryu
+    date::date
+    openssl::openssl
+  PRIVATE
+    bolt_common_compression
+    bolt_process
+    glog::glog
 )
 
 if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
 
-if(${BOLT_ENABLE_BENCHMARKS})
+if(${BOLT_BUILD_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
 
-add_library(bolt_id_map BigintIdMap.cpp)
+bolt_add_library(bolt_id_map BigintIdMap.cpp)
 target_link_libraries(
   bolt_id_map
   bolt_memory
-  bolt_flag_definitions
+  bolt_common_flags
   bolt_process
   glog::glog
   Folly::folly
@@ -87,9 +103,12 @@ target_link_libraries(
   gflags::gflags
 )
 
-add_library(bolt_status Status.cpp)
+bolt_add_library(bolt_status Status.cpp)
 target_link_libraries(
   bolt_status
-  PUBLIC fmt::fmt Folly::folly
-  PRIVATE glog::glog
+  PUBLIC
+    fmt::fmt
+    Folly::folly
+  PRIVATE
+    glog::glog
 )

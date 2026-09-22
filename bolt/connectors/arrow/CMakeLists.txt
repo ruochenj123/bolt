@@ -13,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_library(bolt_arrow_connector ArrowMemoryConnector.cpp)
+bolt_add_library(bolt_arrow_connector ArrowMemoryConnector.cpp)
 
 target_link_libraries(bolt_arrow_connector bolt_connector)
 
 # Force export this library
 add_custom_target(
   dummy_arrow_connector_target
-  DEPENDS bolt_arrow_connector
+  DEPENDS
+    bolt_arrow_connector
   COMMENT "Exporting arrow connector library"
 )
 

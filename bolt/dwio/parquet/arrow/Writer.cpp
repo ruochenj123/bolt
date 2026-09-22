@@ -328,9 +328,13 @@ class FileWriterImpl : public FileWriter {
       std::shared_ptr<ArrowWriterProperties> arrow_properties)
       : schema_(std::move(schema)),
         writer_(std::move(writer)),
+        writerMetrics_(writer_->properties()->writer_metrics()),
         row_group_writer_(nullptr),
         column_write_context_(pool, arrow_properties.get()),
         arrow_properties_(std::move(arrow_properties)),
+        io_context_(std::make_unique<::arrow::io::IOContext>(
+            column_write_context_.memory_pool)),
+        arrow_reader_properties_(std::make_unique<ArrowReaderProperties>()),
         closed_(false) {
     if (arrow_properties_->use_threads()) {
       parallel_column_write_contexts_.reserve(schema_->num_fields());
@@ -342,13 +346,14 @@ class FileWriterImpl : public FileWriter {
             pool, arrow_properties_.get());
       }
     }
+    arrow_reader_properties_->set_io_context(*io_context_);
   }
 
   Status Init() {
     return SchemaManifest::Make(
         writer_->schema(),
         /*schema_metadata=*/nullptr,
-        default_arrow_reader_properties(),
+        *arrow_reader_properties_,
         &schema_manifest_);
   }
 
@@ -390,6 +395,8 @@ class FileWriterImpl : public FileWriter {
         return Status::Invalid(
             "Cannot write column chunk into the buffered row group.");
       }
+      WriterEncodeMetricTimer timer(
+          writerMetrics_ ? &writerMetrics_->writeEncodeWallNanos : nullptr);
       ARROW_ASSIGN_OR_RAISE(
           std::unique_ptr<ArrowColumnWriterV2> writer,
           ArrowColumnWriterV2::Make(
@@ -457,6 +464,15 @@ class FileWriterImpl : public FileWriter {
     return Status::OK();
   }
 
+  Status Flush() override {
+    if (row_group_writer_ != nullptr) {
+      auto row_group_writer = row_group_writer_;
+      row_group_writer_ = nullptr;
+      PARQUET_CATCH_NOT_OK(row_group_writer->Close());
+    }
+    return Status::OK();
+  }
+
   Status WriteRecordBatch(const RecordBatch& batch) override {
     if (batch.num_rows() == 0) {
       return Status::OK();
@@ -472,24 +488,34 @@ class FileWriterImpl : public FileWriter {
     }
 
     auto WriteBatch = [&](int64_t offset, int64_t size) {
+      if (size <= 0) {
+        return Status::OK();
+      }
       std::vector<std::unique_ptr<ArrowColumnWriterV2>> writers;
       int column_index_start = 0;
 
       for (int i = 0; i < batch.num_columns(); i++) {
         ChunkedArray chunked_array{batch.column(i)};
-        ARROW_ASSIGN_OR_RAISE(
-            std::unique_ptr<ArrowColumnWriterV2> writer,
-            ArrowColumnWriterV2::Make(
-                chunked_array,
-                offset,
-                size,
-                schema_manifest_,
-                row_group_writer_,
-                column_index_start));
+        std::unique_ptr<ArrowColumnWriterV2> writer;
+        {
+          WriterEncodeMetricTimer timer(
+              writerMetrics_ ? &writerMetrics_->writeEncodeWallNanos : nullptr);
+          ARROW_ASSIGN_OR_RAISE(
+              writer,
+              ArrowColumnWriterV2::Make(
+                  chunked_array,
+                  offset,
+                  size,
+                  schema_manifest_,
+                  row_group_writer_,
+                  column_index_start));
+        }
         column_index_start += writer->leaf_count();
         if (arrow_properties_->use_threads()) {
           writers.emplace_back(std::move(writer));
         } else {
+          WriterEncodeMetricTimer timer(
+              writerMetrics_ ? &writerMetrics_->writeEncodeWallNanos : nullptr);
           RETURN_NOT_OK(writer->Write(&column_write_context_));
         }
       }
@@ -499,6 +525,9 @@ class FileWriterImpl : public FileWriter {
         RETURN_NOT_OK(::arrow::internal::ParallelFor(
             static_cast<int>(writers.size()),
             [&](int i) {
+              WriterEncodeMetricTimer timer(
+                  writerMetrics_ ? &writerMetrics_->writeEncodeWallNanos
+                                 : nullptr);
               return writers[i]->Write(&parallel_column_write_contexts_[i]);
             },
             arrow_properties_->executor()));
@@ -516,8 +545,7 @@ class FileWriterImpl : public FileWriter {
       if (numRowsWritten <= 0) {
         return false;
       }
-      // Whether the number of rows will exceed the threshold
-      if (numRowsWritten + numRows > max_row_group_length) {
+      if (numRowsWritten >= max_row_group_length) {
         return true;
       }
       // Parquet_block_size is not set.
@@ -576,6 +604,22 @@ class FileWriterImpl : public FileWriter {
     return 0;
   }
 
+  WriterMemoryStats memoryStats() const override {
+    WriterMemoryStats stats;
+    if (row_group_writer_ != nullptr) {
+      stats = row_group_writer_->memory_stats();
+    }
+    stats.writeContextScratchAllocatedBytes =
+        column_write_context_.scratch_allocated_bytes();
+    for (const auto& ctx : parallel_column_write_contexts_) {
+      stats.writeContextScratchAllocatedBytes += ctx.scratch_allocated_bytes();
+    }
+    stats.trackedWriterMemoryBytes = stats.bufferedPageActualMemoryBytes +
+        stats.encoderCurrentBytes + stats.columnScratchAllocatedBytes +
+        stats.writeContextScratchAllocatedBytes;
+    return stats;
+  }
+
  private:
   friend class FileWriter;
 
@@ -584,9 +628,12 @@ class FileWriterImpl : public FileWriter {
   SchemaManifest schema_manifest_;
 
   std::unique_ptr<ParquetFileWriter> writer_;
+  const std::shared_ptr<WriterMetricsCollector> writerMetrics_;
   RowGroupWriter* row_group_writer_;
   ArrowWriteContext column_write_context_;
   std::shared_ptr<ArrowWriterProperties> arrow_properties_;
+  std::unique_ptr<::arrow::io::IOContext> io_context_;
+  std::unique_ptr<ArrowReaderProperties> arrow_reader_properties_;
   bool closed_;
 
   /// If arrow_properties_.use_threads() is true, the vector size is equal to
@@ -697,7 +744,8 @@ Result<std::unique_ptr<FileWriter>> FileWriter::Open(
           std::move(sink),
           schema_node,
           std::move(properties),
-          std::move(metadata)));
+          std::move(metadata),
+          !arrow_properties->use_threads()));
 
   std::unique_ptr<FileWriter> writer;
   auto schema_ptr = std::make_shared<::arrow::Schema>(schema);

@@ -110,6 +110,21 @@ class FormatData {
         std::vector<uint64_t>>>
         metadataFilterResults;
     int totalCount = 0;
+
+    std::string toString() {
+      std::string str =
+          "filterResult is:" + fmt::format("{}", fmt::join(filterResult, ",")) +
+          "\t";
+      str += "metadataFilterResults is:";
+      for (const auto& x : metadataFilterResults) {
+        str += "<" +
+            (x.first == nullptr ? std::string("nullptr")
+                                : std::string("NOT NULL")) +
+            ", " + fmt::format("{}", fmt::join(x.second, ",")) + ">";
+      }
+      str += "\t" + fmt::format("totalCount is: {}", totalCount);
+      return str;
+    }
   };
 
   /// Applies 'scanSpec' to the metadata of 'this'. Returns row group
@@ -128,7 +143,7 @@ class FormatData {
   /// column statistics and random access, returns the number of rows
   /// in such a group. This is the row group size for ORC and nullopt
   /// for Parquet, where row groups are physically separate runs of
-  /// arbitrary nunber of rows.
+  /// arbitrary number of rows.
   virtual std::optional<int64_t> rowsPerRowGroup() const {
     return std::nullopt;
   }

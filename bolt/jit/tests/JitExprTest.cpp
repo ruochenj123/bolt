@@ -396,7 +396,7 @@ TEST_F(JitFilterProjectTest, testTypes) {
         )sql");
   }
 
-  // WTF: bolt doesn't support >= <= !!!
+  // NOTE: bolt doesn't support >= <= yet
 
   // 1. constant literal expression
   // 2.  + - * / for types integer, real, double
@@ -450,16 +450,5 @@ TEST_F(JitFilterProjectTest, testTypes) {
 }
 
 } // namespace bytedance::bolt::jit::test
-
-int main(int argc, char** argv) {
-  ::testing::InitGoogleTest(&argc, argv);
-
-  // Calls common init functions in the necessary order, initializing
-  // singletons, installing proper signal handlers for better debugging
-  // experience, and initialize glog and gflags.
-  // folly::init(&argc, &argv);
-
-  return RUN_ALL_TESTS();
-}
 
 #endif // #ifdef ENABLE_BOLT_EXPR_JIT

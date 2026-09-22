@@ -28,33 +28,46 @@
 add_executable(bolt_exec_vector_hasher_benchmark VectorHasherBenchmark.cpp)
 
 target_link_libraries(
-  bolt_exec_vector_hasher_benchmark bolt_exec bolt_vector_test_lib ${FOLLY_BENCHMARK}
+  bolt_exec_vector_hasher_benchmark
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 add_executable(bolt_filter_project_benchmark FilterProjectBenchmark.cpp)
 
 target_link_libraries(
-  bolt_filter_project_benchmark bolt_exec bolt_vector_test_lib bolt_exec_test_lib
-  ${FOLLY_BENCHMARK}
+  bolt_filter_project_benchmark
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 add_executable(bolt_exchange_benchmark ExchangeBenchmark.cpp)
 
 target_link_libraries(
-  bolt_exchange_benchmark bolt_exec bolt_exec_test_lib bolt_vector_test_lib ${FOLLY_BENCHMARK}
+  bolt_exchange_benchmark
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 add_executable(bolt_merge_benchmark MergeBenchmark.cpp)
 
 target_link_libraries(
-  bolt_merge_benchmark bolt_exec bolt_vector_test_lib ${FOLLY_BENCHMARK} GTest::gtest
-  GTest::gtest_main
+  bolt_merge_benchmark
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 add_executable(bolt_hash_benchmark HashTableBenchmark.cpp)
 
 target_link_libraries(
-  bolt_hash_benchmark bolt_exec bolt_exec_test_lib bolt_vector_test_lib ${FOLLY_BENCHMARK}
+  bolt_hash_benchmark
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 add_executable(bolt_sort_random_data_benchmark SortRandomDataBenchmark.cpp)
@@ -62,36 +75,25 @@ add_executable(bolt_sort_random_data_benchmark SortRandomDataBenchmark.cpp)
 add_executable(bolt_sort_window_benchmark SortWindowBenchmark.cpp)
 target_link_libraries(
   bolt_sort_random_data_benchmark
-  bolt_hive_connector
-  bolt_exec
-  bolt_exec_test_lib
-  bolt_dwio_common_exception
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  Folly::folly
-  ${FOLLY_BENCHMARK}
-  gflags::gflags
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 add_executable(bolt_hash_join_prepare_join_table_benchmark HashJoinPrepareJoinTableBenchmark.cpp)
 
 target_link_libraries(
-  bolt_hash_join_prepare_join_table_benchmark bolt_exec bolt_exec_test_lib bolt_vector_test_lib
-  ${FOLLY_BENCHMARK}
+  bolt_hash_join_prepare_join_table_benchmark
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 target_link_libraries(
   bolt_sort_window_benchmark
-  bolt_hive_connector
-  bolt_exec
-  bolt_exec_test_lib
-  bolt_dwio_common_exception
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  bolt_window
-  Folly::folly
-  ${FOLLY_BENCHMARK}
-  gflags::gflags
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 if(${BOLT_ENABLE_PARQUET})
@@ -101,52 +103,33 @@ if(${BOLT_ENABLE_PARQUET})
 
   target_link_libraries(
     bolt_sort_benchmark
-    bolt_exec
-    bolt_exec_test_lib
-    bolt_vector_test_lib
-    ${FOLLY_BENCHMARK}
-    arrow::arrow
-    thrift::thrift
-    gfx::timsort
+    PRIVATE
+      bolt_testutils
+      ${FOLLY_BENCHMARK}
   )
 endif()
 
 add_executable(bolt_gather_copy_benchmark GatherCopyBenchmark.cpp)
 target_link_libraries(
-  bolt_gather_copy_benchmark bolt_exec bolt_exec_test_lib bolt_vector_test_lib bolt_vector_fuzzer
+  bolt_gather_copy_benchmark
+  bolt_testutils
   ${FOLLY_BENCHMARK}
 )
 
 add_executable(rowEqVectors_benchmark RowEqVectorsBenchmark.cpp)
 target_link_libraries(
   rowEqVectors_benchmark
-  bolt_aggregates
-  bolt_hive_connector
-  bolt_functions_lib
-  bolt_exec_test_lib
-  bolt_functions_prestosql
-  bolt_dwio_common_exception
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  Folly::folly
-  ${FOLLY_BENCHMARK}
-  gflags::gflags
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 add_executable(hash_vectors_bench HashVectorsBenchmark.cpp)
 target_link_libraries(
   hash_vectors_bench
-  bolt_exec
-  bolt_hive_connector
-  bolt_functions_lib
-  bolt_exec_test_lib
-  bolt_functions_prestosql
-  bolt_dwio_common_exception
-  bolt_vector_fuzzer
-  bolt_vector_test_lib
-  Folly::folly
-  ${FOLLY_BENCHMARK}
-  gflags::gflags
+  PRIVATE
+    bolt_testutils
+    ${FOLLY_BENCHMARK}
 )
 
 set_target_properties(bolt_gather_copy_benchmark PROPERTIES LINK_LIBRARY_OVERRIDE "WHOLE_ARCHIVE,bolt_process") # WHOLE_ARCHIVE/plain mix fix

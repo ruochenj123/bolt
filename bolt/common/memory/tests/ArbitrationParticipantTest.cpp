@@ -40,6 +40,7 @@
 
 #include "bolt/common/base/SuccinctPrinter.h"
 #include "bolt/common/base/tests/GTestUtils.h"
+#include "bolt/common/flags/BoltFlags.h"
 #include "bolt/common/memory/ArbitrationOperation.h"
 #include "bolt/common/memory/ArbitrationParticipant.h"
 #include "bolt/common/memory/MallocAllocator.h"
@@ -51,9 +52,6 @@
 #include "bolt/exec/tests/utils/PlanBuilder.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 #include "gmock/gmock-matchers.h"
-
-DECLARE_bool(bolt_memory_leak_check_enabled);
-DECLARE_bool(bolt_suppress_memory_capacity_exceeding_error_message);
 
 using namespace ::testing;
 using namespace bytedance::bolt::common::testutil;
@@ -378,7 +376,7 @@ class ArbitrationParticipantTest : public testing::Test {
   static void SetUpTestCase() {
     SharedArbitrator::registerFactory();
     FLAGS_bolt_memory_leak_check_enabled = true;
-    TestValue::enable();
+    BOLT_TEST_VALUE_ENABLE();
     MemoryArbitrator::Factory factory =
         [](const MemoryArbitrator::Config& config) {
           return std::make_unique<TestArbitrator>(config);

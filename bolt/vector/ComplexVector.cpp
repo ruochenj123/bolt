@@ -649,7 +649,7 @@ void RowVector::validate(const VectorValidateOptions& options) const {
   }
 
   for (auto& child : children_) {
-    // TODO: Currently we arent checking for null children on ROWs
+    // TODO: Currently we aren't checking for null children on ROWs
     // since there are cases in SelectiveStructReader/DWIO/Koski where
     // ROW Vectors with null children are created.
     if (child != nullptr) {
@@ -695,8 +695,8 @@ void RowVector::resize(vector_size_t newSize, bool setNotNull) {
 }
 
 // static
-bool RowVector::isComposite(std::shared_ptr<RowVector>& input) {
-  return dynamic_cast<CompositeRowVector*>(input.get()) != nullptr;
+bool RowVector::isComposite(const std::shared_ptr<RowVector>& input) {
+  return std::dynamic_pointer_cast<CompositeRowVector>(input) != nullptr;
 }
 
 void ArrayVectorBase::checkRanges() const {
@@ -1332,7 +1332,7 @@ void MapVector::prepareForReuse() {
 }
 
 VectorPtr MapVector::slice(vector_size_t offset, vector_size_t length) const {
-  return std::make_shared<MapVector>(
+  auto sliced = std::make_shared<MapVector>(
       pool_,
       type_,
       sliceNulls(offset, length),
@@ -1343,6 +1343,9 @@ VectorPtr MapVector::slice(vector_size_t offset, vector_size_t length) const {
              : sizes_,
       keys_,
       values_);
+  sliced->setMayChangeContentUnderSameAddress(
+      mayChangeContentUnderSameAddress());
+  return sliced;
 }
 
 void MapVector::validate(const VectorValidateOptions& options) const {

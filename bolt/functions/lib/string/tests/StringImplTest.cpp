@@ -29,6 +29,7 @@
  */
 
 #include "bolt/functions/lib/string/StringImpl.h"
+#include "bolt/common/base/SparkCompatibility.h"
 #include "bolt/common/base/tests/GTestUtils.h"
 #include "bolt/core/CoreTypeSystem.h"
 #include "bolt/functions/lib/string/JavaStyleSplit.h"
@@ -91,6 +92,29 @@ class StringImplTest : public testing::Test {
          "абвгдежзийклмнопрстуфхцчшщъыьэюя"}};
   }
 };
+
+TEST_F(StringImplTest, isAscii) {
+  constexpr size_t kSimdWidth = xsimd::batch<uint8_t>::size;
+  constexpr size_t kMaxLength = 2 * kSimdWidth + 1;
+  std::string input(kMaxLength + 1, 'a');
+
+  // Start at an unaligned address and cover lengths around the first two SIMD
+  // boundaries. Deriving the range from the native batch width covers SSE,
+  // AVX/AVX2, and AVX-512 builds.
+  const char* data = input.data() + 1;
+  for (size_t length = 0; length <= kMaxLength; ++length) {
+    EXPECT_TRUE(isAscii(data, length));
+
+    for (size_t nonAsciiPosition = 0; nonAsciiPosition < length;
+         ++nonAsciiPosition) {
+      input[nonAsciiPosition + 1] = static_cast<char>(0x80);
+      EXPECT_FALSE(isAscii(data, length))
+          << "length: " << length
+          << ", non-ASCII position: " << nonAsciiPosition;
+      input[nonAsciiPosition + 1] = 'a';
+    }
+  }
+}
 
 TEST_F(StringImplTest, upperAscii) {
   for (auto& testCase : getUpperAsciiTestData()) {
@@ -1288,6 +1312,16 @@ TEST_F(StringImplTest, toLower) {
   EXPECT_EQ(
       toLower<true>(std::string_view("ΕΠΕΙΔΗ Η ΑΝΑΓΝΩΡΙΣΗ ΤΗΣ ΑΞΙΟΠΡΕΠΕΙΑΣ")),
       "επειδη η αναγνωριση της αξιοπρεπειας");
+  if constexpr (kSparkCompatible) {
+    // Exercise sparse and repeated Sigma adjustments, including more offsets
+    // than fit in the inline small-vector buffer.
+    EXPECT_EQ(
+        (toLower<false, kSparkCompatible>(std::string_view("AΣ8B"))), "aσ8b");
+    EXPECT_EQ(
+        (toLower<false, kSparkCompatible>(std::string_view("AΣ AΣ AΣ AΣ AΣ"))),
+        "aς aς aς aς aς");
+    EXPECT_EQ((toLower<false, kSparkCompatible>(std::string_view("AΣ"))), "aς");
+  }
   // Surrogate pairs.
   EXPECT_EQ(toLower<true>(std::string_view("a🙃b🙃c")), "a🙃b🙃c");
   EXPECT_EQ(toLower<true>(std::string_view("😀😆😃😄😄😆")), "😀😆😃😄😄😆");
@@ -1358,7 +1392,7 @@ TEST_F(StringImplTest, md5_radix) {
   ret = md5_radix<std::string, std::string>(out, std::string("a"), 10);
   EXPECT_TRUE(ret);
   std::string out10 = "16955237001963240173058271559858";
-  // just for compitable with the previous code, we need to resize the output
+  // just for compatible with the previous code, we need to resize the output
   // string to 38 characters.
   out10.resize(38);
   EXPECT_EQ(out10, out10);

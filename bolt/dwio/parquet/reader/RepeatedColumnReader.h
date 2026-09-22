@@ -35,7 +35,7 @@
 #include "bolt/dwio/parquet/reader/ParquetData.h"
 namespace bytedance::bolt::parquet {
 
-/// Comtainer for the lengths of a repeated reader where the lengths are
+/// Container for the lengths of a repeated reader where the lengths are
 /// pre-filled from repdefs.
 class RepeatedLengths {
  public:
@@ -54,13 +54,20 @@ class RepeatedLengths {
 
   void readLengths(int32_t* FOLLY_NONNULL lengths, int32_t numLengths) {
     BOLT_CHECK_NOT_NULL(lengths_);
-    BOLT_CHECK_LE(
-        nextLengthIndex_ + numLengths, lengths_->size() / sizeof(int32_t));
-    memcpy(
-        lengths,
-        lengths_->as<int32_t>() + nextLengthIndex_,
-        numLengths * sizeof(int32_t));
-    nextLengthIndex_ += numLengths;
+    const int32_t available =
+        static_cast<int32_t>(lengths_->size() / sizeof(int32_t)) -
+        nextLengthIndex_;
+    const int32_t toCopy = std::min(numLengths, available);
+    if (toCopy > 0) {
+      memcpy(
+          lengths,
+          lengths_->as<int32_t>() + nextLengthIndex_,
+          toCopy * sizeof(int32_t));
+    }
+    if (toCopy < numLengths) {
+      std::memset(lengths + toCopy, 0, (numLengths - toCopy) * sizeof(int32_t));
+    }
+    nextLengthIndex_ += toCopy;
   }
 
  private:
@@ -107,6 +114,14 @@ class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
   /// Sets nulls and lengths of 'this' for the range of top level rows for which
   /// these have been decoded in 'leaf'.
   void setLengthsFromRepDefs(PageReader& leaf);
+  const arrow::LevelInfo& levelInfo() const {
+    return levelInfo_;
+  }
+  BufferPtr prepareRepDefLengths(int32_t maxItems);
+  arrow::ValidityBitmapInputOutput prepareRepDefNulls(int32_t maxItems);
+  void setLengthsFromRepDefOutput(
+      BufferPtr lengths,
+      const arrow::ValidityBitmapInputOutput& bits);
 
   /// advances 'this' to the end of the previously provided lengths/nulls. This
   /// is needed if lists are conditionally read from different structs that all
@@ -166,6 +181,14 @@ class ListColumnReader : public dwio::common::SelectiveListColumnReader {
   /// Sets nulls and lengths of 'this' for the range of top level rows for which
   /// these have been decoded in 'leaf'.
   void setLengthsFromRepDefs(PageReader& leaf);
+  const arrow::LevelInfo& levelInfo() const {
+    return levelInfo_;
+  }
+  BufferPtr prepareRepDefLengths(int32_t maxItems);
+  arrow::ValidityBitmapInputOutput prepareRepDefNulls(int32_t maxItems);
+  void setLengthsFromRepDefOutput(
+      BufferPtr lengths,
+      const arrow::ValidityBitmapInputOutput& bits);
 
   /// advances 'this' to the end of the previously provided lengths/nulls. This
   /// is needed if lists are conditionally read from different structs that all
@@ -190,5 +213,9 @@ class ListColumnReader : public dwio::common::SelectiveListColumnReader {
 /// repeated reader. The topmost repeated reader ensures repdefs for
 /// all its children.
 void ensureRepDefs(dwio::common::SelectiveColumnReader& reader, int32_t numTop);
+
+void skipRepDefsInChunks(
+    dwio::common::SelectiveColumnReader& reader,
+    int64_t num);
 
 } // namespace bytedance::bolt::parquet

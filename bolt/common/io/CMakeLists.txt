@@ -25,6 +25,10 @@
 # This modified file is released under the same license.
 # --------------------------------------------------------------------------
 
-add_library(bolt_common_io IoStatistics.cpp)
+bolt_add_library(bolt_common_io IoStatistics.cpp)
 
-target_link_libraries(bolt_common_io Folly::folly glog::glog)
+target_link_libraries(
+  bolt_common_io
+  Folly::folly
+  glog::glog
+)

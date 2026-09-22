@@ -30,6 +30,7 @@
 
 #include "bolt/dwio/common/ScanSpec.h"
 #include "bolt/dwio/common/Statistics.h"
+#include "bolt/type/Type.h"
 namespace bytedance::bolt::common {
 
 ScanSpec& ScanSpec::operator=(const ScanSpec& other) {
@@ -51,6 +52,8 @@ ScanSpec& ScanSpec::operator=(const ScanSpec& other) {
     childByFieldName_ = other.childByFieldName_;
     valueHook_ = other.valueHook_;
     isArrayElementOrMapEntry_ = other.isArrayElementOrMapEntry_;
+    logicalTypeName_ = other.logicalTypeName_;
+    convertedTypeName_ = other.convertedTypeName_;
     maxArrayElementsCount_ = other.maxArrayElementsCount_;
     isRowIndex_ = other.isRowIndex_;
     rowIndexBase_ = other.rowIndexBase_;
@@ -68,6 +71,8 @@ ScanSpec* ScanSpec::getOrCreateChild(const std::string& name) {
   }
   this->children_.push_back(std::make_unique<ScanSpec>(name));
   auto* child = this->children_.back().get();
+  child->setExpressionEvaluator(this->expressionEvaluator_);
+  child->setRuntimeStatistics(this->statis_);
   this->childByFieldName_[child->fieldName()] = child;
   return child;
 }
@@ -172,6 +177,18 @@ bool ScanSpec::hasFilter() const {
   }
   hasFilter_ = false;
   return false;
+}
+
+bool ScanSpec::testNull() const {
+  if (filter_ && !filter_->testNull()) {
+    return false;
+  }
+  for (auto& child : children_) {
+    if (!child->isArrayElementOrMapEntry_ && !child->testNull()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void ScanSpec::moveAdaptationFrom(ScanSpec& other) {
@@ -594,9 +611,23 @@ void ScanSpec::addAllChildFields(const Type& type) {
     case TypeKind::ARRAY:
       addArrayElementFieldRecursively(*type.childAt(0));
       break;
+    case TypeKind::VARIANT: {
+      const auto& variantType = static_cast<const VariantType&>(type);
+      for (auto i = 0; i < type.size(); ++i) {
+        addFieldRecursively(
+            variantType.nameOf(i), *type.childAt(i), ScanSpec::kNoChannel);
+      }
+      break;
+    }
     default:
       break;
   }
+}
+
+void ScanSpec::removeAllChildFields() {
+  children_.clear();
+  stableChildren_.clear();
+  childByFieldName_.clear();
 }
 
 } // namespace bytedance::bolt::common

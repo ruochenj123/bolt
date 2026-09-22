@@ -45,8 +45,8 @@
 #include "bolt/vector/VectorTypeUtils.h"
 
 #ifdef ENABLE_BOLT_JIT
+#include "bolt/jit/CompiledModule.h"
 #include "bolt/jit/RowContainer/RowContainerCodeGenerator.h"
-#include "bolt/jit/common.h"
 
 #endif
 namespace bytedance::bolt::exec {
@@ -130,6 +130,9 @@ struct RowContainerIterator {
   char* FOLLY_NULLABLE rowBegin{nullptr};
   // First byte after the end of the range containing 'currentRow'.
   char* FOLLY_NULLABLE endOfRun{nullptr};
+
+  // Cursor used by fast row listing with cached row pointers.
+  int32_t listRowCursor{0};
 
   // Returns the current row, skipping a possible normalized key below the first
   // byte of row.
@@ -229,6 +232,18 @@ class RowContainer {
       memory::MemoryPool* FOLLY_NONNULL pool)
       : RowContainer(
             keyTypes,
+            dependentTypes,
+            false, // useListRowIndex
+            pool) {}
+
+  // Convenience overload to enable fast row listing via cached pointers.
+  RowContainer(
+      const std::vector<TypePtr>& keyTypes,
+      const std::vector<TypePtr>& dependentTypes,
+      bool useListRowIndex,
+      memory::MemoryPool* FOLLY_NONNULL pool)
+      : RowContainer(
+            keyTypes,
             true, // nullableKeys
             std::vector<Accumulator>{},
             dependentTypes,
@@ -236,6 +251,7 @@ class RowContainer {
             false, // isJoinBuild
             false, // hasProbedFlag
             false, // hasNormalizedKey
+            useListRowIndex,
             pool) {}
 
   ~RowContainer();
@@ -270,6 +286,7 @@ class RowContainer {
       bool isJoinBuild,
       bool hasProbedFlag,
       bool hasNormalizedKey,
+      bool useListRowIndex,
       memory::MemoryPool* FOLLY_NONNULL pool,
       std::shared_ptr<HashStringAllocator> stringAllocator = nullptr);
 
@@ -362,11 +379,12 @@ class RowContainer {
       const std::vector<char*>& rows, // span
       size_t column) {
     auto numKeys = keyTypes_.size();
-    if (column < numKeys && !nullableKeys_) {
+    bool isKey = column < numKeys;
+    if (isKey && !nullableKeys_) {
       auto off = offsets_[column];
 
       for (auto r = 0; r < size; ++r) {
-        storeNoNulls<Kind>(decoded, r, rows[r], off);
+        storeNoNulls<Kind>(decoded, r, isKey, rows[r], off);
       }
     } else {
       BOLT_DCHECK(column < keyTypes_.size() || accumulators_.empty());
@@ -376,7 +394,7 @@ class RowContainer {
       auto mask = rowColumn.nullMask();
 
       for (auto r = 0; r < size; ++r) {
-        storeWithNulls<Kind>(decoded, r, rows[r], off, nullByte, mask);
+        storeWithNulls<Kind>(decoded, r, isKey, rows[r], off, nullByte, mask);
       }
     }
   }
@@ -544,6 +562,22 @@ class RowContainer {
   /// There is a barrier but tsan does not know this.
   enum class ProbeType { kAll, kProbed, kNotProbed };
 
+  /// Fast path for `listRows` that returns `rowPointers_` directly. Used by
+  /// `SortBuffer` and `SortInputSpiller`, so it skips checking the free and
+  /// probe flags.
+  int32_t listRowsFast(
+      RowContainerIterator* FOLLY_NONNULL iter,
+      int32_t maxRows,
+      char* FOLLY_NONNULL* FOLLY_NONNULL rows) const {
+    int32_t count = 0;
+    while (count < maxRows &&
+           iter->listRowCursor < static_cast<int32_t>(rowPointers_.size())) {
+      rows[count++] = rowPointers_[iter->listRowCursor];
+      ++iter->listRowCursor;
+    }
+    return count;
+  }
+
   template <ProbeType probeType>
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
@@ -631,6 +665,9 @@ class RowContainer {
       RowContainerIterator* FOLLY_NONNULL iter,
       int32_t maxRows,
       char* FOLLY_NONNULL* FOLLY_NONNULL rows) {
+    if (useListRowIndex_) {
+      return listRowsFast(iter, maxRows, rows);
+    }
     return listRows<ProbeType::kAll>(iter, maxRows, kUnlimited, rows);
   }
 
@@ -801,6 +838,10 @@ class RowContainer {
   codegenRowEqVectors(const std::vector<TypePtr>& keyTypes, bool haveNulls);
 
 #endif
+
+  const std::vector<char*, StlAllocator<char*>>& testingRowPointers() const {
+    return rowPointers_;
+  }
 
   memory::MemoryPool* FOLLY_NONNULL pool() const {
     return stringAllocator_->pool();
@@ -1010,6 +1051,7 @@ class RowContainer {
   inline void storeWithNulls(
       const DecodedVector& decoded,
       vector_size_t index,
+      bool isKey,
       char* FOLLY_NONNULL row,
       int32_t offset,
       int32_t nullByte,
@@ -1047,6 +1089,7 @@ class RowContainer {
   inline void storeNoNulls(
       const DecodedVector& decoded,
       vector_size_t index,
+      bool isKey,
       char* FOLLY_NONNULL group,
       int32_t offset) {
     using T = typename TypeTraits<Kind>::NativeType;
@@ -1075,7 +1118,7 @@ class RowContainer {
     BufferPtr& nullBuffer = result->mutableNulls(maxRows);
     auto nulls = nullBuffer->asMutable<uint64_t>();
     BufferPtr valuesBuffer = result->mutableValues(maxRows);
-    auto values = valuesBuffer->asMutableRange<T>();
+    [[maybe_unused]] auto values = valuesBuffer->asMutableRange<T>();
     for (int32_t i = 0; i < numRows; ++i) {
       const char* row;
       if constexpr (useRowNumbers) {
@@ -1111,7 +1154,7 @@ class RowContainer {
     auto maxRows = numRows + resultOffset;
     BOLT_DCHECK_LE(maxRows, result->size());
     BufferPtr valuesBuffer = result->mutableValues(maxRows);
-    auto values = valuesBuffer->asMutableRange<T>();
+    [[maybe_unused]] auto values = valuesBuffer->asMutableRange<T>();
     for (int32_t i = 0; i < numRows; ++i) {
       const char* row;
       if constexpr (useRowNumbers) {
@@ -1297,6 +1340,7 @@ class RowContainer {
   void storeComplexType(
       const DecodedVector& decoded,
       vector_size_t index,
+      bool isKey,
       char* FOLLY_NONNULL row,
       int32_t offset,
       int32_t nullByte = 0,
@@ -1452,6 +1496,8 @@ class RowContainer {
   int32_t fixedRowSize_;
   // True if normalized keys are enabled in initial state.
   const bool hasNormalizedKeys_;
+  // Whether to use cached row pointers for fast listing.
+  const bool useListRowIndex_;
   // The count of entries that have an extra normalized_key_t before the
   // start.
   int64_t numRowsWithNormalizedKey_ = 0;
@@ -1471,6 +1517,7 @@ class RowContainer {
 
   memory::AllocationPool rows_;
   std::shared_ptr<HashStringAllocator> stringAllocator_;
+  std::vector<char*, StlAllocator<char*>> rowPointers_;
 
   int alignment_ = 1;
 };
@@ -1486,66 +1533,73 @@ template <>
 inline void RowContainer::storeWithNulls<TypeKind::ROW>(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool isKey,
     char* FOLLY_NONNULL row,
     int32_t offset,
     int32_t nullByte,
     uint8_t nullMask) {
-  storeComplexType(decoded, index, row, offset, nullByte, nullMask);
+  storeComplexType(decoded, index, isKey, row, offset, nullByte, nullMask);
 }
 
 template <>
 inline void RowContainer::storeNoNulls<TypeKind::ROW>(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool isKey,
     char* FOLLY_NONNULL row,
     int32_t offset) {
-  storeComplexType(decoded, index, row, offset);
+  storeComplexType(decoded, index, isKey, row, offset);
 }
 
 template <>
 inline void RowContainer::storeWithNulls<TypeKind::ARRAY>(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool isKey,
     char* FOLLY_NONNULL row,
     int32_t offset,
     int32_t nullByte,
     uint8_t nullMask) {
-  storeComplexType(decoded, index, row, offset, nullByte, nullMask);
+  storeComplexType(decoded, index, isKey, row, offset, nullByte, nullMask);
 }
 
 template <>
 inline void RowContainer::storeNoNulls<TypeKind::ARRAY>(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool isKey,
     char* FOLLY_NONNULL row,
     int32_t offset) {
-  storeComplexType(decoded, index, row, offset);
+  storeComplexType(decoded, index, isKey, row, offset);
 }
 
 template <>
 inline void RowContainer::storeWithNulls<TypeKind::MAP>(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool isKey,
     char* FOLLY_NONNULL row,
     int32_t offset,
     int32_t nullByte,
     uint8_t nullMask) {
-  storeComplexType(decoded, index, row, offset, nullByte, nullMask);
+  storeComplexType(decoded, index, isKey, row, offset, nullByte, nullMask);
 }
 
 template <>
 inline void RowContainer::storeNoNulls<TypeKind::MAP>(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool isKey,
     char* FOLLY_NONNULL row,
     int32_t offset) {
-  storeComplexType(decoded, index, row, offset);
+  storeComplexType(decoded, index, isKey, row, offset);
 }
 
 template <>
 inline void RowContainer::storeWithNulls<TypeKind::HUGEINT>(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool /*isKey*/,
     char* FOLLY_NONNULL row,
     int32_t offset,
     int32_t nullByte,
@@ -1564,6 +1618,7 @@ template <>
 inline void RowContainer::storeNoNulls<TypeKind::HUGEINT>(
     const DecodedVector& decoded,
     vector_size_t index,
+    bool /*isKey*/,
     char* FOLLY_NONNULL row,
     int32_t offset) {
   HugeInt::serialize(decoded.valueAt<int128_t>(index), row + offset);
@@ -2005,6 +2060,18 @@ class HybridContainer {
     return totalBatches_;
   }
 
+  /// Returns the total payload memory bytes that would be needed to coalesce
+  /// all payload batches. This is the sum of estimateFlatSize() for all payload
+  /// columns across all batches. Used by SortBuffer to account for the memory
+  /// required for coalescing when making spill decisions.
+  uint64_t payloadMemoryBytes() const {
+    uint64_t total = 0;
+    for (const auto& bytes : payloadFlatBytesSum_) {
+      total += bytes;
+    }
+    return total;
+  }
+
   void setId(uint8_t id) {
     id_ = id;
   }
@@ -2148,9 +2215,10 @@ class HybridContainer {
 
     auto* pool = keys_->pool();
     const auto numPayloadCols = payloadTypes_.size();
-    
-    // Handle empty container: create an empty batch to maintain single-batch invariant.
-    // This ensures getSingleContainerData() works even when no data was added.
+
+    // Handle empty container: create an empty batch to maintain single-batch
+    // invariant. This ensures getSingleContainerData() works even when no data
+    // was added.
     if (owningInputs_.empty()) {
       std::vector<VectorPtr> emptyChildren;
       emptyChildren.reserve(numPayloadCols);
@@ -2158,7 +2226,8 @@ class HybridContainer {
       payloadNames.reserve(numPayloadCols);
       for (int32_t col = 0; col < numPayloadCols; ++col) {
         payloadNames.push_back(fmt::format("c{}", col));
-        emptyChildren.push_back(BaseVector::create(payloadTypes_[col], 0, pool));
+        emptyChildren.push_back(
+            BaseVector::create(payloadTypes_[col], 0, pool));
       }
       owningInputs_.push_back(std::make_shared<RowVector>(
           pool,
@@ -2171,7 +2240,6 @@ class HybridContainer {
     }
 
     const auto totalRows = totalRows_;
-    const auto numBatches = owningInputs_.size();
 
     std::vector<VectorPtr> newChildren;
     newChildren.reserve(numPayloadCols);
@@ -2208,7 +2276,6 @@ class HybridContainer {
         std::move(newChildren)));
 
     totalBatches_ = 1;
-
   }
 
  private:
@@ -2271,38 +2338,58 @@ class HybridContainer {
       bool exactSize) {
     result->resize(numRows + resultOffset);
     BOLT_CHECK_EQ(numRows, outputRowIds.size());
-    BOLT_CHECK(Kind != TypeKind::ROW, "Currently do not support ROW");
-    if (Kind == TypeKind::ARRAY || Kind == TypeKind::MAP) {
+    if (Kind == TypeKind::ARRAY || Kind == TypeKind::MAP ||
+        Kind == TypeKind::ROW) {
       extractPayloadComplex(
           numRows, columnIndex, resultOffset, result, outputRowIds);
       return;
     }
-    BOLT_CHECK(Kind != TypeKind::ROW && Kind != TypeKind::MAP);
+    BOLT_CHECK(Kind != TypeKind::MAP);
     using T = typename KindToFlatVector<Kind>::HashRowType;
     auto flatResult = result->as<FlatVector<T>>();
 
-    // Scattered mode: payloads kept in separate batches
+    // Scattered mode path: use DecodedVector for extraction
     if (scatteredModeEnabled_) {
       if (isSingleContainer()) {
         if (isNullable_[columnIndex]) {
           extractPayloadScatteredWithNulls<T, useRowNumbers>(
-              rows, rowNumbers, numRows, columnIndex, resultOffset,
-              flatResult, outputRowIds);
+              rows,
+              rowNumbers,
+              numRows,
+              columnIndex,
+              resultOffset,
+              flatResult,
+              outputRowIds);
         } else {
           extractPayloadScatteredNoNulls<T, useRowNumbers>(
-              rows, rowNumbers, numRows, columnIndex, resultOffset,
-              flatResult, outputRowIds);
+              rows,
+              rowNumbers,
+              numRows,
+              columnIndex,
+              resultOffset,
+              flatResult,
+              outputRowIds);
         }
       } else {
         // Multi-container scattered mode
         if (isNullable_[columnIndex]) {
           extractPayloadScatteredWithNullsMulti<T, useRowNumbers>(
-              rows, rowNumbers, numRows, columnIndex, resultOffset,
-              flatResult, outputRowIds);
+              rows,
+              rowNumbers,
+              numRows,
+              columnIndex,
+              resultOffset,
+              flatResult,
+              outputRowIds);
         } else {
           extractPayloadScatteredNoNullsMulti<T, useRowNumbers>(
-              rows, rowNumbers, numRows, columnIndex, resultOffset,
-              flatResult, outputRowIds);
+              rows,
+              rowNumbers,
+              numRows,
+              columnIndex,
+              resultOffset,
+              flatResult,
+              outputRowIds);
         }
       }
       return;
@@ -2596,9 +2683,11 @@ class HybridContainer {
     }
   }
 
-  // ========== Scattered mode extraction (non-coalesced batches) ==========
-  // Optimization: 4-way unrolled prefetch for better cache utilization.
-  // Cache data pointers per batch and prefetch future row data locations.
+  // ========== End single-container fast path implementations ==========
+
+  // ========== Scattered mode extraction implementations ==========
+  // These use DecodedVector for extraction from non-coalesced batches.
+  // rowId encodes (batchId, rowInBatch) instead of global row index.
 
   template <typename T, bool useRowNumbers>
   void extractPayloadScatteredNoNulls(
@@ -2616,7 +2705,6 @@ class HybridContainer {
     auto values = valuesBuffer->asMutableRange<T>();
     auto* rowIdPtr = outputRowIds.data();
 
-    // Simple loop using DecodedVector - no prefetch complexity
     for (int32_t i = 0; i < numRows; ++i) {
       const char* row;
       if constexpr (useRowNumbers) {
@@ -2634,10 +2722,10 @@ class HybridContainer {
 
       result->setNull(resultIndex, false);
       const auto& rid = rowIdPtr[i];
-      auto batchIdx = rid.batchId();
-      auto rowInBatch = rid.rowInBatch();
-
-      T value = decodedPayloads_[batchIdx][columnIndex]->valueAt<T>(rowInBatch);
+      const auto batchIdx = rid.batchId();
+      const auto rowInBatch = rid.rowInBatch();
+      T value = decodedPayloads_[batchIdx][columnIndex]->template valueAt<T>(
+          rowInBatch);
       if constexpr (std::is_same_v<T, StringView>) {
         result->set(resultIndex, value);
       } else {
@@ -2645,7 +2733,6 @@ class HybridContainer {
       }
     }
   }
-
 
   template <typename T, bool useRowNumbers>
   void extractPayloadScatteredWithNulls(
@@ -2659,11 +2746,12 @@ class HybridContainer {
     auto maxRows = numRows + resultOffset;
     BOLT_DCHECK_LE(maxRows, result->size());
 
+    BufferPtr& nullBuffer = result->mutableNulls(maxRows);
+    auto nulls = nullBuffer->asMutable<uint64_t>();
     BufferPtr valuesBuffer = result->mutableValues(maxRows);
     auto values = valuesBuffer->asMutableRange<T>();
     auto* rowIdPtr = outputRowIds.data();
 
-    // Simple loop using DecodedVector - no prefetch complexity
     for (int32_t i = 0; i < numRows; ++i) {
       const char* row;
       if constexpr (useRowNumbers) {
@@ -2675,22 +2763,21 @@ class HybridContainer {
 
       const auto resultIndex = resultOffset + i;
       if (row == nullptr) {
-        result->setNull(resultIndex, true);
+        bits::setNull(nulls, resultIndex, true);
         continue;
       }
 
       const auto& rid = rowIdPtr[i];
-      auto batchIdx = rid.batchId();
-      auto rowInBatch = rid.rowInBatch();
-
-      // Check for null in the payload
-      if (decodedPayloads_[batchIdx][columnIndex]->isNullAt(rowInBatch)) {
-        result->setNull(resultIndex, true);
+      const auto batchIdx = rid.batchId();
+      const auto rowInBatch = rid.rowInBatch();
+      auto* decoded = decodedPayloads_[batchIdx][columnIndex].get();
+      if (decoded->isNullAt(rowInBatch)) {
+        bits::setNull(nulls, resultIndex, true);
         continue;
       }
 
-      result->setNull(resultIndex, false);
-      T value = decodedPayloads_[batchIdx][columnIndex]->valueAt<T>(rowInBatch);
+      bits::setNull(nulls, resultIndex, false);
+      T value = decoded->template valueAt<T>(rowInBatch);
       if constexpr (std::is_same_v<T, StringView>) {
         result->set(resultIndex, value);
       } else {
@@ -2699,10 +2786,7 @@ class HybridContainer {
     }
   }
 
-  // ========== Multi-container scattered mode extraction ==========
-  // Each container has its own decodedPayloads_, indexed by [batchIdx][columnIndex].
-  // Uses containerId_ to find the right container, then batchId()/rowInBatch() to locate data.
-
+  // Multi-container scattered mode extraction
   template <typename T, bool useRowNumbers>
   void extractPayloadScatteredNoNullsMulti(
       const char* FOLLY_NONNULL const* FOLLY_NONNULL rows,
@@ -2782,6 +2866,8 @@ class HybridContainer {
     auto maxRows = numRows + resultOffset;
     BOLT_DCHECK_LE(maxRows, result->size());
 
+    BufferPtr& nullBuffer = result->mutableNulls(maxRows);
+    auto nulls = nullBuffer->asMutable<uint64_t>();
     BufferPtr valuesBuffer = result->mutableValues(maxRows);
     auto values = valuesBuffer->asMutableRange<T>();
     auto* rowIdPtr = outputRowIds.data();
@@ -2806,7 +2892,7 @@ class HybridContainer {
 
       const auto resultIndex = resultOffset + i;
       if (row == nullptr) {
-        result->setNull(resultIndex, true);
+        bits::setNull(nulls, resultIndex, true);
         continue;
       }
 
@@ -2820,20 +2906,20 @@ class HybridContainer {
                    "Container {} not found", currentContainerId);
       }
 
-      auto batchIdx = rid.batchId();
-      auto rowInBatch = rid.rowInBatch();
+      const auto batchIdx = rid.batchId();
+      const auto rowInBatch = rid.rowInBatch();
 
       BOLT_DCHECK_LT(batchIdx, currentDecodedPayloads->size());
       BOLT_DCHECK_LT(columnIndex, (*currentDecodedPayloads)[batchIdx].size());
 
-      // Check for null in the payload
-      if ((*currentDecodedPayloads)[batchIdx][columnIndex]->isNullAt(rowInBatch)) {
-        result->setNull(resultIndex, true);
+      auto* decoded = (*currentDecodedPayloads)[batchIdx][columnIndex].get();
+      if (decoded->isNullAt(rowInBatch)) {
+        bits::setNull(nulls, resultIndex, true);
         continue;
       }
 
-      result->setNull(resultIndex, false);
-      T value = (*currentDecodedPayloads)[batchIdx][columnIndex]->valueAt<T>(rowInBatch);
+      bits::setNull(nulls, resultIndex, false);
+      T value = decoded->template valueAt<T>(rowInBatch);
       if constexpr (std::is_same_v<T, StringView>) {
         result->set(resultIndex, value);
       } else {
@@ -2843,7 +2929,6 @@ class HybridContainer {
   }
 
   // ========== End scattered mode extraction implementations ==========
-  // ========== End single-container fast path implementations ==========
 
   template <typename T, bool useRowNumbers>
   void extractPayloadWithNulls(
@@ -3255,15 +3340,13 @@ class HybridContainer {
   // Default true for better cache locality. Can be disabled for testing.
   bool reorderEnabled_{true};
 
-  // Controls whether scattered (non-coalesced) mode is used.
-  // In scattered mode, payload batches are kept separate and row IDs
-  // encode (batchId, rowInBatch) instead of global row index.
+  // Scattered mode: keep payload batches separate (no coalesce).
+  // In scattered mode, rowId encodes (batchId, rowInBatch) instead of global
+  // row index.
   bool scatteredModeEnabled_{false};
 
-  // Decoded payload vectors for scattered mode extraction.
-  // Outer vector: per batch (same index as owningInputs_)
-  // Inner vector: per payload column
-  // Using DecodedVector allows efficient access to any encoding (flat, dictionary, lazy).
+  // Pre-decoded payload vectors for scattered mode extraction.
+  // Indexed by [batchIndex][columnIndex].
   std::vector<std::vector<std::unique_ptr<DecodedVector>>> decodedPayloads_;
 };
 
@@ -3315,7 +3398,7 @@ inline void HybridContainer::extractNulls(
     BOLT_DCHECK(result->size() >= bits::nbytes(numRows));
     auto* rawResult = result->asMutable<uint64_t>();
     bits::fillBits(rawResult, 0, numRows, false);
-    if (!isNullable_[columnIndex]) {
+    if (!isNullable_[payloadColumnIndex]) {
       return;
     }
     std::vector<const uint64_t*> rawNullsByContainer(
@@ -3344,6 +3427,5 @@ inline void HybridContainer::extractNulls(
     }
   }
 }
-
 
 } // namespace bytedance::bolt::exec

@@ -239,21 +239,7 @@ void SortWindowBuild::noMoreInput() {
     // At this point we have seen all the input rows which are sorted. This will
     // compute the index for each partition.
     computePartitionStartRows();
-    if (table_) {
-      BaseHashTable::RowsIterator partitionIt;
-      static const size_t kPartitionBatchSize = 1000;
-      std::vector<char*> partitions{kPartitionBatchSize};
-      while (auto numPartitions = table_->listAllRows(
-                 &partitionIt,
-                 partitions.size(),
-                 RowContainer::kUnlimited,
-                 partitions.data())) {
-        for (auto i = 0; i < numPartitions; ++i) {
-          std::destroy_at(
-              reinterpret_cast<TopRows*>(partitions[i] + partitionOffset_));
-        }
-      }
-    }
+    clearTopRows();
   }
 }
 
@@ -436,7 +422,11 @@ std::shared_ptr<WindowPartition> SortWindowBuild::nextPartition() {
     BOLT_CHECK(!sortRows_.empty(), "No window partitions available");
     auto partition = folly::Range(sortRows_.data(), sortRows_.size());
     return std::make_shared<WindowPartitionImpl<RowFormat::kRowContainer>>(
-        data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+        data_.get(),
+        partition,
+        inversedInputChannels_,
+        sortKeyInfo_,
+        enableJit_);
   }
 
   if (rowBasedSpillSortMerger_ != nullptr) {
@@ -479,7 +469,11 @@ std::shared_ptr<WindowPartition> SortWindowBuild::nextPartition() {
         sortRows_.data() + partitionStartRows_[currentPartition_],
         partitionSize);
     return std::make_shared<WindowPartitionImpl<RowFormat::kSerializedRows>>(
-        data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+        data_.get(),
+        partition,
+        inversedInputChannels_,
+        sortKeyInfo_,
+        enableJit_);
   }
 
   BOLT_CHECK(!partitionStartRows_.empty(), "No window partitions available")
@@ -496,7 +490,7 @@ std::shared_ptr<WindowPartition> SortWindowBuild::nextPartition() {
   auto partition = folly::Range(
       sortRows_.data() + partitionStartRows_[currentPartition_], partitionSize);
   return std::make_shared<WindowPartitionImpl<RowFormat::kRowContainer>>(
-      data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+      data_.get(), partition, inversedInputChannels_, sortKeyInfo_, enableJit_);
 }
 
 bool SortWindowBuild::hasNextPartition() {
@@ -521,6 +515,40 @@ void SortWindowBuild::initializeNewPartitions() {
   for (auto index : lookup_->newGroups) {
     new (lookup_->hits[index] + partitionOffset_)
         TopRows(table_->stringAllocator(), comparator_);
+  }
+}
+
+void SortWindowBuild::clearTopRows() {
+  if (!table_) {
+    return;
+  }
+
+  BaseHashTable::RowsIterator partitionIt;
+  static const size_t kPartitionBatchSize = 1000;
+  std::vector<char*> partitions{kPartitionBatchSize};
+  while (auto numPartitions = table_->listAllRows(
+             &partitionIt,
+             partitions.size(),
+             RowContainer::kUnlimited,
+             partitions.data())) {
+    for (auto i = 0; i < numPartitions; ++i) {
+      std::destroy_at(
+          reinterpret_cast<TopRows*>(partitions[i] + partitionOffset_));
+    }
+  }
+}
+
+void SortWindowBuild::clearStateBeforeSortSpill() {
+  if (followedTopNum_ <= 0) {
+    return;
+  }
+
+  clearTopRows();
+  if (table_) {
+    table_->clear();
+  }
+  if (singlePartition_) {
+    singlePartition_ = std::make_unique<TopRows>(allocator_.get(), comparator_);
   }
 }
 

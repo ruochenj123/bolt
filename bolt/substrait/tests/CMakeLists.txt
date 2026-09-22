@@ -41,46 +41,15 @@ add_dependencies(bolt_plan_conversion_test bolt_substrait_plan_converter)
 
 add_test(
   NAME bolt_plan_conversion_test
-  COMMAND bolt_plan_conversion_test
+  COMMAND
+    bolt_plan_conversion_test
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(
-  bolt_plan_conversion_test
-  bolt_substrait_plan_converter
-  bolt_functions_test_lib
-  bolt_exec
-  bolt_dwio_common
-  bolt_aggregates
-  bolt_functions_aggregates_test_lib
-  bolt_functions_lib
-  bolt_functions_prestosql
-  bolt_hive_connector
-  bolt_type
-  bolt_serialization
-  bolt_exec_test_lib
-  bolt_functions_json
-  bolt_vector
-  bolt_memory
-  bolt_dwio_common_exception
-  Boost::atomic
-  Boost::context
-  Boost::date_time
-  Boost::filesystem
-  Boost::program_options
-  Boost::thread
-  Boost::system
-  GTest::gtest
-  GTest::gtest_main
-  ${FOLLY_WITH_DEPENDENCIES}
-  gflags::gflags
-  glog::glog
-  fmt::fmt
-  ${FILESYSTEM}
-)
+target_link_libraries(bolt_plan_conversion_test bolt_gtest_main)
 
 if(${BOLT_ENABLE_TORCH})
   target_compile_definitions(bolt_plan_conversion_test PRIVATE BOLT_HAS_TORCH=1)
   target_include_directories(bolt_plan_conversion_test SYSTEM PRIVATE ${TORCH_INCLUDE_DIRS})
-  target_link_libraries(bolt_plan_conversion_test bolt_torch bolt_vector_fuzzer)
+  target_link_libraries(bolt_plan_conversion_test bolt_torch)
 endif()

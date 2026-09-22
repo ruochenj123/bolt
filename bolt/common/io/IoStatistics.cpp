@@ -59,6 +59,10 @@ uint64_t IoStatistics::totalScanTime() const {
   return totalScanTime_.load(std::memory_order_relaxed);
 }
 
+uint64_t IoStatistics::totalMergeTime() const {
+  return totalMergeTime_.load(std::memory_order_relaxed);
+}
+
 uint64_t IoStatistics::loadFileMetaDataTimeNs() const {
   return loadFileMetaDataTimeNs_.load(std::memory_order_relaxed);
 }
@@ -128,6 +132,10 @@ uint64_t IoStatistics::incTotalScanTime(int64_t v) {
   return totalScanTime_.fetch_add(v, std::memory_order_relaxed);
 }
 
+uint64_t IoStatistics::incTotalMergeTime(int64_t v) {
+  return totalMergeTime_.fetch_add(v, std::memory_order_relaxed);
+}
+
 uint64_t IoStatistics::incLoadFileMetaDataTimeNs(int64_t v) {
   return loadFileMetaDataTimeNs_.fetch_add(v, std::memory_order_relaxed);
 }
@@ -160,6 +168,7 @@ void IoStatistics::merge(const IoStatistics& other) {
   rawBytesRead_ += other.rawBytesRead_;
   rawBytesWritten_ += other.rawBytesWritten_;
   totalScanTime_ += other.totalScanTime_;
+  totalMergeTime_ += other.totalMergeTime_;
   for (int i = 0; i < 4; ++i) {
     readStats_.rawBytesReads_[i] += other.readStats_.rawBytesReads_[i];
     readStats_.cntReads_[i] += other.readStats_.cntReads_[i];

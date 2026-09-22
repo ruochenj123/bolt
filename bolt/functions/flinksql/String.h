@@ -19,7 +19,31 @@
 #include "bolt/functions/Macros.h"
 #include "bolt/functions/lib/string/StringCore.h"
 #include "bolt/functions/lib/string/StringImpl.h"
+#include "bolt/functions/prestosql/StringFunctions.h"
+#include "bolt/functions/sparksql/String.h"
 namespace bytedance::bolt::functions::flinksql {
+
+template <typename T>
+struct FlinkLPadFunction : public sparksql::PadFunctionBase<
+                               T,
+                               true,
+                               sparksql::PadInvalidInputPolicy::kReturnNull> {};
+
+template <typename T>
+struct FlinkRPadFunction : public sparksql::PadFunctionBase<
+                               T,
+                               false,
+                               sparksql::PadInvalidInputPolicy::kReturnNull> {};
+
+/// substr(string, start[, length]) -> varchar
+/// Flink-compatible substring: zero start uses the first character and a
+/// negative length returns null.
+template <typename T>
+struct FlinkSubstrFunction : public SubstrFunctionBase<
+                                 T,
+                                 true,
+                                 SubstrInvalidInputPolicy::kReturnNull> {};
+
 /// isDigit function
 /// isDigit(str) -> boolean
 /// returns true if the given string is a digit, false otherwise

@@ -33,9 +33,12 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <folly/dynamic.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <optional>
 #include "bolt/common/compression/Compression.h"
-
+#include "bolt/common/serialization/Serializable.h"
+#include "bolt/vector/VectorStream.h"
 namespace bytedance::bolt::common {
 
 #define BOLT_SPILL_LIMIT_EXCEEDED(errorMessage)                     \
@@ -72,7 +75,7 @@ enum class RowBasedSpillMode {
 RowBasedSpillMode strToRowBasedSpillMode(const std::string& str);
 
 /// Specifies the config for spilling.
-struct SpillConfig {
+struct SpillConfig : public bytedance::bolt::ISerializable {
   SpillConfig() = default;
   SpillConfig(
       GetSpillDirectoryPathCB _getSpillDirPathCb,
@@ -93,6 +96,7 @@ struct SpillConfig {
       const std::string& _compressionKind,
       const std::string& _fileCreateConfig = {},
       const std::string& _rowBasedSpillMode = "disabled",
+      const std::string& _singlePartitionSerdeKind = {},
       bool _jitEnabled = true);
 
   /// Returns the hash join spilling level with given 'startBitOffset'.
@@ -109,6 +113,16 @@ struct SpillConfig {
   bool exceedJoinSpillLevelLimit(uint8_t startBitOffset) const;
 
   std::string toString() const;
+
+  /// Serializes all value fields. Callbacks and executor are omitted and must
+  /// be re-injected by the host after deserialization.
+  folly::dynamic serialize() const override;
+
+  /// Reconstructs a SpillConfig from a serialized object. Callbacks and
+  /// executor are left at their default (null/empty) values.
+  static std::shared_ptr<SpillConfig> deserialize(const folly::dynamic& obj);
+
+  static void registerSerDe();
 
   /// A callback function that returns the spill directory path. Implementations
   /// can use it to ensure the path exists before returning.
@@ -127,66 +141,98 @@ struct SpillConfig {
   SpillConfig& setJITenableForSpill(bool enabled) noexcept;
   bool getJITenabledForSpill() const noexcept;
 
+  struct SpillIOConfig {
+    GetSpillDirectoryPathCB getSpillDirPathCb;
+    UpdateAndCheckSpillLimitCB updateAndCheckSpillLimitCb;
+    std::string fileNamePrefix;
+    uint64_t maxFileSize;
+    bool spillUringEnabled;
+    uint64_t writeBufferSize;
+    common::CompressionKind compressionKind;
+    std::string fileCreateConfig;
+    std::optional<VectorSerde::Kind> spillSerdeKind;
+  };
+
+  SpillIOConfig spillIOConfig(int32_t maxPartitions) const {
+    std::optional<VectorSerde::Kind> kind;
+    if (maxPartitions == 1 && !singlePartitionSerdeKind.empty()) {
+      kind = VectorSerde::kindByName(singlePartitionSerdeKind);
+    }
+    return SpillIOConfig{
+        getSpillDirPathCb,
+        updateAndCheckSpillLimitCb,
+        fileNamePrefix,
+        maxFileSize,
+        spillUringEnabled,
+        writeBufferSize,
+        compressionKind,
+        fileCreateConfig,
+        kind};
+  }
+
   /// The max spill file size. If it is zero, there is no limit on the spill
   /// file size.
-  uint64_t maxFileSize;
+  uint64_t maxFileSize{0};
 
   // io_uring control
-  bool spillUringEnabled;
+  bool spillUringEnabled{false};
 
   /// Specifies the size to buffer the serialized spill data before write to
   /// storage system for io efficiency.
-  uint64_t writeBufferSize;
+  uint64_t writeBufferSize{0};
 
   /// Executor for spilling. If nullptr spilling writes on the Driver's thread.
-  folly::Executor* executor; // Not owned.
+  folly::Executor* executor{nullptr}; // Not owned.
 
   /// The minimal spillable memory reservation in percentage of the current
   /// memory usage.
-  int32_t minSpillableReservationPct;
+  int32_t minSpillableReservationPct{0};
 
   /// The spillable memory reservation growth in percentage of the current
   /// memory usage.
-  int32_t spillableReservationGrowthPct;
+  int32_t spillableReservationGrowthPct{0};
 
   /// Used to calculate spill partition number.
-  uint8_t startPartitionBit;
+  uint8_t startPartitionBit{0};
 
   /// Used to calculate the spill hash partition number for hash join with
   /// 'startPartitionBit'.
-  uint8_t joinPartitionBits;
+  uint8_t joinPartitionBits{0};
 
   /// partition bits for spill level > 0
-  uint8_t joinRepartitionBits;
+  uint8_t joinRepartitionBits{0};
 
   /// The max allowed spilling level with zero being the initial spilling
   /// level. This only applies for hash build spilling which needs recursive
   /// spilling when the build table is too big. If it is set to -1, then there
   /// is no limit and then some extreme large query might run out of spilling
   /// partition bits at the end.
-  int32_t maxSpillLevel;
+  int32_t maxSpillLevel{0};
 
   /// The max row numbers to fill and spill for each spill run. This is used to
   /// cap the memory used for spilling. If it is zero, then there is no limit
   /// and spilling might run out of memory.
-  uint64_t maxSpillRunRows;
+  uint64_t maxSpillRunRows{0};
 
   /// Minimum memory footprint size required to reclaim memory from a file
   /// writer by flushing its buffered data to disk.
-  uint64_t writerFlushThresholdSize;
+  uint64_t writerFlushThresholdSize{0};
 
   /// Percentage of input batches to be spilled for testing. 0 means no
   /// spilling for test.
-  int32_t testSpillPct;
+  int32_t testSpillPct{0};
 
   /// CompressionKind when spilling, CompressionKind_NONE means no compression.
-  common::CompressionKind compressionKind;
+  common::CompressionKind compressionKind{CompressionKind_NONE};
 
   /// Custom options passed to bolt::FileSystem to create spill WriteFile.
   std::string fileCreateConfig;
 
   // spill direct with row format
-  RowBasedSpillMode rowBasedSpillMode;
+  RowBasedSpillMode rowBasedSpillMode{RowBasedSpillMode::DISABLE};
+
+  // Optional serde kind for single-partition row-vector spill (e.g., "Arrow").
+  std::string singlePartitionSerdeKind;
 
   /// The max allowed number of partitions to be adjusted upwards.
   uint32_t spillPartitionsAdaptiveThreshold{128};

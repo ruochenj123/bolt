@@ -34,6 +34,7 @@
 using namespace bytedance::bolt::exec;
 using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::functions::aggregate::test;
+using bytedance::bolt::test::emptyArray;
 namespace bytedance::bolt::aggregate::test {
 
 namespace {
@@ -43,7 +44,7 @@ class MapUnionSumTest : public AggregationTestBase {};
 TEST_F(MapUnionSumTest, global) {
   auto data = makeRowVector({
       makeNullableMapVector<int64_t, int64_t>({
-          {{}}, // empty map
+          emptyArray, // empty map
           std::nullopt, // null map
           {{{1, 10}, {2, 20}}},
           {{{1, 11}, {3, 30}, {4, 40}}},
@@ -75,7 +76,7 @@ TEST_F(MapUnionSumTest, globalVarcharKey) {
 
   auto data = makeRowVector({
       makeNullableMapVector<StringView, int64_t>({
-          {{}}, // empty map
+          emptyArray, // empty map
           std::nullopt, // null map
           {{{keys[0], 10}, {keys[1], 20}}},
           {{{keys[0], 11}, {keys[2], 30}, {keys[3], 40}}},
@@ -132,9 +133,9 @@ TEST_F(MapUnionSumTest, nullAndEmptyMaps) {
   auto emptyAndNullMaps = makeRowVector({
       makeNullableMapVector<int64_t, int64_t>({
           std::nullopt,
-          {{}},
+          emptyArray,
           std::nullopt,
-          {{}},
+          emptyArray,
       }),
   });
 

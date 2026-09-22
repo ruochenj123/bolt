@@ -31,6 +31,8 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <cstddef>
+#include <memory>
 #include "bolt/common/memory/Memory.h"
 #include "bolt/vector/BaseVector.h"
 
@@ -57,8 +59,22 @@ struct ArrowOptions {
   // values first and then convert it to arrow format, and FlatVector will not
   // be modified.
   bool stringViewCopyValues{false};
+  bool exportToArrowIPC{false};
+  // When true, export ARRAY-type CONSTANT vectors as Arrow Dictionary
+  // (1 value + N zero indices) instead of Run-End Encoded. Needed for
+  // consumers that don't support REE (e.g. Arrow Java < 19). Other types
+  // (scalar, map, struct) are unaffected and use REE.
+  bool arrayConstantAsDictionary{false};
 };
 namespace bytedance::bolt {
+/// Returns true when the vector will use the experimental
+/// Dictionary<List<T>> export path for ARRAY constants. Callers that prepare
+/// or size an export must use this predicate to stay aligned with the actual
+/// ArrowSchema and ArrowArray exporters.
+bool shouldExportArrayConstantAsDictionary(
+    const BaseVector& vector,
+    const ArrowOptions& options);
+
 /// Export a generic Bolt Vector to an ArrowArray, as defined by Arrow's C data
 /// interface:
 ///
@@ -91,6 +107,40 @@ void exportToArrow(
     ArrowArray& arrowArray,
     memory::MemoryPool* pool,
     const ArrowOptions& options);
+
+/// A bounded pool for exporting ArrowArray and ArrowSchema together.
+class ReusableArrowBatchPool {
+ public:
+  explicit ReusableArrowBatchPool(size_t numSlots);
+  ReusableArrowBatchPool(const ReusableArrowBatchPool&) = delete;
+  ReusableArrowBatchPool& operator=(const ReusableArrowBatchPool&) = delete;
+  ReusableArrowBatchPool(ReusableArrowBatchPool&& other) noexcept;
+  ReusableArrowBatchPool& operator=(ReusableArrowBatchPool&& other) noexcept;
+  ~ReusableArrowBatchPool();
+
+  size_t size() const;
+
+  /// Exports into caller-owned Arrow C Data Interface structs. Returns true if
+  /// the schema was rebuilt, and false if a cached schema was reused. The
+  /// caller releases schema and array through their release callbacks.
+  ///
+  /// This pool is not thread-safe. Export and release all Arrow structures
+  /// produced by a pool, including any moved child arrays, using external
+  /// synchronization. The pool must outlive all Arrow structures exported from
+  /// it. The supplied MemoryPool must outlive the ReusableArrowBatchPool
+  /// because reusable slots may retain small scratch buffers between exports.
+  bool exportToArrow(
+      const VectorPtr& vector,
+      memory::MemoryPool* pool,
+      const ArrowOptions& options,
+      ArrowSchema* schema,
+      ArrowArray* array,
+      const std::vector<std::string>& fieldNames = {});
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 /// Export the type of a Bolt vector to an ArrowSchema.
 ///

@@ -122,6 +122,7 @@ class IoStatistics {
   uint64_t inputBatchSize() const;
   uint64_t outputBatchSize() const;
   uint64_t totalScanTime() const;
+  uint64_t totalMergeTime() const;
   uint64_t loadFileMetaDataTimeNs() const;
 
   ReadStats& readStats();
@@ -136,6 +137,7 @@ class IoStatistics {
   uint64_t incInputBatchSize(int64_t);
   uint64_t incOutputBatchSize(int64_t);
   uint64_t incTotalScanTime(int64_t);
+  uint64_t incTotalMergeTime(int64_t);
   uint64_t incLoadFileMetaDataTimeNs(int64_t);
   void incIOInfo(int64_t size, int64_t time);
 
@@ -193,6 +195,7 @@ class IoStatistics {
   std::atomic<uint64_t> outputBatchSize_{0};
   std::atomic<uint64_t> rawOverreadBytes_{0};
   std::atomic<uint64_t> totalScanTime_{0};
+  std::atomic<uint64_t> totalMergeTime_{0};
   std::atomic<uint64_t> loadFileMetaDataTimeNs_{0};
 
   ReadStats readStats_{};

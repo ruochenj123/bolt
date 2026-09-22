@@ -132,8 +132,7 @@ void ExpressionRunner::run(
   BOLT_CHECK(!sql.empty());
 
   auto queryCtx = core::QueryCtx::create();
-  std::shared_ptr<memory::MemoryPool> pool{
-      memory::deprecatedAddDefaultLeafMemoryPool()};
+  auto pool = memory::memoryManager()->addLeafPool();
   core::ExecCtx execCtx{pool.get(), queryCtx.get()};
 
   RowVectorPtr inputVector;
@@ -141,12 +140,13 @@ void ExpressionRunner::run(
     inputVector = std::make_shared<RowVector>(
         pool.get(), ROW({}), nullptr, 1, std::vector<VectorPtr>{});
   } else {
-    inputVector = std::dynamic_pointer_cast<RowVector>(
-        restoreVectorFromFile(inputPath.c_str(), pool.get()));
+    VectorPtr inputVectorPtr =
+        restoreVectorFromFile(inputPath.c_str(), pool.get());
+    inputVector = std::dynamic_pointer_cast<RowVector>(inputVectorPtr);
     BOLT_CHECK_NOT_NULL(
         inputVector,
         "Input vector is not a RowVector: {}",
-        inputVector->toString());
+        inputVectorPtr->toString());
     BOLT_CHECK_GT(inputVector->size(), 0, "Input vector must not be empty.");
   }
 

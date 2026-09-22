@@ -34,10 +34,12 @@
 #include "bolt/connectors/hive/HiveConfig.h"
 #include "bolt/connectors/hive/HiveDataSink.h"
 #include "bolt/connectors/hive/HiveDataSource.h"
+#include "bolt/connectors/hive/HiveObjectFactory.h"
 #include "bolt/connectors/hive/HivePartitionFunction.h"
+#include "bolt/connectors/hive/TableHandle.h"
 // Meta's buck build system needs this check.
 #ifdef BOLT_ENABLE_GCS
-#include "bolt/connectors/hive/storage_adapters/gcs/RegisterGCSFileSystem.h" // @manual
+#include "bolt/connectors/hive/storage_adapters/gcs/RegisterGcsFileSystem.h" // @manual
 #endif
 #ifdef BOLT_ENABLE_HDFS
 #include "bolt/connectors/hive/storage_adapters/hdfs/RegisterHdfsFileSystem.h" // @manual
@@ -156,6 +158,8 @@ std::unique_ptr<core::PartitionFunction> HivePartitionFunctionSpec::create(
 
 void HiveConnectorFactory::initialize() {
   static bool once = []() {
+    HiveTableHandle::registerSerDe();
+    HiveColumnHandle::registerSerDe();
     dwio::common::registerFileSinks();
     dwrf::registerDwrfReaderFactory();
     dwrf::registerDwrfWriterFactory();
@@ -180,13 +184,21 @@ void HiveConnectorFactory::initialize() {
     filesystems::registerHdfsFileSystem();
 #endif
 #ifdef BOLT_ENABLE_GCS
-    filesystems::registerGCSFileSystem();
+    filesystems::registerGcsFileSystem();
 #endif
 #ifdef BOLT_ENABLE_ABFS
-    filesystems::abfs::registerAbfsFileSystem();
+    filesystems::registerAbfsFileSystem();
 #endif
     return true;
   }();
+}
+
+void HiveConnectorFactory::registerObjectFactory(
+    const std::string& connectorId) const {
+  if (!connector::hasConnectorObjectFactory(connectorName())) {
+    connector::registerConnectorObjectFactory(
+        std::make_shared<HiveObjectFactory>(connectorId));
+  }
 }
 
 std::string HivePartitionFunctionSpec::toString() const {

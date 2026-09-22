@@ -36,6 +36,7 @@
 #include <folly/Range.h>
 #include <folly/container/F14Map.h>
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <utility>
@@ -591,7 +592,7 @@ class BaseVector {
   // all current values.
   //
   // If 'result' is a lazy vector, then caller needs to ensure it is unique in
-  // order to re-use the loaded vector. Otherwise, a copy would be created.
+  // order to reuse the loaded vector. Otherwise, a copy would be created.
   static void ensureWritable(
       const SelectivityVector& rows,
       const TypePtr& type,
@@ -854,6 +855,14 @@ class BaseVector {
     memoDisabled_ = true;
   }
 
+  bool mayChangeContentUnderSameAddress() const {
+    return mayChangeContentUnderSameAddress_;
+  }
+
+  void setMayChangeContentUnderSameAddress(bool mayChange) {
+    mayChangeContentUnderSameAddress_ = mayChange;
+  }
+
   /// Used to check internal state of a vector like sizes of the buffers,
   /// enclosed child vectors, values in indices. Currently, its only used in
   /// debug builds to check the result of expressions and some interim results.
@@ -970,13 +979,17 @@ class BaseVector {
   /// unloaded lazy vector should not be wrapped by two separate top level
   /// vectors. This would ensure we avoid it being loaded for two separate set
   /// of rows.
-  bool containsLazyAndIsWrapped_{false};
+  std::atomic_bool containsLazyAndIsWrapped_{false};
 
   // Whether we should use Expr::evalWithMemo to cache the result of evaluation
   // on dictionary values (this vector).  Set to false when the dictionary
   // values are not going to be reused (e.g. result of filtering), so that we
   // don't need to reallocate the result for every batch.
   bool memoDisabled_{false};
+
+  // Whether this vector may be reused with different logical content while
+  // keeping the same object address.
+  bool mayChangeContentUnderSameAddress_{false};
 };
 
 /// Loops over rows in 'ranges' and invokes 'func' for each row.

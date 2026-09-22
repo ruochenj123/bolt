@@ -61,8 +61,8 @@ TEST_F(ArrayNGramsTest, integers) {
   testNgram<int64_t>({1, 2, 3, 4}, 5, {{{1, 2, 3, 4}}});
   testNgram<int64_t>(
       {1, 2, 3, 4}, std::numeric_limits<int32_t>::max(), {{{1, 2, 3, 4}}});
-  testNgram<int64_t>({}, 1, {{{}}});
-  testNgram<int64_t>({}, 10, {{{}}});
+  testNgram<int64_t>({}, 1, {emptyArray});
+  testNgram<int64_t>({}, 10, {emptyArray});
 }
 
 TEST_F(ArrayNGramsTest, invalidN) {

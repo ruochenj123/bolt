@@ -29,21 +29,164 @@
  * --------------------------------------------------------------------------
  */
 
-#include "bolt/dwio/parquet/reader/ParquetReader.h"
+#include "bolt/common/base/SparkCompatibility.h"
+
 #include <parquet/metadata.h>
 #include <thrift/protocol/TCompactProtocol.h> //@manual
 #include <cstdint>
 #include "bolt/dwio/common/CachedBufferedInput.h"
+#include "bolt/dwio/common/DirectBufferedInput.h"
 #include "bolt/dwio/common/Options.h"
+#include "bolt/dwio/parquet/encryption/KmsClient.h"
 #include "bolt/dwio/parquet/reader/ParquetColumnReader.h"
 #include "bolt/dwio/parquet/reader/ParquetFooterCache.h"
+#include "bolt/dwio/parquet/reader/ParquetReader.h"
+#include "bolt/dwio/parquet/reader/ParquetReaderCast.h"
 #include "bolt/dwio/parquet/reader/SchemaHelper.h"
 #include "bolt/dwio/parquet/reader/StructColumnReader.h"
 #include "bolt/dwio/parquet/thrift/FmtParquetFormatters.h"
+#include "bolt/dwio/parquet/thrift/ThriftInternal.h"
 #include "bolt/dwio/parquet/thrift/ThriftTransport.h"
 #include "bolt/dwio/parquet/thrift/codegen/parquet_types.h"
 
 namespace bytedance::bolt::parquet {
+
+constexpr std::string_view kDcmapColPrefix =
+    "parquet.meta.dynamic.column.map.keys.of.";
+
+namespace {
+::parquet::EncryptionAlgorithm FromThrift(
+    const thrift::EncryptionAlgorithm& encryption) {
+  ::parquet::EncryptionAlgorithm algo;
+  if (encryption.__isset.AES_GCM_V1) {
+    algo.algorithm = ::parquet::ParquetCipher::AES_GCM_V1;
+    algo.aad = ::parquet::AadMetadata{
+        encryption.AES_GCM_V1.aad_prefix,
+        encryption.AES_GCM_V1.aad_file_unique,
+        encryption.AES_GCM_V1.supply_aad_prefix};
+  } else {
+    algo.algorithm = ::parquet::ParquetCipher::AES_GCM_CTR_V1;
+    algo.aad = ::parquet::AadMetadata{
+        encryption.AES_GCM_CTR_V1.aad_prefix,
+        encryption.AES_GCM_CTR_V1.aad_file_unique,
+        encryption.AES_GCM_CTR_V1.supply_aad_prefix};
+  }
+  return algo;
+}
+
+std::string parquetSourceTypeName(const thrift::SchemaElement& schemaElement) {
+  if (schemaElement.__isset.converted_type) {
+    return fmt::format(
+        "{}({})", schemaElement.type, schemaElement.converted_type);
+  }
+  if (schemaElement.__isset.logicalType) {
+    const auto& logicalType = schemaElement.logicalType;
+    if (logicalType.__isset.DATE) {
+      return fmt::format("{}(DATE)", schemaElement.type);
+    }
+    if (logicalType.__isset.INTEGER) {
+      return fmt::format("{}(INTEGER)", schemaElement.type);
+    }
+    if (logicalType.__isset.DECIMAL) {
+      return fmt::format("{}(DECIMAL)", schemaElement.type);
+    }
+    if (logicalType.__isset.STRING) {
+      return fmt::format("{}(STRING)", schemaElement.type);
+    }
+    if (logicalType.__isset.TIMESTAMP) {
+      return fmt::format("{}(TIMESTAMP)", schemaElement.type);
+    }
+    if (logicalType.__isset.TIME) {
+      return fmt::format("{}(TIME)", schemaElement.type);
+    }
+  }
+  return fmt::format("{}", schemaElement.type);
+}
+
+// Cross-family implicit cast for VARCHAR/VARBINARY file columns:
+// StringColumnReader::makeCastExpr handles VARCHAR/VARBINARY file -> int
+// family requested type. Non-Spark builds also get a strict check at
+// ParquetColumnReader.cpp:95 via matchType() that fires after convertType
+// and throws with its own error message for that case.
+bool acceptsVarcharFileForReaderCast(const bytedance::bolt::TypePtr& t) {
+  using TK = bytedance::bolt::TypeKind;
+  const auto k = t->kind();
+  return k == TK::TINYINT || k == TK::SMALLINT || k == TK::INTEGER ||
+      k == TK::BIGINT;
+}
+bool acceptsIntFileForReaderCast(const bytedance::bolt::TypePtr& t) {
+  return t->kind() == bytedance::bolt::TypeKind::VARCHAR ||
+      t->kind() == bytedance::bolt::TypeKind::VARBINARY;
+}
+
+bool acceptsDateFile(const bytedance::bolt::TypePtr& t) {
+  return t->isDate() || t->kind() == bytedance::bolt::TypeKind::INTEGER ||
+      t->kind() == bytedance::bolt::TypeKind::VARCHAR;
+}
+
+bool acceptsRealFileForReaderCast(const bytedance::bolt::TypePtr& t) {
+  return t->kind() == bytedance::bolt::TypeKind::VARCHAR;
+}
+
+bool acceptsDoubleFileForReaderCast(const bytedance::bolt::TypePtr& t) {
+  return (::bytedance::bolt::kSparkCompatible &&
+          t->kind() == bytedance::bolt::TypeKind::BIGINT) ||
+      acceptsRealFileForReaderCast(t);
+}
+
+// Compatibility predicate for Parquet INT32-physical source columns
+// (INT_8 / INT_16 / INT_32 annotated, plus unannotated INT32).
+// Accepts:
+//   - Any int-family target. Narrowing (file INT32 -> requested ByteType /
+//     ShortType) is silently truncated at read time, matching Spark's
+//     vectorized reader. Covers HIVE-14294 where Hive 1.x writes
+//     TINYINT/SMALLINT as unannotated INT32 (SPARK-16632).
+//   - DOUBLE target. INT32 values are exactly representable as DOUBLE and
+//     SelectiveColumnReader::getIntValues performs the widening at read time.
+//     This covers Hive tables whose historical partitions were written as
+//     INT32 before the metastore type was widened to DOUBLE.
+//   - BOOLEAN target, using Spark SQL cast semantics for compatibility with
+//     tables that store boolean-like flags as unannotated INT32.
+//   - VARCHAR / VARBINARY target via IntegerColumnReader::makeCastExpr,
+//     which performs the int-to-string cast at read time.
+bool isInt32Compatible(const bytedance::bolt::TypePtr& type) {
+  using TK = bytedance::bolt::TypeKind;
+  const auto k = type->kind();
+  return k == TK::TINYINT || k == TK::SMALLINT || k == TK::INTEGER ||
+      k == TK::BIGINT || k == TK::DOUBLE || k == TK::BOOLEAN ||
+      acceptsIntFileForReaderCast(type);
+}
+
+// Compatibility predicate for UINT_* annotations. Keep this aligned with
+// SelectiveColumnReader::getUnsignedIntValues.
+bool isUInt32Compatible(const bytedance::bolt::TypePtr& type) {
+  using TK = bytedance::bolt::TypeKind;
+  const auto k = type->kind();
+  return k == TK::TINYINT || k == TK::SMALLINT || k == TK::INTEGER ||
+      k == TK::BIGINT || k == TK::HUGEINT || acceptsIntFileForReaderCast(type);
+}
+
+// Compatibility predicate for Parquet INT64-physical source columns.
+// Accepts BIGINT only (no integer narrowing), plus VARCHAR / VARBINARY
+// via IntegerColumnReader::makeCastExpr.
+bool isInt64Compatible(const bytedance::bolt::TypePtr& type) {
+  using TK = bytedance::bolt::TypeKind;
+  return type->kind() == TK::BIGINT || acceptsIntFileForReaderCast(type);
+}
+
+bool isUInt64Compatible(const bytedance::bolt::TypePtr& type) {
+  if (!::bytedance::bolt::kSparkCompatible || !type->isDecimal()) {
+    return isInt64Compatible(type);
+  }
+  // Spark maps Parquet UINT64 to DECIMAL(20, 0) because it has no unsigned
+  // 64-bit type. Keep this as a dedicated Spark representation mapping, not
+  // general integer-to-Decimal schema evolution. The unsigned integer reader
+  // already widens the 8-byte value to 128 bits without rescaling.
+  const auto [precision, scale] = getDecimalPrecisionScale(*type);
+  return precision == 20 && scale == 0;
+}
+
+} // namespace
 
 /// Metadata and options for reading Parquet.
 class ReaderBase {
@@ -70,6 +213,10 @@ class ReaderBase {
     return *fileMetaData_;
   }
 
+  const std::shared_ptr<InternalFileDecryptor>& fileDecryptor() const {
+    return fileDecryptor_;
+  }
+
   FileMetaDataPtr fileMetaData() const {
     return FileMetaDataPtr(reinterpret_cast<const void*>(fileMetaData_.get()));
   }
@@ -85,6 +232,11 @@ class ReaderBase {
   const std::unordered_map<std::string, thrift::LogicalType>&
   schemaLogicalTypes() const {
     return logicalTypesByPath_;
+  }
+
+  const std::unordered_map<std::string, thrift::ConvertedType::type>&
+  schemaConvertedTypes() const {
+    return convertedTypesByPath_;
   }
 
   bool isFileColumnNamesReadAsLowerCase() const {
@@ -142,6 +294,15 @@ class ReaderBase {
           children,
       bool fileColumnNamesReadAsLowerCase);
 
+  uint32_t parseEncryptedFooter(
+      const char* cryptoMetadataBuffer,
+      uint32_t footerLen);
+  void parsePlainFooter();
+  std::string HandleAadPrefix(
+      const std::shared_ptr<::parquet::FileDecryptionProperties>&
+          fileDecryptionProperties,
+      ::parquet::EncryptionAlgorithm& algo);
+
   memory::MemoryPool& pool_;
   const uint64_t footerEstimatedSize_;
   const uint64_t filePreloadThreshold_;
@@ -156,11 +317,24 @@ class ReaderBase {
   // Logical types keyed by dot-delimited field path from the root.
   std::unordered_map<std::string, thrift::LogicalType> logicalTypesByPath_;
 
+  std::unordered_map<std::string, thrift::ConvertedType::type>
+      convertedTypesByPath_;
+
   // Map from row group index to pre-created loading BufferedInput.
   std::unordered_map<uint32_t, std::shared_ptr<dwio::common::BufferedInput>>
       inputs_;
 
+  std::shared_ptr<::parquet::encryption::CryptoFactory> cryptoFactory_;
+
+  std::shared_ptr<::parquet::FileDecryptionProperties>
+      fileDecryptionProperties_;
+  std::shared_ptr<InternalFileDecryptor> fileDecryptor_;
+
   void collectLogicalTypes(
+      const std::shared_ptr<const dwio::common::TypeWithId>& type,
+      const std::string& path);
+
+  void collectConvertedTypes(
       const std::shared_ptr<const dwio::common::TypeWithId>& type,
       const std::string& path);
 };
@@ -201,13 +375,20 @@ void ReaderBase::loadFileMetaData() {
     auto entry = cache->get(input_->getReadFile()->getName());
     if (entry.has_value()) {
       fileMetaData_ = std::move(entry.value());
+      parsePlainFooter();
       return;
     }
   }
 
   std::unique_ptr<dwio::common::SeekableInputStream> stream;
   if (preloadFile) {
-    stream = input_->loadCompleteFile();
+    if (auto* directInput =
+            dynamic_cast<dwio::common::DirectBufferedInput*>(input_.get())) {
+      directInput->preload();
+      stream = input_->read(0, fileLength_, dwio::common::LogType::FILE);
+    } else {
+      stream = input_->loadCompleteFile();
+    }
   } else {
     stream = input_->read(
         fileLength_ - readSize, readSize, dwio::common::LogType::FOOTER);
@@ -219,8 +400,11 @@ void ReaderBase::loadFileMetaData() {
   dwio::common::readBytes(
       readSize, stream.get(), copy.data(), bufferStart, bufferEnd);
   BOLT_CHECK(
-      strncmp(copy.data() + readSize - 4, "PAR1", 4) == 0,
+      strncmp(copy.data() + readSize - 4, "PAR1", 4) == 0 ||
+          strncmp(copy.data() + readSize - 4, "PARE", 4) == 0,
       "No magic bytes found at end of the Parquet file");
+  const bool isEncryptedFooter =
+      strncmp(copy.data() + readSize - 4, "PARE", 4) == 0;
 
   uint32_t footerLength =
       *(reinterpret_cast<const uint32_t*>(copy.data() + readSize - 8));
@@ -241,14 +425,52 @@ void ReaderBase::loadFileMetaData() {
         missingLength, stream.get(), copy.data(), bufferStart, bufferEnd);
   }
 
+  char* fileMetadataBuffer = copy.data() + footerOffsetInBuffer;
+  uint32_t fileMetadataLen = footerLength;
+  std::vector<char> decryptedBuffer;
+
+  if (isEncryptedFooter) {
+    // Encrypted file with Encrypted footer.
+    uint32_t cryptoMetadataLen =
+        parseEncryptedFooter(copy.data() + footerOffsetInBuffer, footerLength);
+    // Read the actual footer
+    footerOffsetInBuffer += cryptoMetadataLen;
+    footerLength -= cryptoMetadataLen;
+    auto decryptor = fileDecryptor_->GetFooterDecryptor();
+    decryptedBuffer.resize(footerLength - decryptor->CiphertextSizeDelta());
+    int32_t decryptedBufferLen = decryptor->Decrypt(
+        reinterpret_cast<uint8_t*>(copy.data() + footerOffsetInBuffer),
+        0,
+        reinterpret_cast<uint8_t*>(decryptedBuffer.data()),
+        decryptedBuffer.size());
+    if (decryptedBufferLen <= 0) {
+      BOLT_FAIL("Couldn't decrypt footer buffer");
+    }
+    fileMetadataBuffer = decryptedBuffer.data();
+    fileMetadataLen = decryptedBufferLen;
+  }
+
   std::shared_ptr<thrift::ThriftTransport> thriftTransport =
       std::make_shared<thrift::ThriftBufferedTransport>(
-          copy.data() + footerOffsetInBuffer, footerLength);
+          fileMetadataBuffer, fileMetadataLen);
   auto thriftProtocol = std::make_unique<
       apache::thrift::protocol::TCompactProtocolT<thrift::ThriftTransport>>(
       thriftTransport);
   fileMetaData_ = std::make_shared<thrift::FileMetaData>();
   fileMetaData_->read(thriftProtocol.get());
+
+  if (isEncryptedFooter) {
+    return;
+  } else if (!fileMetaData_->__isset.encryption_algorithm) {
+    if (fileDecryptionProperties_ != nullptr) {
+      if (!fileDecryptionProperties_->plaintext_files_allowed()) {
+        BOLT_FAIL("Applying decryption properties on plaintext file");
+      }
+    }
+  } else {
+    // Encrypted file with plaintext footer mode.
+    parsePlainFooter();
+  }
 
   if (auto* cache = ParquetFooterCache::getInstance()) {
     cache->add(input_->getReadFile()->getName(), fileMetaData_, footerLength);
@@ -256,9 +478,6 @@ void ReaderBase::loadFileMetaData() {
 }
 
 void ReaderBase::initializeSchema() {
-  if (fileMetaData_->__isset.encryption_algorithm) {
-    BOLT_UNSUPPORTED("Encrypted Parquet files are not supported");
-  }
   BOLT_CHECK_GT(
       fileMetaData_->schema.size(),
       1,
@@ -294,7 +513,9 @@ void ReaderBase::initializeSchema() {
       schemaWithId_->getChildren(), isFileColumnNamesReadAsLowerCase());
 
   logicalTypesByPath_.clear();
+  convertedTypesByPath_.clear();
   collectLogicalTypes(schemaWithId_, "");
+  collectConvertedTypes(schemaWithId_, "");
 }
 
 std::shared_ptr<const ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
@@ -389,6 +610,55 @@ std::shared_ptr<const ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
       children.push_back(std::move(child));
     }
     BOLT_CHECK(!children.empty());
+
+    // Detect Spark 4.0 Variant structure: STRUCT<value BINARY, metadata BINARY>
+    // Promote only when the requested logical type explicitly asks for
+    // VARIANT. The raw Parquet schema alone is not specific enough because
+    // ordinary structs can also contain {value, metadata} binary children.
+    if (children.size() == 2 && children[0]->type()->isVarbinary() &&
+        children[1]->type()->isVarbinary()) {
+      auto child0Name =
+          std::static_pointer_cast<const ParquetTypeWithId>(children[0])->name_;
+      auto child1Name =
+          std::static_pointer_cast<const ParquetTypeWithId>(children[1])->name_;
+      folly::toLowerAscii(child0Name);
+      folly::toLowerAscii(child1Name);
+      bool isRequestedVariant = requestedType && requestedType->isVariant();
+      if (!isRequestedVariant && parentRequestedType) {
+        if (parentRequestedType->isVariant()) {
+          isRequestedVariant = true;
+        } else if (parentRequestedType->isRow()) {
+          auto childIdx =
+              parentRequestedType->asRow().getChildIdxIfExists(name);
+          if (childIdx.has_value()) {
+            isRequestedVariant =
+                parentRequestedType->asRow().childAt(*childIdx)->isVariant();
+          }
+        }
+      }
+      bool matchesVariantSchema =
+          (child0Name == "value" && child1Name == "metadata") ||
+          (child0Name == "metadata" && child1Name == "value");
+      if (matchesVariantSchema && isRequestedVariant) {
+        if (child0Name == "metadata") {
+          std::swap(children[0], children[1]);
+        }
+        return std::make_shared<const ParquetTypeWithId>(
+            VARIANT(),
+            std::move(children),
+            curSchemaIdx,
+            maxSchemaElementIdx,
+            ParquetTypeWithId::kNonLeaf,
+            std::move(name),
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            maxRepeat,
+            maxDefine,
+            isOptional,
+            isRepeated);
+      }
+    }
 
     if (schemaElement.__isset.converted_type) {
       switch (schemaElement.converted_type) {
@@ -485,6 +755,45 @@ std::shared_ptr<const ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
               isRepeated);
         }
 
+        case thrift::ConvertedType::DCMAP: {
+          std::unordered_map<std::string, std::vector<std::string>> dcKeys;
+          for (const auto& kv : fileMetaData_->key_value_metadata) {
+            if (kv.key.find(kDcmapColPrefix, 0) != std::string::npos) {
+              auto k = kv.key.substr(kv.key.rfind('.') + 1);
+              auto v = kv.value;
+              auto start = 0U;
+              auto end = v.find(',');
+              while (end != std::string::npos) {
+                dcKeys[k].emplace_back(v.substr(start, end - start));
+                start = end + 1;
+                end = v.find(',', start);
+              }
+              dcKeys[k].push_back(v.substr(start));
+            }
+          }
+
+          auto childrenCopy = children;
+          return std::make_shared<const ParquetTypeWithId>(
+              createRowType(children, isFileColumnNamesReadAsLowerCase()),
+              std::move(childrenCopy),
+              curSchemaIdx,
+              maxSchemaElementIdx,
+              ParquetTypeWithId::kNonLeaf, // columnIdx,
+              std::move(name),
+              std::nullopt,
+              std::nullopt,
+              std::nullopt,
+              maxRepeat,
+              maxDefine,
+              isOptional,
+              isRepeated,
+              0,
+              0,
+              0,
+              true,
+              dcKeys);
+        }
+
         default:
           BOLT_UNREACHABLE(
               "Invalid SchemaElement converted_type: {}, name: {}",
@@ -530,6 +839,65 @@ std::shared_ptr<const ParquetTypeWithId> ReaderBase::getParquetColumnInfo(
               std::move(type),
               std::move(children),
               curSchemaIdx, // TODO: there are holes in the ids
+              maxSchemaElementIdx,
+              ParquetTypeWithId::kNonLeaf, // columnIdx,
+              std::move(name),
+              std::nullopt,
+              std::nullopt,
+              std::nullopt,
+              maxRepeat,
+              maxDefine,
+              isOptional,
+              isRepeated);
+        } else if (
+            schema[parentSchemaIdx].converted_type ==
+            thrift::ConvertedType::DCMAP) {
+          BOLT_CHECK_EQ(children.size(), 2);
+          auto type = TypeFactory<TypeKind::MAP>::create(
+              children[0]->type(), children[1]->type());
+          return std::make_unique<ParquetTypeWithId>(
+              std::move(type),
+              std::move(children),
+              curSchemaIdx,
+              maxSchemaElementIdx,
+              ParquetTypeWithId::kNonLeaf, // columnIdx,
+              std::move(name),
+              std::nullopt,
+              std::nullopt,
+              std::nullopt,
+              maxRepeat,
+              maxDefine - 1,
+              isOptional,
+              isRepeated);
+        } else {
+          // Row type
+          // To support list backward compatibility, need create a new row type
+          // instance and set all the fields as its children.
+          auto childrenRowType =
+              createRowType(children, isFileColumnNamesReadAsLowerCase());
+          std::vector<std::shared_ptr<const ParquetTypeWithId::TypeWithId>>
+              rowChildren;
+          // In this legacy case, there is no middle layer between "array"
+          // node and the children nodes. Below creates this dummy middle
+          // layer to mimic the non-legacy case and fill the gap.
+          rowChildren.emplace_back(std::make_shared<const ParquetTypeWithId>(
+              childrenRowType,
+              std::move(children),
+              curSchemaIdx,
+              maxSchemaElementIdx,
+              ParquetTypeWithId::kNonLeaf,
+              "dummy",
+              std::nullopt,
+              std::nullopt,
+              std::nullopt,
+              maxRepeat,
+              maxDefine,
+              isOptional,
+              isRepeated));
+          return std::make_unique<ParquetTypeWithId>(
+              TypeFactory<TypeKind::ARRAY>::create(childrenRowType),
+              std::move(rowChildren),
+              curSchemaIdx,
               maxSchemaElementIdx,
               ParquetTypeWithId::kNonLeaf, // columnIdx,
               std::move(name),
@@ -629,28 +997,45 @@ void ReaderBase::collectLogicalTypes(
     const std::shared_ptr<const dwio::common::TypeWithId>& type,
     const std::string& path) {
   auto parquetType = std::static_pointer_cast<const ParquetTypeWithId>(type);
-  if (parquetType->isLeaf()) {
-    if (parquetType->logicalType_.has_value()) {
-      if (!path.empty()) {
-        logicalTypesByPath_[path] = parquetType->logicalType_.value();
-      }
-    } else if (type->type()->kind() == TypeKind::ROW) {
-      // no-op for leaves of struct; handled via parent path
+  if (parquetType->logicalType_.has_value()) {
+    if (!path.empty()) {
+      logicalTypesByPath_[path] = parquetType->logicalType_.value();
     }
+  }
+
+  if (parquetType->isLeaf()) {
     return;
   }
-  if (type->type()->kind() == TypeKind::ROW) {
-    auto row = type->type()->asRow();
-    for (size_t i = 0; i < type->getChildren().size(); ++i) {
-      auto child = type->getChildren()[i];
-      auto childName = row.nameOf(i);
-      auto childPath = path.empty() ? childName : (path + "." + childName);
-      collectLogicalTypes(child, childPath);
+
+  for (auto& child : type->getChildren()) {
+    auto parquetChild =
+        std::static_pointer_cast<const ParquetTypeWithId>(child);
+    auto childPath =
+        path.empty() ? parquetChild->name_ : (path + "." + parquetChild->name_);
+    collectLogicalTypes(child, childPath);
+  }
+}
+
+void ReaderBase::collectConvertedTypes(
+    const std::shared_ptr<const dwio::common::TypeWithId>& type,
+    const std::string& path) {
+  auto parquetType = std::static_pointer_cast<const ParquetTypeWithId>(type);
+  if (parquetType->convertedType_.has_value()) {
+    if (!path.empty()) {
+      convertedTypesByPath_[path] = parquetType->convertedType_.value();
     }
-  } else {
-    for (auto& child : type->getChildren()) {
-      collectLogicalTypes(child, path);
-    }
+  }
+
+  if (parquetType->isLeaf()) {
+    return;
+  }
+
+  for (auto& child : type->getChildren()) {
+    auto parquetChild =
+        std::static_pointer_cast<const ParquetTypeWithId>(child);
+    auto childPath =
+        path.empty() ? parquetChild->name_ : (path + "." + parquetChild->name_);
+    collectConvertedTypes(child, childPath);
   }
 }
 
@@ -663,6 +1048,48 @@ TypePtr ReaderBase::convertType(
           schemaElement.__isset.type_length,
       "FIXED_LEN_BYTE_ARRAY requires length to be set");
 
+  // Whether this leaf is a Parquet "repeated" field (unannotated array).
+  // Allows requestedType=ARRAY<element> to be satisfied by checking against
+  // the element type — see isCompatible() in the anonymous namespace.
+  const bool isRepeated = schemaElement.__isset.repetition_type &&
+      schemaElement.repetition_type == thrift::FieldRepetitionType::REPEATED;
+
+  // Common helper: emits a user-error matching Spark's
+  // SchemaColumnConvertNotSupportedException semantics when the requested
+  // type can't be satisfied by this Parquet leaf. No-op when there is no
+  // requested type (caller is only inferring the file's declared schema).
+  auto checkRequested =
+      [&](const std::function<bool(const TypePtr&)>& isCompatibleFunc) {
+        // An empty file cannot supply a value that violates the requested
+        // schema. Keep deriving its physical schema, but don't reject a
+        // requested type mismatch before the reader can return zero rows.
+        if (requestedType == nullptr || fileMetaData_->num_rows == 0) {
+          return;
+        }
+        const bool strictMatch = isCompatibleFunc(requestedType);
+        // Legacy Parquet 1.0 unannotated array: a repeated field that
+        // isn't wrapped in a LIST group. If requestedType is ARRAY and
+        // the leaf is REPEATED, fall back to checking the array's
+        // element type.
+        const bool unannotatedArrayMatch = !strictMatch && isRepeated &&
+            requestedType->isArray() &&
+            isCompatibleFunc(requestedType->asArray().elementType());
+        if (!(strictMatch || unannotatedArrayMatch)) {
+          BOLT_SCHEMA_MISMATCH_ERROR(fmt::format(
+              "{} Column: [{}], From Kind: {}, To Kind: {}",
+              kParquetTypeMappingErrorPrefix,
+              schemaElement.name,
+              parquetSourceTypeName(schemaElement),
+              mapTypeKindToName(requestedType->kind())));
+        }
+        if (unannotatedArrayMatch) {
+          LOG_FIRST_N(INFO, 8)
+              << "Reading unannotated array (legacy Parquet 1.0): column '"
+              << schemaElement.name << "', requested type "
+              << requestedType->toString();
+        }
+      };
+
   if (schemaElement.__isset.converted_type) {
     switch (schemaElement.converted_type) {
       case thrift::ConvertedType::INT_8:
@@ -670,6 +1097,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT32,
             "INT8 converted type can only be set for value of thrift::Type::INT32");
+        checkRequested([](const TypePtr& t) { return isInt32Compatible(t); });
         return TINYINT();
 
       case thrift::ConvertedType::INT_16:
@@ -677,6 +1105,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT32,
             "INT16 converted type can only be set for value of thrift::Type::INT32");
+        checkRequested([](const TypePtr& t) { return isInt32Compatible(t); });
         return SMALLINT();
 
       case thrift::ConvertedType::INT_32:
@@ -684,6 +1113,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT32,
             "INT32 converted type can only be set for value of thrift::Type::INT32");
+        checkRequested([](const TypePtr& t) { return isInt32Compatible(t); });
         return INTEGER();
 
       case thrift::ConvertedType::INT_64:
@@ -691,6 +1121,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT64,
             "INT64 converted type can only be set for value of thrift::Type::INT64");
+        checkRequested([](const TypePtr& t) { return isInt64Compatible(t); });
         return BIGINT();
 
       case thrift::ConvertedType::UINT_8:
@@ -698,6 +1129,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT32,
             "UINT_8 converted type can only be set for value of thrift::Type::INT32");
+        checkRequested([](const TypePtr& t) { return isUInt32Compatible(t); });
         return TINYINT();
 
       case thrift::ConvertedType::UINT_16:
@@ -705,6 +1137,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT32,
             "UINT_16 converted type can only be set for value of thrift::Type::INT32");
+        checkRequested([](const TypePtr& t) { return isUInt32Compatible(t); });
         return SMALLINT();
 
       case thrift::ConvertedType::UINT_32:
@@ -712,6 +1145,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT32,
             "UINT_32 converted type can only be set for value of thrift::Type::INT32");
+        checkRequested([](const TypePtr& t) { return isUInt32Compatible(t); });
         return INTEGER();
 
       case thrift::ConvertedType::UINT_64:
@@ -719,6 +1153,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT64,
             "UINT_64 converted type can only be set for value of thrift::Type::INT64");
+        checkRequested([](const TypePtr& t) { return isUInt64Compatible(t); });
         return BIGINT();
 
       case thrift::ConvertedType::DATE:
@@ -726,6 +1161,7 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT32,
             "DATE converted type can only be set for value of thrift::Type::INT32");
+        checkRequested([](const TypePtr& t) { return acceptsDateFile(t); });
         return DATE();
 
       case thrift::ConvertedType::TIMESTAMP_MICROS:
@@ -734,12 +1170,27 @@ TypePtr ReaderBase::convertType(
             schemaElement.type,
             thrift::Type::INT64,
             "TIMESTAMP_MICROS or TIMESTAMP_MILLIS converted type can only be set for value of thrift::Type::INT64");
+        checkRequested(
+            [](const TypePtr& t) { return t->kind() == TypeKind::TIMESTAMP; });
         return TIMESTAMP();
 
       case thrift::ConvertedType::DECIMAL: {
         BOLT_CHECK(
             schemaElement.__isset.precision && schemaElement.__isset.scale,
             "DECIMAL requires a length and scale specifier!");
+        // Decimal reader casts currently support precision widening at a
+        // fixed scale. A scale change also requires rescaling decoded values
+        // and coordinating filter pushdown, so reject it until that path is
+        // implemented end to end.
+        const auto filePrecision = schemaElement.precision;
+        const auto fileScale = schemaElement.scale;
+        checkRequested([&](const TypePtr& t) {
+          if (!t->isDecimal()) {
+            return false;
+          }
+          auto [precision, scale] = getDecimalPrecisionScale(*t);
+          return scale == fileScale && precision >= filePrecision;
+        });
         return DECIMAL(schemaElement.precision, schemaElement.scale);
       }
 
@@ -748,16 +1199,40 @@ TypePtr ReaderBase::convertType(
         switch (schemaElement.type) {
           case thrift::Type::BYTE_ARRAY:
           case thrift::Type::FIXED_LEN_BYTE_ARRAY:
+            checkRequested([&](const TypePtr& t) {
+              if (::bytedance::bolt::kSparkCompatible &&
+                  schemaElement.type == thrift::Type::BYTE_ARRAY &&
+                  t->kind() == TypeKind::VARBINARY) {
+                return true;
+              }
+              return t->kind() == TypeKind::VARCHAR ||
+                  acceptsVarcharFileForReaderCast(t);
+            });
+            if (::bytedance::bolt::kSparkCompatible &&
+                schemaElement.type == thrift::Type::BYTE_ARRAY &&
+                requestedType && requestedType->isVarbinary()) {
+              return VARBINARY();
+            }
             return VARCHAR();
           default:
             BOLT_FAIL(
                 "{} converted type can only be set for thrift::Type::(FIXED_LEN_)BYTE_ARRAY.",
                 thrift::to_string(schemaElement.converted_type));
         }
+      case thrift::ConvertedType::ENUM: {
+        BOLT_CHECK_EQ(
+            schemaElement.type,
+            thrift::Type::BYTE_ARRAY,
+            "ENUM converted type can only be set for value of thrift::Type::BYTE_ARRAY");
+        checkRequested([](const TypePtr& t) {
+          return t->kind() == TypeKind::VARCHAR ||
+              acceptsVarcharFileForReaderCast(t);
+        });
+        return VARCHAR();
+      }
       case thrift::ConvertedType::MAP:
       case thrift::ConvertedType::MAP_KEY_VALUE:
       case thrift::ConvertedType::LIST:
-      case thrift::ConvertedType::ENUM:
       case thrift::ConvertedType::TIME_MILLIS:
       case thrift::ConvertedType::TIME_MICROS:
       case thrift::ConvertedType::BSON:
@@ -770,31 +1245,73 @@ TypePtr ReaderBase::convertType(
   } else {
     switch (schemaElement.type) {
       case thrift::Type::type::BOOLEAN:
+        checkRequested(
+            [](const TypePtr& t) { return t->kind() == TypeKind::BOOLEAN; });
         return BOOLEAN();
       case thrift::Type::type::INT32:
+        if (schemaElement.__isset.logicalType &&
+            schemaElement.logicalType.__isset.DATE) {
+          checkRequested([](const TypePtr& t) { return acceptsDateFile(t); });
+          return DATE();
+        }
+        checkRequested([](const TypePtr& t) { return isInt32Compatible(t); });
         return INTEGER();
       case thrift::Type::type::INT64:
         // For Int64 Timestamp in nano precision
         if (schemaElement.__isset.logicalType &&
             schemaElement.logicalType.__isset.TIMESTAMP) {
+          checkRequested([](const TypePtr& t) {
+            return t->kind() == TypeKind::TIMESTAMP;
+          });
           return TIMESTAMP();
+        }
+        if (::bytedance::bolt::kSparkCompatible &&
+            schemaElement.__isset.logicalType &&
+            schemaElement.logicalType.__isset.INTEGER &&
+            !schemaElement.logicalType.INTEGER.isSigned) {
+          BOLT_CHECK_EQ(
+              schemaElement.logicalType.INTEGER.bitWidth,
+              64,
+              "Unsigned INTEGER logical type on INT64 must have bit width 64");
+          checkRequested(
+              [](const TypePtr& t) { return isUInt64Compatible(t); });
+          return BIGINT();
         }
         if (schemaElement.__isset.converted_type &&
             (schemaElement.converted_type ==
                  thrift::ConvertedType::TIMESTAMP_MILLIS ||
              schemaElement.converted_type ==
                  thrift::ConvertedType::TIMESTAMP_MICROS)) {
+          checkRequested([](const TypePtr& t) {
+            return t->kind() == TypeKind::TIMESTAMP;
+          });
           return TIMESTAMP();
         }
+        checkRequested([](const TypePtr& t) { return isInt64Compatible(t); });
         return BIGINT();
       case thrift::Type::type::INT96:
+        checkRequested(
+            [](const TypePtr& t) { return t->kind() == TypeKind::TIMESTAMP; });
         return TIMESTAMP(); // INT96 only maps to a timestamp
       case thrift::Type::type::FLOAT:
+        checkRequested([](const TypePtr& t) {
+          return t->kind() == TypeKind::REAL || t->kind() == TypeKind::DOUBLE ||
+              acceptsRealFileForReaderCast(t);
+        });
         return REAL();
       case thrift::Type::type::DOUBLE:
+        checkRequested([](const TypePtr& t) {
+          return t->kind() == TypeKind::DOUBLE ||
+              acceptsDoubleFileForReaderCast(t);
+        });
         return DOUBLE();
       case thrift::Type::type::BYTE_ARRAY:
       case thrift::Type::type::FIXED_LEN_BYTE_ARRAY:
+        checkRequested([](const TypePtr& t) {
+          return t->kind() == TypeKind::VARCHAR ||
+              t->kind() == TypeKind::VARBINARY ||
+              acceptsVarcharFileForReaderCast(t);
+        });
         if (requestedType && requestedType->isVarchar()) {
           return VARCHAR();
         } else {
@@ -861,6 +1378,7 @@ void ReaderBase::scheduleRowGroups(
   // clear old RowGroup
   if (currentGroup >= 1) {
     inputs_.erase(rowGroupIds[currentGroup - 1]);
+    reader.releaseRowGroupReader();
   }
   // load current RowGroup and prefetch new RowGroup
   auto numRowGroupsToLoad = std::min(
@@ -898,6 +1416,7 @@ int32_t parquetTypeToBoltBytes(thrift::Type::type type) {
 }
 } // namespace
 
+// TODO: consider dictionary encoding cases
 int64_t ReaderBase::estimatedRowGroupBytesInMemory(
     int32_t rowGroupIndex,
     const dwio::common::TypeWithId& type) const {
@@ -927,6 +1446,128 @@ bool ReaderBase::isRowGroupBuffered(int32_t rowGroupIndex) const {
   return inputs_.count(rowGroupIndex) != 0;
 }
 
+uint32_t ReaderBase::parseEncryptedFooter(
+    const char* cryptoMetadataBuffer,
+    uint32_t footerLen) {
+  auto cryptoMetadataLen = footerLen;
+  thrift::FileCryptoMetaData fileCryptoMetadata;
+  thrift::ThriftDeserializer deserializer;
+  deserializer.DeserializeUnencryptedMessage(
+      reinterpret_cast<const uint8_t*>(cryptoMetadataBuffer),
+      &cryptoMetadataLen,
+      &fileCryptoMetadata);
+
+  // Add KMS metadata to retrieve the key. Since the implementation of the
+  // KMS client varies among different KMS systems, we leave a base KMS
+  // client class here. You can implement your own KMS client.
+
+  cryptoFactory_ = std::make_shared<::parquet::encryption::CryptoFactory>();
+
+  std::shared_ptr<KmsClientFactory> kmsClientFactory =
+      std::make_shared<KmsClientFactory>();
+
+  std::shared_ptr<KmsConfBuilder> kmsConfBuilder =
+      std::make_shared<KmsConfBuilder>(fileCryptoMetadata.key_metadata);
+
+  ::parquet::encryption::KmsConnectionConfig kmsConf = kmsConfBuilder->build();
+  ::parquet::encryption::DecryptionConfiguration decryptionConf =
+      ::parquet::encryption::DecryptionConfiguration();
+
+  cryptoFactory_->RegisterKmsClientFactory(std::move(kmsClientFactory));
+
+  fileDecryptionProperties_ =
+      cryptoFactory_->GetFileDecryptionProperties(kmsConf, decryptionConf);
+
+  thrift::EncryptionAlgorithm encryption =
+      fileCryptoMetadata.encryption_algorithm;
+  ::parquet::EncryptionAlgorithm algo = FromThrift(encryption);
+  std::string fileAad = HandleAadPrefix(fileDecryptionProperties_, algo);
+  fileDecryptor_ = std::make_shared<InternalFileDecryptor>(
+      fileDecryptionProperties_.get(),
+      fileAad,
+      algo.algorithm == ::parquet::ParquetCipher::type::AES_GCM_V1
+          ? ParquetCipher::type::AES_GCM_V1
+          : ParquetCipher::type::AES_GCM_CTR_V1,
+      fileCryptoMetadata.key_metadata,
+      &getMemoryPool());
+  return cryptoMetadataLen;
+}
+
+std::string ReaderBase::HandleAadPrefix(
+    const std::shared_ptr<::parquet::FileDecryptionProperties>&
+        fileDecryptionProperties,
+    ::parquet::EncryptionAlgorithm& algo) {
+  std::string aadPrefixInProperties = fileDecryptionProperties->aad_prefix();
+  std::string aadPrefix = aadPrefixInProperties;
+  bool fileHasAadPrefix = algo.aad.aad_prefix.empty() ? false : true;
+  std::string aadPrefixInFile = algo.aad.aad_prefix;
+  if (algo.aad.supply_aad_prefix && aadPrefixInProperties.empty()) {
+    BOLT_FAIL(
+        "AAD prefix used for file encryption, but not stored in file and not supplied in decryption properties");
+  }
+  if (fileHasAadPrefix) {
+    if (!aadPrefixInProperties.empty()) {
+      if (aadPrefixInProperties.compare(aadPrefixInFile) != 0) {
+        BOLT_FAIL("AAD Prefix in file and in properties is not the same");
+      }
+    }
+    aadPrefix = aadPrefixInFile;
+    const std::shared_ptr<::parquet::AADPrefixVerifier>& aadPrefixVerifier =
+        fileDecryptionProperties->aad_prefix_verifier();
+    if (aadPrefixVerifier != nullptr) {
+      aadPrefixVerifier->Verify(aadPrefix);
+    }
+  } else {
+    if (!algo.aad.supply_aad_prefix && !aadPrefixInProperties.empty()) {
+      BOLT_FAIL(
+          "AAD Prefix set in decryption properties, but was not used for file encryption");
+    }
+    const std::shared_ptr<::parquet::AADPrefixVerifier>& aadPrefixVerifier =
+        fileDecryptionProperties->aad_prefix_verifier();
+    if (aadPrefixVerifier != nullptr) {
+      BOLT_FAIL("AAD Prefix Verifier is set, but AAD Prefix not found in file");
+    }
+  }
+  return aadPrefix + algo.aad.aad_file_unique;
+}
+
+// Parse plain footers in Encrypted Parquet files.
+void ReaderBase::parsePlainFooter() {
+  // Providing decryption properties in plaintext footer mode is not
+  // mandatory, for example when reading by legacy reader.
+  auto* file_decryption_properties = fileDecryptionProperties_.get();
+  if (file_decryption_properties != nullptr) {
+    thrift::EncryptionAlgorithm& thriftAlgo =
+        fileMetaData_->encryption_algorithm;
+    ::parquet::EncryptionAlgorithm algo;
+    ParquetCipher::type algorithmType = ParquetCipher::type::AES_GCM_V1;
+    // from thrift algo to arrow parquet EncryptionAlgorithm
+    if (thriftAlgo.__isset.AES_GCM_V1) {
+      algo.algorithm = ::parquet::ParquetCipher::type::AES_GCM_V1;
+      algo.aad.aad_prefix = thriftAlgo.AES_GCM_V1.aad_prefix;
+      algo.aad.aad_file_unique = thriftAlgo.AES_GCM_V1.aad_file_unique;
+      algo.aad.supply_aad_prefix = thriftAlgo.AES_GCM_V1.supply_aad_prefix;
+    } else if (thriftAlgo.__isset.AES_GCM_CTR_V1) {
+      algorithmType = ParquetCipher::type::AES_GCM_CTR_V1;
+      algo.algorithm = ::parquet::ParquetCipher::type::AES_GCM_CTR_V1;
+      algo.aad.aad_prefix = thriftAlgo.AES_GCM_CTR_V1.aad_prefix;
+      algo.aad.aad_file_unique = thriftAlgo.AES_GCM_CTR_V1.aad_file_unique;
+      algo.aad.supply_aad_prefix = thriftAlgo.AES_GCM_CTR_V1.supply_aad_prefix;
+    } else {
+      BOLT_FAIL("ParquetCipher::type not specified");
+    }
+    // Handle AAD prefix
+    std::string file_aad = HandleAadPrefix(fileDecryptionProperties_, algo);
+    fileDecryptor_ = std::make_shared<InternalFileDecryptor>(
+        file_decryption_properties,
+        file_aad,
+        algorithmType,
+        fileMetaData_->footer_signing_key_metadata,
+        &pool_);
+    // TODO : check_plaintext_footer_integrity
+  }
+}
+
 namespace {
 struct ParquetStatsContext : dwio::common::StatsContext {};
 } // namespace
@@ -944,7 +1585,14 @@ class ParquetRowReader::Impl {
         currentRowGroupPtr_(nullptr),
         rowsInCurrentRowGroup_(0),
         currentRowInGroup_(0),
-        schemaHelper_(readerBase_->thriftFileMetaData().schema) {
+        schemaHelper_(readerBase_->thriftFileMetaData().schema),
+        maxBatchBytes_(options.getMaxBatchBytes()) {
+    if (auto selector = options_.getSelector()) {
+      requestedType_ = selector->getSchema();
+    } else {
+      requestedType_ = readerBase_->schema();
+    }
+
     // Validate the requested type is compatible with what's in the file
     std::function<std::string()> createExceptionContext = [&]() {
       std::string exceptionMessageContext = fmt::format(
@@ -958,6 +1606,8 @@ class ParquetRowReader::Impl {
       return exceptionMessageContext;
     };
 
+    validateReaderCastFilter();
+
     if (rowGroups_.empty()) {
       return; // TODO
     }
@@ -966,16 +1616,15 @@ class ParquetRowReader::Impl {
         columnReaderStats_,
         readerBase_->thriftFileMetaData(),
         options_.timestampPrecision(),
+        readerBase->fileDecryptor(),
         schemaHelper_,
+        options_.getMetadataFilter() != nullptr,
+        options_.disableFloatingPointToVarcharMetadataFilter(),
         options_.isDictionaryFilterEnabled(),
         options_.getDecodeRepDefPageCount(),
-        options_.getParquetRepDefMemoryLimit());
-
-    if (auto selector = options_.getSelector()) {
-      requestedType_ = selector->getSchema();
-    } else {
-      requestedType_ = readerBase_->schema();
-    }
+        options_.getParquetRepDefMemoryLimit(),
+        options_.getParquetRepDefStreamingWindowSize(),
+        options_.parquetReaderImplicitCastMask());
 
     auto requestedTypeWithId = ReaderBase::createTypeWithId(
         dwio::common::TypeWithId::create(requestedType_),
@@ -990,10 +1639,14 @@ class ParquetRowReader::Impl {
         params,
         *options_.getScanSpec(),
         pool_);
+    columnReader_->setIsTopLevel();
+
+    extractRequiredColumnNodes();
 
     // Annotate scan spec with logical type names before filtering row groups.
     if (auto scanSpecPtr = options_.getScanSpec()) {
       const auto& ltMap = readerBase_->schemaLogicalTypes();
+      const auto& ctMap = readerBase_->schemaConvertedTypes();
       auto& scanSpec = *scanSpecPtr;
       auto annotate = [&](common::ScanSpec& spec,
                           const std::string& basePath,
@@ -1048,6 +1701,19 @@ class ParquetRowReader::Impl {
                 name));
           }
           spec.setLogicalTypeName(name);
+        }
+        auto ctIt = ctMap.find(path);
+        if (ctIt != ctMap.end()) {
+          const auto name = thrift::to_string(ctIt->second);
+          BOLT_CHECK(
+              spec.convertedTypeName().empty() ||
+                  spec.convertedTypeName() == name,
+              fmt::format(
+                  "ConvertedType mismatch for path {}: scanSpec={}, schema={}",
+                  path,
+                  spec.convertedTypeName(),
+                  name));
+          spec.setConvertedTypeName(name);
         }
         VLOG(2) << "Annotate path=" << path << " field=" << spec.fieldName()
                 << " kind=" << static_cast<int>(twi.type()->kind())
@@ -1158,26 +1824,143 @@ class ParquetRowReader::Impl {
       uint64_t size,
       bolt::VectorPtr& result,
       const dwio::common::Mutation* mutation) {
-    BOLT_DCHECK(!options_.getAppendRowNumberColumn());
     auto rowsToRead = nextReadSize(size);
     if (rowsToRead == kAtEnd) {
       return 0;
     }
     BOLT_DCHECK_GT(rowsToRead, 0);
-    columnReader_->next(rowsToRead, result, mutation);
+    // Cap the batch by an in-memory byte budget derived from row-group
+    // metadata. This protects against peak-memory spikes when crossing
+    // into row-groups with very wide BYTE_ARRAY (e.g. large strings)
+    // before the upstream feedback loop in TableScan has a chance to
+    // shrink the batch size after the fact.
+    const auto requestedRows = rowsToRead;
+    if (maxBatchBytes_ > 0 && cachedBytesPerRow_ > 0) {
+      auto rowsByBytes =
+          std::max<int64_t>(1, maxBatchBytes_ / cachedBytesPerRow_);
+      const auto cappedRows = std::min<int64_t>(rowsToRead, rowsByBytes);
+      if (cappedRows < rowsToRead) {
+        VLOG(1) << "ParquetRowReader::next byte-budget cap: requestedSize="
+                << size << ", rowsAfterRowGroupClip=" << requestedRows
+                << ", cachedBytesPerRow=" << cachedBytesPerRow_
+                << ", maxBatchBytes=" << maxBatchBytes_
+                << ", rowsByBytes=" << rowsByBytes
+                << ", finalRowsToRead=" << cappedRows
+                << ", projectedBatchBytes=" << cappedRows * cachedBytesPerRow_;
+      } else {
+        VLOG(1) << "ParquetRowReader::next byte-budget ok: requestedSize="
+                << size << ", finalRowsToRead=" << rowsToRead
+                << ", cachedBytesPerRow=" << cachedBytesPerRow_
+                << ", projectedBatchBytes=" << rowsToRead * cachedBytesPerRow_;
+      }
+      rowsToRead = cappedRows;
+    }
+    if (!options_.getAppendRowNumberColumn() &&
+        !options_.getRowNumberColumnInfo().has_value()) {
+      columnReader_->next(rowsToRead, result, mutation);
+    } else {
+      readWithRowNumber(rowsToRead, result, mutation);
+    }
     currentRowInGroup_ += rowsToRead;
     return rowsToRead;
   }
 
+  void readWithRowNumber(
+      uint64_t rowsToRead,
+      VectorPtr& result,
+      const dwio::common::Mutation* mutation) {
+    auto* rowVector = result->asUnchecked<RowVector>();
+    column_index_t numChildren = 0;
+    for (auto& column : options_.getScanSpec()->children()) {
+      if (column->projectOut()) {
+        ++numChildren;
+      }
+    }
+    dwio::common::RowNumberColumnInfo rowNumberColumnInfo;
+    if (options_.getRowNumberColumnInfo().has_value()) {
+      rowNumberColumnInfo = options_.getRowNumberColumnInfo().value();
+    } else {
+      rowNumberColumnInfo.insertPosition = numChildren;
+      rowNumberColumnInfo.name = "";
+    }
+    auto rowNumberColumnIndex = rowNumberColumnInfo.insertPosition;
+    auto rowNumberColumnName = rowNumberColumnInfo.name;
+    BOLT_CHECK_LE(rowNumberColumnIndex, numChildren);
+
+    VectorPtr rowNumVector;
+    if (rowVector->childrenSize() != numChildren) {
+      BOLT_CHECK_EQ(rowVector->childrenSize(), numChildren + 1);
+
+      rowNumVector = rowVector->childAt(rowNumberColumnIndex);
+      auto& rowType = rowVector->type()->asRow();
+      auto names = rowType.names();
+      auto types = rowType.children();
+      auto children = rowVector->children();
+      BOLT_DCHECK(!names.empty() && !types.empty() && !children.empty());
+      names.erase(names.begin() + rowNumberColumnIndex);
+      types.erase(types.begin() + rowNumberColumnIndex);
+      children.erase(children.begin() + rowNumberColumnIndex);
+      result = std::make_shared<RowVector>(
+          rowVector->pool(),
+          ROW(std::move(names), std::move(types)),
+          rowVector->nulls(),
+          rowVector->size(),
+          std::move(children));
+    }
+
+    const auto previousRow = nextRowNumber();
+    columnReader_->next(rowsToRead, result, mutation);
+    FlatVector<int64_t>* flatRowNum = nullptr;
+    if (rowNumVector && BaseVector::isVectorWritable(rowNumVector)) {
+      flatRowNum = rowNumVector->asFlatVector<int64_t>();
+    }
+    if (flatRowNum) {
+      flatRowNum->clearAllNulls();
+      flatRowNum->resize(result->size());
+    } else {
+      rowNumVector = std::make_shared<FlatVector<int64_t>>(
+          result->pool(),
+          BIGINT(),
+          nullptr,
+          result->size(),
+          AlignedBuffer::allocate<int64_t>(result->size(), result->pool()),
+          std::vector<BufferPtr>());
+      flatRowNum = rowNumVector->asUnchecked<FlatVector<int64_t>>();
+    }
+
+    auto rowOffsets = columnReader_->outputRows();
+    BOLT_DCHECK_EQ(rowOffsets.size(), result->size());
+    auto* rawRowNum = flatRowNum->mutableRawValues();
+    for (int i = 0; i < rowOffsets.size(); ++i) {
+      rawRowNum[i] = previousRow + rowOffsets[i];
+    }
+    rowVector = result->asUnchecked<RowVector>();
+    auto& rowType = rowVector->type()->asRow();
+    auto names = rowType.names();
+    auto types = rowType.children();
+    auto children = rowVector->children();
+    names.insert(names.begin() + rowNumberColumnIndex, rowNumberColumnName);
+    types.insert(types.begin() + rowNumberColumnIndex, BIGINT());
+    children.insert(children.begin() + rowNumberColumnIndex, rowNumVector);
+    result = std::make_shared<RowVector>(
+        rowVector->pool(),
+        ROW(std::move(names), std::move(types)),
+        rowVector->nulls(),
+        rowVector->size(),
+        std::move(children));
+  }
+
   std::optional<size_t> estimatedRowSize() const {
+    if (requiredColumnNodes_.empty()) {
+      return std::nullopt;
+    }
     auto index =
         nextRowGroupIdsIdx_ < 1 ? 0 : rowGroupIds_[nextRowGroupIdsIdx_ - 1];
-    return readerBase_->estimatedRowGroupBytesInMemory(
-               index,
-               *dynamic_cast<bytedance::bolt::parquet::StructColumnReader*>(
-                    columnReader_.get())
-                    ->requestedTypeWithId()) /
-        rowGroups_[index].num_rows;
+    int64_t bytes = 0;
+    for (const auto& node : requiredColumnNodes_) {
+      bytes += readerBase_->estimatedRowGroupBytesInMemory(index, *node);
+    }
+    return bytes / rowGroups_[index].num_rows;
   }
 
   void updateRuntimeStats(dwio::common::RuntimeStatistics& stats) const {
@@ -1186,6 +1969,7 @@ class ParquetRowReader::Impl {
   }
 
   void resetFilterCaches() {
+    validateReaderCastFilter();
     columnReader_->resetFilterCaches();
   }
 
@@ -1194,6 +1978,83 @@ class ParquetRowReader::Impl {
   }
 
  private:
+  void validateReaderCastFilter() const {
+    if (!options_.getScanSpec()) {
+      return;
+    }
+    parquet::validateReaderCastFilter(
+        readerBase_->schema(), requestedType_, *options_.getScanSpec(), "");
+  }
+
+  // Walk the ScanSpec children against schemaWithId() and collect the
+  // matched top-level Parquet subtrees. We deliberately do NOT wrap them
+  // in a synthetic TypeWithId root: the TypeWithId constructor rewrites
+  // each child's parent_ pointer, which would corrupt the original
+  // schema tree (later code such as ParquetTypeWithId::makeLevelInfo()
+  // walks parquetParent() and reinterprets the parent as a
+  // ParquetTypeWithId). Instead we keep the selected ParquetTypeWithId
+  // nodes as-is and let the caller iterate over them.
+  void extractRequiredColumnNodes() {
+    if (!requiredColumnNodes_.empty()) {
+      return;
+    }
+    auto scanSpecPtr = options_.getScanSpec();
+    if (scanSpecPtr == nullptr) {
+      return;
+    }
+    const auto& schemaWithId = readerBase_->schemaWithId();
+    if (schemaWithId == nullptr) {
+      return;
+    }
+    auto fileRoot =
+        std::dynamic_pointer_cast<const ParquetTypeWithId>(schemaWithId);
+    if (fileRoot == nullptr) {
+      return;
+    }
+    for (const auto& childSpec : scanSpecPtr->children()) {
+      if (childSpec == nullptr || !childSpec->readFromFile()) {
+        // Skip constant / partition / missing columns.
+        continue;
+      }
+      auto fileChild = findFileChildByName(*fileRoot, childSpec->fieldName());
+      if (fileChild == nullptr) {
+        continue;
+      }
+      // Keep the matched node as-is, including kNonLeaf subtrees. The
+      // node still belongs to the original schema tree, so its parent_
+      // chain (used by makeLevelInfo()) remains valid.
+      requiredColumnNodes_.push_back(std::move(fileChild));
+    }
+    if (VLOG_IS_ON(1)) {
+      std::string names;
+      for (const auto& node : requiredColumnNodes_) {
+        if (!names.empty()) {
+          names.append(", ");
+        }
+        names.append(node->type()->toString());
+      }
+      VLOG(1) << "row group requiredColumnNodes_ = [" << names << "]";
+    }
+  }
+
+  // Looks up a child node of the given Parquet (file) row by name. The
+  // lookup is case-sensitive; fileColumnNamesReadAsLowerCase has already
+  // been applied when building schemaWithId so ScanSpec field names match
+  // what is stored in ParquetTypeWithId::name_.
+  static std::shared_ptr<const ParquetTypeWithId> findFileChildByName(
+      const ParquetTypeWithId& parent,
+      const std::string& name) {
+    for (uint32_t i = 0; i < parent.size(); ++i) {
+      const auto& childPtr = parent.childAt(i);
+      auto parquetChild =
+          std::static_pointer_cast<const ParquetTypeWithId>(childPtr);
+      if (parquetChild->name_ == name) {
+        return parquetChild;
+      }
+    }
+    return nullptr;
+  }
+
   bool advanceToNextRowGroup() {
     if (nextRowGroupIdsIdx_ == rowGroupIds_.size()) {
       return false;
@@ -1209,6 +2070,37 @@ class ParquetRowReader::Impl {
     currentRowInGroup_ = 0;
     nextRowGroupIdsIdx_++;
     columnReader_->seekToRowGroup(nextRowGroupIndex);
+
+    // Refresh per-row in-memory byte estimate from the row-group metadata
+    // for the projected columns. Used by next() to cap the batch size and
+    // protect against peak-memory spikes (e.g. wide BYTE_ARRAY columns).
+    const auto previousBytesPerRow = cachedBytesPerRow_;
+    cachedBytesPerRow_ = 0;
+    int64_t estimatedRowGroupBytes = 0;
+    if (maxBatchBytes_ > 0 && rowsInCurrentRowGroup_ > 0) {
+      auto* structReader =
+          dynamic_cast<bytedance::bolt::parquet::StructColumnReader*>(
+              columnReader_.get());
+      if (structReader != nullptr && !requiredColumnNodes_.empty()) {
+        for (const auto& node : requiredColumnNodes_) {
+          estimatedRowGroupBytes += readerBase_->estimatedRowGroupBytesInMemory(
+              nextRowGroupIndex, *node);
+        }
+        cachedBytesPerRow_ = std::max<int64_t>(
+            1, estimatedRowGroupBytes / rowsInCurrentRowGroup_);
+      }
+    }
+    VLOG(1) << "ParquetRowReader::advanceToNextRowGroup: rowGroupIndex="
+            << nextRowGroupIndex
+            << ", rowGroupSlot=" << (nextRowGroupIdsIdx_ - 1) << "/"
+            << rowGroupIds_.size() << ", numRows=" << rowsInCurrentRowGroup_
+            << ", estimatedRowGroupBytes=" << estimatedRowGroupBytes
+            << ", prevBytesPerRow=" << previousBytesPerRow
+            << ", newBytesPerRow=" << cachedBytesPerRow_
+            << ", maxBatchBytes=" << maxBatchBytes_ << ", rowsByBytesCap="
+            << (cachedBytesPerRow_ > 0
+                    ? std::max<int64_t>(1, maxBatchBytes_ / cachedBytesPerRow_)
+                    : -1);
     return true;
   }
 
@@ -1233,6 +2125,16 @@ class ParquetRowReader::Impl {
 
   dwio::common::ColumnReaderStatistics columnReaderStats_;
   SchemaHelper schemaHelper_;
+
+  std::vector<std::shared_ptr<const ParquetTypeWithId>> requiredColumnNodes_;
+
+  // Hard upper bound (bytes) for a single batch's in-memory size; 0
+  // disables. Cached from RowReaderOptions at construction time.
+  int64_t maxBatchBytes_{0};
+  // Estimated in-memory bytes per row of the projected schema in the
+  // current row-group. Refreshed by advanceToNextRowGroup() and consumed
+  // by next() to derive a row-cap from maxBatchBytes_.
+  int64_t cachedBytesPerRow_{0};
 };
 
 ParquetRowReader::ParquetRowReader(
@@ -1240,6 +2142,8 @@ ParquetRowReader::ParquetRowReader(
     const dwio::common::RowReaderOptions& options) {
   impl_ = std::make_unique<ParquetRowReader::Impl>(readerBase, options);
 }
+
+ParquetRowReader::~ParquetRowReader() = default;
 
 void ParquetRowReader::filterRowGroups() {
   impl_->filterRowGroups();

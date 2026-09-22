@@ -27,12 +27,14 @@
 
 find_package(simdjson CONFIG REQUIRED)
 
-add_library(
+bolt_add_library(
   bolt_functions_spark
   Register.cpp
   RegisterArray.cpp
   RegisterBinary.cpp
+  RegisterBitmap.cpp
   RegisterBitwise.cpp
+  RegisterCharVarchar.cpp
   RegisterComparison.cpp
   RegisterDatetime.cpp
   RegisterJson.cpp
@@ -48,6 +50,7 @@ add_library(
   RegisterSpecialForm.cpp
   RegisterString.cpp
   RegisterUrl.cpp
+  RegisterVariant.cpp
 )
 
 # GCC 12 has a bug where it does not respect "pragma ignore" directives and ends up failing
@@ -57,7 +60,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 target_link_libraries(
-  bolt_functions_spark bolt_functions_spark_impl bolt_is_null_functions simdjson::simdjson
+  bolt_functions_spark
+  bolt_functions_spark_impl
+  bolt_is_null_functions
+  simdjson::simdjson
 )
 
-set_property(TARGET bolt_functions_spark PROPERTY JOB_POOL_COMPILE high_memory_pool)
+set_property(
+  TARGET
+    bolt_functions_spark
+  PROPERTY
+    JOB_POOL_COMPILE
+      high_memory_pool
+)

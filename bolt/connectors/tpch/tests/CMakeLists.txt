@@ -29,18 +29,8 @@ add_executable(bolt_tpch_connector_test TpchConnectorTest.cpp)
 
 add_test(bolt_tpch_connector_test bolt_tpch_connector_test)
 
-target_link_libraries(
-  bolt_tpch_connector_test
-  bolt_tpch_connector
-  bolt_vector_test_lib
-  bolt_exec_test_lib
-  bolt_aggregates
-  GTest::gtest
-  GTest::gtest_main
-)
+target_link_libraries(bolt_tpch_connector_test bolt_gtest_main)
 
 add_executable(bolt_tpch_speed_test SpeedTest.cpp)
 
-target_link_libraries(
-  bolt_tpch_speed_test bolt_tpch_connector bolt_exec bolt_exec_test_lib bolt_memory fmt::fmt
-)
+target_link_libraries(bolt_tpch_speed_test bolt_testutils)

@@ -36,7 +36,9 @@
 #include "bolt/common/file/FileSystems.h"
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/MmapAllocator.h"
+#ifndef NDEBUG
 #include "bolt/common/testutil/ScopedTestTime.h"
+#endif
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
 #include "folly/experimental/EventCount.h"
@@ -82,7 +84,7 @@ class AsyncDataCacheTest : public testing::Test {
   static constexpr int32_t kNumFiles = 100;
 
   static void SetUpTestCase() {
-    TestValue::enable();
+    BOLT_TEST_VALUE_ENABLE();
   }
 
   void SetUp() override {
@@ -111,7 +113,7 @@ class AsyncDataCacheTest : public testing::Test {
     std::unique_ptr<SsdCache> ssdCache;
     if (ssdBytes > 0) {
       // tmpfs does not support O_DIRECT, so turn this off for testing.
-      FLAGS_ssd_odirect = false;
+      FLAGS_bolt_ssd_odirect = false;
       // Make a new tempDirectory only if one is not already set. The
       // second creation of cache must find the checkpoint of the
       // previous one.
@@ -176,7 +178,7 @@ class AsyncDataCacheTest : public testing::Test {
   // number of entries, then loads the ones that nobody else is
   // loading. Stops after loading 'loadBytes' worth of entries. If
   // 'errorEveryNBatches' is non-0, every nth load batch will have a
-  // bad read and wil be dropped. The entries of the failed batch read
+  // bad read and will be dropped. The entries of the failed batch read
   // will still be accessed one by one. If 'largeEveryNBatches' is
   // non-0, allocates and freees a single allocation of 'largeBytes'
   // every so many batches. This creates extra memory pressure, as
@@ -779,7 +781,7 @@ TEST_F(AsyncDataCacheTest, DISABLED_ssd) {
 
   // Read back all writes. This increases the chance of writes falling behind
   // new entry creation.
-  FLAGS_ssd_verify_write = true;
+  FLAGS_bolt_ssd_verify_write = true;
 
   // We read kSsdBytes worth of data on 16 threads. The same data will be hit by
   // all threads. The expectation is that most of the data ends up on SSD. All
@@ -794,7 +796,7 @@ TEST_F(AsyncDataCacheTest, DISABLED_ssd) {
   ASSERT_LE(kRamBytes, ssdStats.bytesWritten);
 
   // We allow writes to proceed faster.
-  FLAGS_ssd_verify_write = false;
+  FLAGS_bolt_ssd_verify_write = false;
   // We read the data back. The verify hook checks correct values. Error every
   // 13 batch loads.
   runThreads(16, [&](int32_t /*i*/) { loadLoop(0, kSsdBytes, 13); });
