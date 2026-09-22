@@ -158,7 +158,7 @@ void SortBuffer::addInput(const VectorPtr& input) {
     // rowId = global row index (container id 0 for Sort).
     auto baseRow = hybridData_->getNumRows();
     for (int row = 0; row < input->size(); ++row) {
-      const uint64_t encodedId =
+      uint64_t encodedId =
           static_cast<uint64_t>(row + baseRow) & ((1ULL << 56) - 1);
       data_->storeSingleRowId(encodedId, rows[row]);
     }

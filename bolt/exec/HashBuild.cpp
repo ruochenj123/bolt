@@ -670,7 +670,7 @@ void HashBuild::addInput(RowVectorPtr input) {
       for (auto i = 0; i < hashers.size(); ++i) {
         rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
       }
-      const uint64_t encodedId = (static_cast<uint64_t>(driverId_) << 56) |
+      uint64_t encodedId = (static_cast<uint64_t>(driverId_) << 56) |
           (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
       rows->storeSingleRowId(encodedId, newRow);
     });
