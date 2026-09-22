@@ -94,7 +94,7 @@ CONAN_PACKAGE_ARGS = \
 
 CONAN_HOST_PROFILE_ARGS = \
 	-pr:h ${PROFILE} \
-	-pr:h ../../scripts/conan/bolt.profile
+	-pr:h $(CURDIR)/scripts/conan/bolt.profile
 
 # Package-scoped settings only apply when the matching dependency is in the graph.
 CONAN_BUILD_SETTINGS = \
@@ -237,7 +237,7 @@ _conan_prepare:
 	mv new_conan.options conan.options && \
 	echo ${BUILD_TYPE} > ../.build_type && \
 	read ALL_CONAN_OPTIONS < conan.options && \
-	conan graph info ../.. $(CONAN_PACKAGE_ARGS) \
+	conan graph info $(CURDIR) $(CONAN_PACKAGE_ARGS) \
 	   $(CONAN_BUILD_SETTINGS) \
 	   $${ALL_CONAN_OPTIONS} ${CONAN_CONFIG} --build=missing \
 	   --format=html > bolt.conan.graph.html && \
@@ -248,7 +248,7 @@ conan_install: _conan_prepare
 	set -f && \
 	read ALL_CONAN_OPTIONS < conan.options && \
 	NUM_LINK_JOB=$(NUM_LINK_JOB) \
-	conan install ../.. $(CONAN_PACKAGE_ARGS) \
+	conan install $(CURDIR) $(CONAN_PACKAGE_ARGS) \
 	   $(CONAN_BUILD_SETTINGS) \
 	$${ALL_CONAN_OPTIONS} ${CONAN_CONFIG} --build=missing  &&\
 	cd -
@@ -259,7 +259,7 @@ conan_build: _conan_prepare
 	read ALL_CONAN_OPTIONS < conan.options && \
 	$(CONAN_BUILD_ENV) \
 	BOLT_BUILD_TESTING_WITH_COVERAGE=${BOLT_BUILD_TESTING_WITH_COVERAGE} \
-	conan build ../.. $(CONAN_PACKAGE_ARGS) \
+	conan build $(CURDIR) $(CONAN_PACKAGE_ARGS) \
 	   $(CONAN_BUILD_SETTINGS) \
 	   --build=missing $${ALL_CONAN_OPTIONS} ${CONAN_CONFIG} && \
 	cd -
@@ -270,7 +270,7 @@ _compile_db: _conan_prepare
 	read ALL_CONAN_OPTIONS < conan.options && \
 	$(CONAN_BUILD_ENV) \
 	BOLT_CONAN_CONFIGURE_ONLY=1 \
-	conan build ../.. $(CONAN_PACKAGE_ARGS) \
+	conan build $(CURDIR) $(CONAN_PACKAGE_ARGS) \
 	   $(CONAN_BUILD_SETTINGS) \
 	   --build=missing $${ALL_CONAN_OPTIONS} ${CONAN_CONFIG} && \
 	cd - && \
@@ -293,7 +293,7 @@ export_base:
 	conan export-pkg $(CONAN_PACKAGE_ARGS) \
 	 $${ALL_CONAN_OPTIONS} \
 	 $(CONAN_BUILD_SETTINGS) ${CONAN_CONFIG}\
-	 ../.. && \
+	 $(CURDIR) && \
 	cd -
 
 export_debug:
