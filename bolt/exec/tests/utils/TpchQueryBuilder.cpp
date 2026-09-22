@@ -39,16 +39,50 @@
 #include <fstream>
 #include <gflags/gflags.h>
 
-DECLARE_int32(s_selectivity_pct);
-DECLARE_int32(synth_payload_cols);
-DECLARE_int32(synth_sort_keys);
-DECLARE_bool(synth_join_sort);
-DECLARE_int32(synth_join_keys);
-DECLARE_int32(synth_chain_joins);
-DECLARE_int32(synth_payload_cols_t);
-DECLARE_int32(synth_payload_cols_u);
-DECLARE_int32(t_selectivity_pct);
-DECLARE_int32(u_selectivity_pct);
+// Synthetic-bench knobs are defined here (the test-utils library) so every
+// executable linking bolt_testutils resolves them, not only bolt_tpch_benchmark.
+DEFINE_int32(
+    s_selectivity_pct,
+    100,
+    "Selectivity percentage for S table in Q34 (10, 30, 60, 90, or 100)");
+DEFINE_int32(
+    synth_payload_cols,
+    12,
+    "Synthetic benches (Q31 join / Q40 sort): number of payload/projection "
+    "columns to carry (1..12; VARCHARs are the last two).");
+DEFINE_int32(
+    synth_sort_keys,
+    4,
+    "Q40 sort bench: number of sort keys (1..4, low-cardinality first).");
+DEFINE_bool(
+    synth_join_sort,
+    false,
+    "Q31 join bench: append the 4-key sort after the join.");
+DEFINE_int32(
+    synth_payload_cols_t,
+    -1,
+    "Q37: payload width override for dim T (-1 = use synth_payload_cols).");
+DEFINE_int32(
+    synth_payload_cols_u,
+    -1,
+    "Q37: payload width override for dim U (-1 = use synth_payload_cols).");
+DEFINE_int32(
+    synth_chain_joins,
+    2,
+    "Q37 chain bench: number of PK-FK joins in the left-deep chain (2..3).");
+DEFINE_int32(
+    synth_join_keys,
+    4,
+    "Q31 join bench: number of join keys (1..4; row_id first, so match "
+    "cardinality is identical for any count).");
+DEFINE_int32(
+    t_selectivity_pct,
+    100,
+    "Selectivity percentage for T table in Q34 (10, 30, 60, 90, or 100)");
+DEFINE_int32(
+    u_selectivity_pct,
+    100,
+    "Selectivity percentage for U table in Q35/Q36 (10, 30, 60, 90, or 100)");
 
 namespace bytedance::bolt::exec::test {
 
