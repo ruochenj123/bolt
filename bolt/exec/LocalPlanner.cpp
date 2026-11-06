@@ -460,8 +460,9 @@ void LocalPlanner::plan(
   }
 
   // Fusion v2: per-pipeline probe-run detection (docs/fusion-v2-design.md).
-  LOG(ERROR) << "[fusion-v2] planner gate: enabled=" << queryConfig.fusionV2Enabled()
-             << " pipelines=" << driverFactories->size();
+  VLOG(1) << "[fusion-v2] planner gate: enabled="
+          << queryConfig.fusionV2Enabled()
+          << " pipelines=" << driverFactories->size();
   if (queryConfig.fusionV2Enabled()) {
     auto plan = std::make_shared<FusionPlan>();
     size_t runs = 0;
@@ -472,10 +473,10 @@ void LocalPlanner::plan(
           kinds += n->name();
           kinds += ",";
         }
-        LOG(ERROR) << "[fusion-v2] pipeline nodes: " << kinds;
+        VLOG(1) << "[fusion-v2] pipeline nodes: " << kinds;
       }
       auto hops = JoinFusionPlanner::planPipeline(factory->planNodes);
-      LOG(ERROR) << "[fusion-v2] hops found: " << hops.size();
+      VLOG(1) << "[fusion-v2] hops found: " << hops.size();
       if (!hops.empty()) {
         ++runs;
         for (auto& hop : hops) {
