@@ -78,8 +78,10 @@ HashTable<ignoreNullKeys>::HashTable(
     memory::MemoryPool* pool,
     const std::shared_ptr<bolt::HashStringAllocator>& stringArena,
     bool enableJit,
-    bool hybridMode)
+    bool hybridMode,
+    int32_t numHybridSlotColumns)
     : BaseHashTable(std::move(hashers)),
+      numHybridSlotColumns_(numHybridSlotColumns),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
       isJoinBuild_(isJoinBuild),
       joinBuildNoDuplicates_(!allowDuplicates),
@@ -94,10 +96,26 @@ HashTable<ignoreNullKeys>::HashTable(
   }
   if (hybridMode) {
     std::vector<TypePtr> rowIdType = {BIGINT()};
+    // Aggregate slots (JoinAggReuse.h, rows mode): one fixed-size, 8-byte
+    // aligned accumulator region per row, updated with atomics.
+    std::vector<Accumulator> hybridAccumulators = accumulators;
+    if (numHybridSlotColumns > 0) {
+      auto noopExtract = [](folly::Range<char**>, VectorPtr&) {};
+      hybridAccumulators.emplace_back(
+          true, // isFixedSize
+          static_cast<int32_t>(8 * numHybridSlotColumns),
+          false, // usesExternalMemory
+          8, // alignment
+          BIGINT(),
+          BIGINT(),
+          noopExtract,
+          noopExtract,
+          [](folly::Range<char**>) {});
+    }
     rows_ = std::make_unique<RowContainer>(
         keys,
         !ignoreNullKeys,
-        accumulators,
+        hybridAccumulators,
         rowIdType,
         allowDuplicates,
         isJoinBuild,

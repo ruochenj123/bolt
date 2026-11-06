@@ -213,6 +213,10 @@ HashProbe::HashProbe(
   if (driverCtx->fusionPlan != nullptr) {
     fusionHop_ = driverCtx->fusionPlan->hopFor(planNodeId());
   }
+  if (driverCtx->joinAggReusePlan != nullptr) {
+    joinAggReuseMember_ = driverCtx->joinAggReusePlan->forJoin(planNodeId());
+    rightDeepBuild_ = driverCtx->joinAggReusePlan->forBuild(planNodeId());
+  }
 
 }
 
@@ -234,6 +238,28 @@ void HashProbe::initialize() {
   auto buildType = joinNode_->sources()[1]->outputType();
   auto tableType =
       makeTableType(buildType.get(), joinNode_->rightKeys(), joinNode_);
+  std::unordered_map<std::string, column_index_t> deferredSourceChannels;
+  if (rightDeepBuild_ != nullptr) {
+    // As HashBuild lays it out: the deferred columns replaced by a trailing
+    // reference column.
+    const auto& rightDeep = *rightDeepBuild_->rightDeep;
+    for (size_t i = 0; i < rightDeep.deferredColumns.size(); ++i) {
+      deferredSourceChannels[rightDeep.deferredColumns[i]] =
+          rightDeep.sourceTableChannels[i];
+    }
+    std::vector<std::string> names;
+    std::vector<TypePtr> types;
+    for (size_t i = 0; i < tableType->size(); ++i) {
+      if (deferredSourceChannels.count(tableType->nameOf(i)) == 0) {
+        names.push_back(tableType->nameOf(i));
+        types.push_back(tableType->childAt(i));
+      }
+    }
+    rightDeepRefChannel_ = names.size();
+    names.push_back(rightDeep.refColumn);
+    types.push_back(BIGINT());
+    tableType = ROW(std::move(names), std::move(types));
+  }
   if (joinNode_->filter()) {
     initializeFilter(joinNode_->filter(), probeType_, tableType);
   }
@@ -255,6 +281,11 @@ void HashProbe::initialize() {
   }
 
   for (column_index_t i = 0; i < outputType_->size(); ++i) {
+    auto deferred = deferredSourceChannels.find(outputType_->nameOf(i));
+    if (deferred != deferredSourceChannels.end()) {
+      rightDeepDeref_.emplace_back(deferred->second, i);
+      continue;
+    }
     auto tableChannel = tableType->getChildIdxIfExists(outputType_->nameOf(i));
     if (tableChannel.has_value()) {
       tableOutputProjections_.emplace_back(tableChannel.value(), i);
@@ -266,8 +297,12 @@ void HashProbe::initialize() {
     }
   }
 
+  if (!rightDeepDeref_.empty()) {
+    // The dictionary output path extracts table columns only.
+    hitSampling_ = false;
+  }
   if (numIdentityProjections == probeType_->size() &&
-      tableOutputProjections_.empty()) {
+      tableOutputProjections_.empty() && rightDeepDeref_.empty()) {
     isIdentityProjection_ = true;
   }
 
@@ -451,6 +486,10 @@ void HashProbe::asyncWaitForHashTable() {
 
   table_ = std::move(hashBuildResult->table);
   BOLT_CHECK_NOT_NULL(table_);
+  if (rightDeepBuild_ != nullptr) {
+    rightDeepSourceTable_ = table_->rightDeepSource();
+  }
+  maybeActivateJoinAggReuse();
 
   // Fusion v2: intermediate hops defer their build payloads; the
   // materialization hop keeps the standard output path and resolves refs
@@ -709,7 +748,8 @@ void HashProbe::clearDynamicFilters() {
   //  * build side has no dependent columns.
   if (keyChannels_.size() == 1 && !table_->hasDuplicateKeys() &&
       tableOutputProjections_.empty() && !filter_ && !dynamicFilters_.empty() &&
-      !isRightJoin(joinType_)) {
+      !isRightJoin(joinType_) && rightDeepDeref_.empty() &&
+      !(joinAggReuseSource() != nullptr && joinAggReuseActive_)) {
     canReplaceWithDynamicFilter_ = true;
   }
 
@@ -733,6 +773,9 @@ void HashProbe::decodeAndDetectNonNullKeys() {
 }
 
 void HashProbe::addInput(RowVectorPtr input) {
+  if (joinAggReuseMember_.position > 0) {
+    takeCarriedRows(input->size());
+  }
   if (skipInput_) {
     BOLT_CHECK_NULL(input_);
     return;
@@ -929,7 +972,256 @@ void HashProbe::fillLeftSemiProjectMatchColumn(vector_size_t size) {
   }
 }
 
+void HashProbe::extractTableColumns(
+    BaseHashTable* table,
+    folly::Range<char**> rows,
+    folly::Range<const IdentityProjection*> projections,
+    memory::MemoryPool* pool,
+    const std::vector<TypePtr>& resultTypes,
+    std::vector<VectorPtr>& resultVectors) {
+  // No sorting: callers fill other columns in the order of 'rows'.
+  extractColumns(
+      table,
+      rows,
+      projections,
+      pool,
+      resultTypes,
+      resultVectors,
+      /*allowSorting=*/false);
+}
+
+void HashProbe::derefRightDeep(char** rows, vector_size_t size) {
+  if (rightDeepDeref_.empty() || size == 0) {
+    return;
+  }
+  if (rightDeepSourceTable_ == nullptr) {
+    // No build input anywhere: these are misses of an outer join.
+    for (const auto& projection : rightDeepDeref_) {
+      output_->childAt(projection.outputChannel) =
+          BaseVector::createNullConstant(
+              outputType_->childAt(projection.outputChannel), size, pool());
+    }
+    return;
+  }
+  std::vector<VectorPtr> refs(1);
+  const std::vector<IdentityProjection> refProjection{
+      IdentityProjection(rightDeepRefChannel_, 0)};
+  extractColumns(
+      table_.get(),
+      folly::Range<char**>(rows, size),
+      refProjection,
+      pool(),
+      std::vector<TypePtr>{BIGINT()},
+      refs,
+      /*allowSorting=*/false);
+  DecodedVector decoded(*refs[0]);
+  rightDeepRows_.resize(size);
+  for (vector_size_t i = 0; i < size; ++i) {
+    rightDeepRows_[i] = rows[i] == nullptr || decoded.isNullAt(i)
+        ? nullptr
+        : reinterpret_cast<char*>(decoded.valueAt<int64_t>(i));
+  }
+  extractColumns(
+      rightDeepSourceTable_.get(),
+      folly::Range<char**>(rightDeepRows_.data(), size),
+      rightDeepDeref_,
+      pool(),
+      outputType_->children(),
+      output_->children(),
+      /*allowSorting=*/false);
+}
+
+void HashProbe::maybeActivateJoinAggReuse() {
+  joinAggReuseActive_ = false;
+  joinAggReuseKeyProjections_.clear();
+  const auto* source = joinAggReuseSource();
+  // Groups come from hybrid row ids; a spill partition's table is not the
+  // one the aggregation's other drivers see.
+  if (source == nullptr || table_->hybridData() == nullptr ||
+      fusionHop_ != nullptr || isSpillInput()) {
+    return;
+  }
+  const auto& spec = *joinAggReuseMember_.spec;
+  for (size_t k = 0; k < source->groupKeys.size(); ++k) {
+    const auto outputChannel =
+        static_cast<column_index_t>(source->groupKeys[k]);
+    if (source->groupKeyBuildKeys[k] >= 0) {
+      // A probe join key: emit the equal build key (a key column).
+      joinAggReuseKeyProjections_.emplace_back(
+          static_cast<column_index_t>(source->groupKeyBuildKeys[k]),
+          outputChannel);
+      continue;
+    }
+    const auto joinChannel =
+        outputType_->getChildIdx(source->groupKeyColumns[k]);
+    bool found = false;
+    for (const auto& projection : tableOutputProjections_) {
+      if (projection.outputChannel == joinChannel) {
+        joinAggReuseKeyProjections_.emplace_back(
+            projection.inputChannel, outputChannel);
+        found = true;
+        break;
+      }
+    }
+    BOLT_CHECK(found, "join-agg reuse: grouping key is not a build output");
+  }
+  joinAggReuseExtract_.clear();
+  joinAggReuseNullChannels_.clear();
+  for (const auto& projection : tableOutputProjections_) {
+    if (source->nullableBuildColumns.count(
+            outputType_->nameOf(projection.outputChannel)) > 0) {
+      joinAggReuseNullChannels_.push_back(projection.outputChannel);
+    } else {
+      joinAggReuseExtract_.emplace_back(
+          projection.inputChannel, projection.outputChannel);
+    }
+  }
+
+  if (spec.rightDeep.has_value()) {
+    // Right-deep reuse: the rows go to the build above; no groups.
+    joinAggReuseActive_ = true;
+    addRuntimeStat("rightDeepSourceActive", RuntimeCounter(1));
+    return;
+  }
+
+  // Rows mode when a single source's build rows are the groups: unique keys
+  // (every probe row matches at most one build row, a build row absorbs all
+  // matches of its key; with duplicate keys, e.g. a lineitem build probed by
+  // orders, each build row tends to match once) and grouping keys that are
+  // the join keys, or too many rows to code. The plan does not say; the built
+  // table does. Otherwise codes mode: dense codes of the grouping values.
+  joinAggReuseRowsMode_ = spec.sources.size() == 1 && !spec.hasDecimal() &&
+      !table_->hasDuplicateKeys() &&
+      (source->keysCoverJoinKeys ||
+       table_->numDistinct() > kJoinAggReuseMaxCodedRows);
+  if (!joinAggReuseRowsMode_) {
+    // Codes are assigned lazily, to the build rows probes match.
+    joinAggReuseCodes_ = table_->joinAggReuseCodes([&]() {
+      return std::make_shared<JoinAggReuseCodes>(
+          *table_, joinAggReuseKeyProjections_);
+    });
+  }
+  joinAggReuseActive_ = true;
+  addRuntimeStat(
+      joinAggReuseRowsMode_ ? "joinAggReuseRowsMode" : "joinAggReuseCodesMode",
+      RuntimeCounter(1));
+}
+
+void HashProbe::takeCarriedRows(vector_size_t size) {
+  if (joinAggReusePublisher_ == nullptr) {
+    const auto& below =
+        joinAggReuseMember_.spec->chainJoinIds[joinAggReuseMember_.position - 1];
+    for (auto* op : operatorCtx_->driver()->operators()) {
+      auto* probe = dynamic_cast<HashProbe*>(op);
+      if (probe != nullptr && probe->planNodeId() == below) {
+        joinAggReusePublisher_ = probe;
+        break;
+      }
+    }
+    BOLT_CHECK_NOT_NULL(joinAggReusePublisher_);
+  }
+  const bool publisherActive = joinAggReusePublisher_->joinAggReuseActive();
+  if (joinAggReuseSource() == nullptr) {
+    joinAggReuseActive_ = publisherActive;
+  } else {
+    BOLT_CHECK_EQ(
+        publisherActive,
+        joinAggReuseActive_,
+        "join-agg reuse: sources of one aggregation decided differently");
+  }
+  if (!publisherActive) {
+    return;
+  }
+  auto& published = joinAggReusePublisher_->joinAggReuseChannels();
+  for (const auto& channel : published) {
+    BOLT_CHECK_EQ(
+        channel.size(),
+        size,
+        "join-agg reuse: probe input is not the join below's last output");
+  }
+  joinAggReuseCarried_.swap(published);
+  published.clear();
+}
+
+void HashProbe::publishJoinAggReuseRows(
+    vector_size_t size,
+    const vector_size_t* mapping) {
+  BOLT_CHECK(
+      joinAggReuseChannels_.empty(),
+      "join-agg reuse: the previous batch's rows were not taken");
+  for (const auto& carried : joinAggReuseCarried_) {
+    std::vector<char*> channel(size);
+    for (vector_size_t i = 0; i < size; ++i) {
+      channel[i] = carried[mapping != nullptr ? mapping[i] : i];
+    }
+    joinAggReuseChannels_.push_back(std::move(channel));
+  }
+  if (joinAggReuseSource() != nullptr) {
+    joinAggReuseChannels_.emplace_back(
+        outputTableRows_.begin(), outputTableRows_.begin() + size);
+  }
+}
+
+void HashProbe::fillOutputForJoinAggReuse(
+    vector_size_t size,
+    bool buildSideOnly) {
+  std::vector<VectorPtr> children(outputType_->size());
+  if (buildSideOnly) {
+    // Unmatched build rows of a right join: null probe-side columns.
+    for (auto projection : projectedInputColumns_) {
+      children[projection.outputChannel] = BaseVector::createNullConstant(
+          outputType_->childAt(projection.outputChannel), size, pool());
+    }
+  } else {
+    for (auto projection : projectedInputColumns_) {
+      ensureLoadedIfNotAtEnd(projection.inputChannel);
+    }
+    wrapIndirectChildren(
+        projectedInputColumns_,
+        input_->children(),
+        size,
+        outputRowMapping_,
+        children);
+  }
+  // Build columns used above only as grouping keys are not extracted: the
+  // aggregation reads the grouping keys from the table once per group.
+  for (auto channel : joinAggReuseNullChannels_) {
+    children[channel] = BaseVector::createNullConstant(
+        outputType_->childAt(channel), size, pool());
+  }
+  if (!joinAggReuseExtract_.empty()) {
+    extractColumns(
+        table_.get(),
+        folly::Range<char**>(outputTableRows_.data(), size),
+        joinAggReuseExtract_,
+        pool(),
+        outputType_->children(),
+        children,
+        /*allowSorting=*/false);
+  }
+  // Channels no projection fills: an output name that occurs twice gets
+  // only its first occurrence mapped (as in the standard path, which leaves
+  // the rest as allocated but unwritten vectors). Share the named column.
+  for (column_index_t i = 0; i < children.size(); ++i) {
+    if (children[i] == nullptr) {
+      const auto first = outputType_->getChildIdx(outputType_->nameOf(i));
+      children[i] = children[first] != nullptr
+          ? children[first]
+          : BaseVector::createNullConstant(
+                outputType_->childAt(i), size, pool());
+    }
+  }
+  output_ = std::make_shared<RowVector>(
+      pool(), outputType_, nullptr, size, std::move(children));
+  publishJoinAggReuseRows(
+      size, buildSideOnly ? nullptr : outputRowMapping_->as<vector_size_t>());
+}
+
 void HashProbe::fillOutput(vector_size_t size) {
+  if (joinAggReuseSource() != nullptr && joinAggReuseActive_) {
+    fillOutputForJoinAggReuse(size, /*buildSideOnly=*/false);
+    return;
+  }
   if (fusionHop_ != nullptr) {
     fusionOutRows_ += size;
   }
@@ -1005,8 +1297,9 @@ void HashProbe::fillOutput(vector_size_t size) {
           pool(),
           outputType_->children(),
           output_->children(),
-          /*allowSorting=*/!hasProbeColumns);
+          /*allowSorting=*/!hasProbeColumns && rightDeepDeref_.empty());
     }
+    derefRightDeep(outputTableRows_.data(), size);
   }
 
   // Fusion v2: resolve upstream deferred refs at the run's final hop.
@@ -1014,6 +1307,10 @@ void HashProbe::fillOutput(vector_size_t size) {
       input_ != nullptr &&
       input_->childrenSize() > probeType_->size()) {
     materializeFusionRefs(size);
+  }
+
+  if (joinAggReuseActive_) {
+    publishJoinAggReuseRows(size, outputRowMapping_->as<vector_size_t>());
   }
 }
 
@@ -1391,6 +1688,11 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
     return nullptr;
   }
 
+  if (joinAggReuseSource() != nullptr && joinAggReuseActive_) {
+    fillOutputForJoinAggReuse(numOut, /*buildSideOnly=*/true);
+    return output_;
+  }
+
   prepareOutput(numOut);
 
   // Populate probe-side columns of the output with nulls.
@@ -1405,7 +1707,9 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
       tableOutputProjections_,
       pool(),
       outputType_->children(),
-      output_->children());
+      output_->children(),
+      /*allowSorting=*/rightDeepDeref_.empty());
+  derefRightDeep(outputTableRows_.data(), numOut);
 
   if (isRightSemiProjectJoin(joinType_)) {
     // Populate 'match' column.
@@ -1530,6 +1834,9 @@ RowVectorPtr HashProbe::getOutput() {
   if (replacedWithDynamicFilter_) {
     addRuntimeStat("replacedWithDynamicFilterRows", RuntimeCounter(inputSize));
     auto output = Operator::fillOutput(inputSize, nullptr);
+    if (joinAggReuseActive_) {
+      publishJoinAggReuseRows(inputSize, nullptr);
+    }
     input_ = nullptr;
     return output;
   }

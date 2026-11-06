@@ -48,6 +48,7 @@
 
 namespace bytedance::bolt::exec {
 class FusionPlan;
+class JoinAggReusePlan;
 
 class Driver;
 class ExchangeClient;
@@ -290,6 +291,8 @@ struct DriverCtx {
 
   /// Fusion v2 plan (immutable; copied from DriverFactory at driver creation).
   std::shared_ptr<const FusionPlan> fusionPlan;
+  /// Join-aggregation reuse specs (immutable; copied from DriverFactory).
+  std::shared_ptr<const JoinAggReusePlan> joinAggReusePlan;
   Driver* driver;
   bytedance::bolt::process::ThreadDebugInfo threadDebugInfo;
   /// Tracks the traced operator ids. It is also used to avoid tracing the
@@ -638,6 +641,10 @@ struct DriverFactory {
   /// Shared by all drivers of this pipeline; operators read their hop via
   /// fusionPlan->hopFor(planNodeId). Never mutated at runtime.
   std::shared_ptr<const FusionPlan> fusionPlan;
+
+  /// Join-aggregation reuse specs of the task (JoinAggReuse.h), shared by all
+  /// pipelines: the build, the probe and the aggregation of a spec read it.
+  std::shared_ptr<const JoinAggReusePlan> joinAggReusePlan;
 
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,

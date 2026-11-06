@@ -64,6 +64,7 @@ bolt_add_library(
   Limit.cpp
   LocalPartition.cpp
   LocalPlanner.cpp
+  JoinAggReuse.cpp
   JoinFusionPlanner.cpp
   LocalShuffle.cpp
   MarkDistinct.cpp

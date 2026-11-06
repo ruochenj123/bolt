@@ -30,6 +30,7 @@
 
 #include "bolt/exec/LocalPlanner.h"
 #include "bolt/exec/JoinFusionPlanner.h"
+#include "bolt/exec/JoinAggReuse.h"
 #include "bolt/common/base/SparkCompatibility.h"
 
 #include "RoundRobinPartitionFunction.h"
@@ -491,6 +492,44 @@ void LocalPlanner::plan(
     }
   }
 
+  // Join-aggregation reuse (JoinAggReuse.h): analysis only; the plan and its
+  // operators stay as they are. The slots live in memory next to the
+  // in-memory build rows, so a spillable join is left alone.
+  if (queryConfig.joinAggReuseEnabled() &&
+      !(queryConfig.spillEnabled() && queryConfig.joinSpillEnabled())) {
+    auto plan = std::make_shared<JoinAggReusePlan>();
+    for (auto& factory : *driverFactories) {
+      for (auto& spec : analyzeJoinAggReuse(factory->planNodes)) {
+        plan->add(std::move(spec));
+      }
+    }
+    for (const auto& id : findRedundantDistincts(planFragment.planNode)) {
+      plan->addPassThrough(id);
+    }
+    // Right-deep reuse, one level: a join whose own build stores references
+    // is not the source of another (its table layout differs).
+    std::vector<JoinAggReuseSpec> rightDeep;
+    std::unordered_set<core::PlanNodeId> consumers;
+    for (auto& factory : *driverFactories) {
+      if (auto spec = analyzeRightDeep(
+              factory->planNodes, factory->consumerNode, *plan)) {
+        consumers.insert(spec->rightDeep->buildJoinNodeId);
+        rightDeep.push_back(std::move(*spec));
+      }
+    }
+    for (auto& spec : rightDeep) {
+      if (consumers.count(spec.sources[0].joinNodeId) == 0) {
+        plan->add(std::move(spec));
+      }
+    }
+    if (!plan->empty()) {
+      std::shared_ptr<const JoinAggReusePlan> shared = std::move(plan);
+      for (auto& factory : *driverFactories) {
+        factory->joinAggReusePlan = shared;
+      }
+    }
+  }
+
   (*driverFactories)[0]->outputDriver = true;
 
   if (planFragment.isGroupedExecution()) {
@@ -630,6 +669,7 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     std::function<int(int pipelineId)> numDrivers,
     std::shared_ptr<LocalExchangeQueue> primedQueue) {
   ctx->fusionPlan = fusionPlan;
+  ctx->joinAggReusePlan = joinAggReusePlan;
   auto driver = std::shared_ptr<Driver>(new Driver());
   ctx->driver = driver.get();
 

@@ -675,6 +675,10 @@ class QueryConfig {
       "fusion_adaptive_enabled";
   static constexpr const char* kFusionAdaptiveTrace = "fusion_adaptive_trace";
 
+  /// Join-aggregation reuse: a partial aggregation above a hash join uses the
+  /// join's build rows as its groups (bolt/exec/JoinAggReuse.h).
+  static constexpr const char* kJoinAggReuseEnabled = "join_agg_reuse_enabled";
+
   /**
    * LLVM JIT enabled
    * -1 : enable all jit (by default)
@@ -1129,6 +1133,10 @@ class QueryConfig {
   /// Returns whether fusion v2 (deferred-ref columns) is enabled.
   bool fusionV2Enabled() const {
     return get<bool>(kFusionV2Enabled, false);
+  }
+
+  bool joinAggReuseEnabled() const {
+    return get<bool>(kJoinAggReuseEnabled, false);
   }
 
   /// Adaptive materialization placement: fused hops start deferring and may

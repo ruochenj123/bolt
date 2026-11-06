@@ -50,6 +50,7 @@
 #include "bolt/exec/PlanNodeStats.h"
 #include "bolt/exec/Split.h"
 #include "bolt/exec/tests/utils/HiveConnectorTestBase.h"
+#include "bolt/exec/tests/utils/ResidentTables.h"
 #include "bolt/exec/tests/utils/TpchQueryBuilder.h"
 #include "bolt/exec/tests/utils/TpcdsHybridQueryBuilder.h"
 #include "bolt/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
@@ -95,7 +96,11 @@ struct ParameterDim {
 
 class QueryBenchmarkBase {
  public:
-  virtual ~QueryBenchmarkBase() = default;
+  virtual ~QueryBenchmarkBase() {
+    // Without shutdown() (error exit), the memory manager owning the resident
+    // batches may already be gone; leak them rather than free into it.
+    (void)residentLoader_.release();
+  }
   virtual void initialize();
   void shutdown();
   std::pair<std::unique_ptr<exec::test::TaskCursor>, std::vector<RowVectorPtr>>
@@ -136,6 +141,18 @@ class QueryBenchmarkBase {
   void runAllCombinations();
 
  protected:
+  /// Query configs derived from the benchmark flags.
+  std::unordered_map<std::string, std::string> queryConfigs() const;
+
+  /// --resident_tables: serves the plan's scans from memory (see
+  /// ResidentTables.h) and clears 'dataFiles'.
+  void makeResident(
+      const core::PlanNodePtr& plan,
+      std::unordered_map<core::PlanNodeId, std::vector<std::string>>&
+          dataFiles,
+      dwio::common::FileFormat format);
+
+  std::unique_ptr<exec::test::ResidentTableLoader> residentLoader_;
   std::unique_ptr<folly::IOThreadPoolExecutor> ioExecutor_;
   std::unique_ptr<folly::IOThreadPoolExecutor> cacheExecutor_;
   std::shared_ptr<memory::MemoryAllocator> allocator_;

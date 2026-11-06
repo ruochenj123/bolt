@@ -47,6 +47,9 @@
 #include "bolt/exec/UnorderedStreamReader.h"
 namespace bytedance::bolt::exec {
 
+class HashProbe;
+struct JoinAggReuseSpec;
+
 // Builds a hash table for use in HashProbe. This is the final
 // Operator in a build side Driver. The build side pipeline has
 // multiple Drivers, each with its own HashBuild. The build finishes
@@ -470,6 +473,22 @@ class HashBuild final : public Operator {
 
   // For hybrid join
   bool hybridJoin_{false};
+
+  // Join-aggregation reuse, rows mode (JoinAggReuse.h): initial values of the
+  // aggregate slots reserved in each key row, and their offset.
+  std::vector<int64_t> joinAggReuseSlotInit_;
+  int32_t joinAggReuseSlotOffset_{-1};
+
+  // Right-deep reuse (JoinAggReuse.h): the build stores, in place of the
+  // deferred columns, a reference to the row of the join below that the probe
+  // publishing the input's rows (in this driver) matched; that join's table is
+  // kept alive with this one.
+  const JoinAggReuseSpec* rightDeep_{nullptr};
+  HashProbe* rightDeepPublisher_{nullptr};
+  std::shared_ptr<BaseHashTable> rightDeepSourceTable_;
+
+  // The payload of 'input': its non-deferred dependents and the references.
+  RowVectorPtr rightDeepPayload(const RowVectorPtr& input);
   int driverId_;
   std::unique_ptr<HybridContainer> hybridData_;
 

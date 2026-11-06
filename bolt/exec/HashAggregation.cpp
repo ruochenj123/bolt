@@ -31,11 +31,13 @@
 #include "bolt/exec/HashAggregation.h"
 #include <folly/ScopeGuard.h>
 #include <signal.h>
+#include <algorithm>
 #include <iostream>
 #include <optional>
 #include "bolt/common/base/SuccinctPrinter.h"
 #include "bolt/common/testutil/TestValue.h"
 #include "bolt/exec/Aggregate.h"
+#include "bolt/exec/HashProbe.h"
 #include "bolt/exec/Operator.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/SortedAggregations.h"
@@ -102,6 +104,43 @@ HashAggregation::HashAggregation(
 
 void HashAggregation::initialize() {
   Operator::initialize();
+
+  if (const auto& plan = operatorCtx_->driverCtx()->joinAggReusePlan;
+      plan != nullptr) {
+    if (const auto* spec = plan->forAggregation(planNodeId())) {
+      // The sources' probes, and the topmost join of the chain, whose output
+      // rows reach this aggregation.
+      std::vector<HashProbe*> sources(spec->sources.size(), nullptr);
+      HashProbe* rowsFrom = nullptr;
+      for (auto* op : operatorCtx_->driver()->operators()) {
+        auto* probe = dynamic_cast<HashProbe*>(op);
+        if (probe == nullptr) {
+          continue;
+        }
+        for (size_t s = 0; s < spec->sources.size(); ++s) {
+          if (probe->planNodeId() == spec->sources[s].joinNodeId) {
+            sources[s] = probe;
+          }
+        }
+        if (probe->planNodeId() == spec->chainJoinIds.back()) {
+          rowsFrom = probe;
+        }
+      }
+      if (rowsFrom != nullptr &&
+          std::find(sources.begin(), sources.end(), nullptr) ==
+              sources.end()) {
+        joinAggReuse_ = std::make_unique<JoinAggReuseConsumer>(
+            *spec, std::move(sources), rowsFrom);
+      }
+    }
+    if (plan->isPassThrough(planNodeId())) {
+      passThrough_ = true;
+      const auto& inputType = aggregationNode_->sources()[0]->outputType();
+      for (const auto& key : aggregationNode_->groupingKeys()) {
+        passThroughChannels_.push_back(inputType->getChildIdx(key->name()));
+      }
+    }
+  }
 
   BOLT_CHECK(pool()->trackUsage());
 
@@ -265,6 +304,21 @@ bool HashAggregation::preferPartialSpill(
 }
 
 void HashAggregation::addInput(RowVectorPtr input) {
+  if (passThrough_) {
+    std::vector<VectorPtr> children;
+    for (auto channel : passThroughChannels_) {
+      children.push_back(input->childAt(channel));
+    }
+    numInputRows_ += input->size();
+    input_ = std::make_shared<RowVector>(
+        pool(), outputType_, nullptr, input->size(), std::move(children));
+    return;
+  }
+  if (joinAggReuseActive()) {
+    numInputRows_ += input->size();
+    joinAggReuse_->addInput(*this, input);
+    return;
+  }
   if (!pushdownChecked_) {
     mayPushdown_ = operatorCtx_->driver()->mayPushdownAggregation(this);
     pushdownChecked_ = true;
@@ -553,6 +607,31 @@ RowVectorPtr HashAggregation::getOutput() {
     input_ = nullptr;
     return nullptr;
   }
+  if (passThrough_) {
+    if (input_ == nullptr) {
+      finished_ = noMoreInput_;
+      return nullptr;
+    }
+    auto output = std::move(input_);
+    input_ = nullptr;
+    numOutputRows_ += output->size();
+    return output;
+  }
+  if (joinAggReuseActive()) {
+    if (!noMoreInput_) {
+      return nullptr;
+    }
+    auto output = joinAggReuse_->getOutput(
+        *this,
+        outputType_,
+        operatorCtx_->driverCtx()->queryConfig().maxOutputBatchRows());
+    if (output == nullptr) {
+      finished_ = true;
+      return nullptr;
+    }
+    numOutputRows_ += output->size();
+    return output;
+  }
   if (abandonedPartialAggregation_) {
     if (noMoreInput_) {
       finished_ = true;
@@ -722,6 +801,15 @@ RowVectorPtr HashAggregation::getDistinctOutput() {
 }
 
 void HashAggregation::noMoreInput() {
+  if (passThrough_) {
+    Operator::noMoreInput();
+    return;
+  }
+  if (joinAggReuseActive()) {
+    Operator::noMoreInput();
+    joinAggReuse_->noMoreInput(*this);
+    return;
+  }
   updateEstimatedOutputRowSize();
   groupingSet_->noMoreInput();
   convertedInput_ = nullptr;

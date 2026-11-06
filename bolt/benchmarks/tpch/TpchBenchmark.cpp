@@ -64,6 +64,11 @@ DEFINE_int32(
     bolt_benchmark_run_query_verbose,
     -1,
     "Run a given query and print execution statistics");
+DEFINE_bool(
+    bolt_benchmark_result_checksum,
+    false,
+    "Print the number of result rows and an order-independent checksum (sum "
+    "of row hashes) of the results");
 DEFINE_int32(
     bolt_benchmark_io_meter_column_pct,
     0,
@@ -111,6 +116,18 @@ class TpchBenchmark : public QueryBenchmarkBase {
       if (FLAGS_bolt_benchmark_include_results) {
         printResults(actualResults, out);
         out << std::endl;
+      }
+      if (FLAGS_bolt_benchmark_result_checksum) {
+        uint64_t sum = 0;
+        int64_t numRows = 0;
+        for (const auto& batch : actualResults) {
+          for (vector_size_t i = 0; i < batch->size(); ++i) {
+            sum += batch->hashValueAt(i);
+          }
+          numRows += batch->size();
+        }
+        out << fmt::format("Result checksum: rows={} sum={:016x}", numRows, sum)
+            << std::endl;
       }
       const auto stats = task->taskStats();
       int64_t rawInputBytes = 0;

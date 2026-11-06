@@ -156,6 +156,20 @@ DEFINE_int32(
     bolt_benchmark_split_preload_per_driver,
     2,
     "Prefetch split metadata");
+
+DEFINE_bool(
+    join_agg_reuse_enabled,
+    false,
+    "A partial aggregation above a hash join uses the join's build rows as "
+    "its groups (bolt/exec/JoinAggReuse.h)");
+
+DEFINE_bool(
+    resident_tables,
+    false,
+    "Serve every TableScan from process-resident, pre-decoded batches (loaded "
+    "once per process by the real scan). Scan filters, including join dynamic "
+    "filters, are still applied at runtime; only the Parquet decode leaves "
+    "the timed region. See ResidentTables.h.");
 using namespace bytedance::bolt::exec;
 using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::dwio::common;
@@ -293,46 +307,78 @@ QueryBenchmarkBase::listSplits(
 }
 
 void QueryBenchmarkBase::shutdown() {
+  // Releases the resident batches before the memory manager goes away.
+  residentLoader_.reset();
   if (cache_) {
     cache_->shutdown();
   }
 }
 
+std::unordered_map<std::string, std::string> QueryBenchmarkBase::queryConfigs()
+    const {
+  std::unordered_map<std::string, std::string> configs;
+  configs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
+      std::to_string(FLAGS_bolt_benchmark_split_preload_per_driver);
+  if (FLAGS_hybrid_join_enabled) {
+    configs[core::QueryConfig::kHybridJoinEnabled] = "true";
+  }
+  if (FLAGS_hybrid_sort_enabled) {
+    configs[core::QueryConfig::kHybridSortEnabled] = "true";
+  }
+  if (FLAGS_fusion_v2_enabled) {
+    configs[core::QueryConfig::kFusionV2Enabled] = "true";
+  }
+  if (FLAGS_fusion_adaptive_enabled) {
+    configs[core::QueryConfig::kFusionAdaptiveEnabled] = "true";
+  }
+  if (FLAGS_fusion_adaptive_trace) {
+    configs[core::QueryConfig::kFusionAdaptiveTrace] = "true";
+  }
+  configs[core::QueryConfig::kHybridJoinReorderEnabled] =
+      FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
+  if (FLAGS_join_agg_reuse_enabled) {
+    configs[core::QueryConfig::kJoinAggReuseEnabled] = "true";
+  }
+  if (FLAGS_max_output_batch_rows != 10000) {
+    configs[core::QueryConfig::kMaxOutputBatchRows] =
+        std::to_string(FLAGS_max_output_batch_rows);
+  }
+  if (FLAGS_preferred_output_batch_rows != 1024) {
+    configs[core::QueryConfig::kPreferredOutputBatchRows] =
+        std::to_string(FLAGS_preferred_output_batch_rows);
+  }
+  return configs;
+}
+
+void QueryBenchmarkBase::makeResident(
+    const core::PlanNodePtr& plan,
+    std::unordered_map<core::PlanNodeId, std::vector<std::string>>& dataFiles,
+    dwio::common::FileFormat format) {
+  if (residentLoader_ == nullptr) {
+    // Same configs as the query, so the preloaded batches have the sizes a
+    // regular scan would produce.
+    residentLoader_ = std::make_unique<ResidentTableLoader>(
+        FLAGS_bolt_benchmark_num_drivers,
+        FLAGS_bolt_benchmark_num_splits_per_file,
+        queryConfigs());
+  }
+  residentLoader_->makeResident(plan, dataFiles, format);
+}
+
 std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>>
-QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
+QueryBenchmarkBase::run(const TpchPlan& originalPlan) {
   int32_t repeat = 0;
+  auto tpchPlan = originalPlan;
   try {
+    if (FLAGS_resident_tables) {
+      makeResident(
+          tpchPlan.plan, tpchPlan.dataFiles, tpchPlan.dataFileFormat);
+    }
     for (;;) {
       CursorParameters params;
       params.maxDrivers = FLAGS_bolt_benchmark_num_drivers;
       params.planNode = tpchPlan.plan;
-      params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
-          std::to_string(FLAGS_bolt_benchmark_split_preload_per_driver);
-      if (FLAGS_hybrid_join_enabled) {
-        params.queryConfigs[core::QueryConfig::kHybridJoinEnabled] = "true";
-      }
-      if (FLAGS_hybrid_sort_enabled) {
-        params.queryConfigs[core::QueryConfig::kHybridSortEnabled] = "true";
-      }
-      if (FLAGS_fusion_v2_enabled) {
-        params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
-      }
-      if (FLAGS_fusion_adaptive_enabled) {
-        params.queryConfigs[core::QueryConfig::kFusionAdaptiveEnabled] = "true";
-      }
-      if (FLAGS_fusion_adaptive_trace) {
-        params.queryConfigs[core::QueryConfig::kFusionAdaptiveTrace] = "true";
-      }
-      params.queryConfigs[core::QueryConfig::kHybridJoinReorderEnabled] =
-          FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
-      if (FLAGS_max_output_batch_rows != 10000) {
-        params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =
-            std::to_string(FLAGS_max_output_batch_rows);
-      }
-      if (FLAGS_preferred_output_batch_rows != 1024) {
-        params.queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] =
-            std::to_string(FLAGS_preferred_output_batch_rows);
-      }
+      params.queryConfigs = queryConfigs();
       const int numSplitsPerFile = FLAGS_bolt_benchmark_num_splits_per_file;
 
       bool noMoreSplits = false;
@@ -364,40 +410,19 @@ QueryBenchmarkBase::run(const TpchPlan& tpchPlan) {
 }
 
 std::pair<std::unique_ptr<TaskCursor>, std::vector<RowVectorPtr>>
-QueryBenchmarkBase::run(const TpcdsPlan& tpcdsPlan) {
+QueryBenchmarkBase::run(const TpcdsPlan& originalPlan) {
   int32_t repeat = 0;
+  auto tpcdsPlan = originalPlan;
   try {
+    if (FLAGS_resident_tables) {
+      makeResident(
+          tpcdsPlan.plan, tpcdsPlan.dataFiles, tpcdsPlan.dataFileFormat);
+    }
     for (;;) {
       CursorParameters params;
       params.maxDrivers = FLAGS_bolt_benchmark_num_drivers;
       params.planNode = tpcdsPlan.plan;
-      params.queryConfigs[core::QueryConfig::kMaxSplitPreloadPerDriver] =
-          std::to_string(FLAGS_bolt_benchmark_split_preload_per_driver);
-      if (FLAGS_hybrid_join_enabled) {
-        params.queryConfigs[core::QueryConfig::kHybridJoinEnabled] = "true";
-      }
-      if (FLAGS_hybrid_sort_enabled) {
-        params.queryConfigs[core::QueryConfig::kHybridSortEnabled] = "true";
-      }
-      if (FLAGS_fusion_v2_enabled) {
-        params.queryConfigs[core::QueryConfig::kFusionV2Enabled] = "true";
-      }
-      if (FLAGS_fusion_adaptive_enabled) {
-        params.queryConfigs[core::QueryConfig::kFusionAdaptiveEnabled] = "true";
-      }
-      if (FLAGS_fusion_adaptive_trace) {
-        params.queryConfigs[core::QueryConfig::kFusionAdaptiveTrace] = "true";
-      }
-      params.queryConfigs[core::QueryConfig::kHybridJoinReorderEnabled] =
-          FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
-      if (FLAGS_max_output_batch_rows != 10000) {
-        params.queryConfigs[core::QueryConfig::kMaxOutputBatchRows] =
-            std::to_string(FLAGS_max_output_batch_rows);
-      }
-      if (FLAGS_preferred_output_batch_rows != 1024) {
-        params.queryConfigs[core::QueryConfig::kPreferredOutputBatchRows] =
-            std::to_string(FLAGS_preferred_output_batch_rows);
-      }
+      params.queryConfigs = queryConfigs();
       const int numSplitsPerFile = FLAGS_bolt_benchmark_num_splits_per_file;
 
       bool noMoreSplits = false;

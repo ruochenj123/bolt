@@ -1584,7 +1584,10 @@ HybridContainer::HybridContainer(
       keys_(rows) {
   // For N-way late-m, payloadTypes can be empty - we only store keys and refs
   // BOLT_CHECK(!payloadTypes_.empty());
-  rowIdColumnOffset_ = keys_->columnAt(keyTypes.size()).offset();
+  // The row id is the first dependent column; accumulators (e.g. fused
+  // aggregate slots, JoinAggReuse.h) sit between the keys and it.
+  rowIdColumnOffset_ =
+      keys_->columnAt(keyTypes.size() + keys_->accumulators().size()).offset();
   isNullable_.resize(payloadTypes_.size(), false);
   types_.reserve(keyTypes_.size() + payloadTypes_.size());
   for (const auto& type : keyTypes_)

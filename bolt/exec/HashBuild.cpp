@@ -29,6 +29,8 @@
  */
 
 #include "bolt/exec/HashBuild.h"
+#include "bolt/exec/HashProbe.h"
+#include "bolt/exec/JoinAggReuse.h"
 #include <boost/sort/pdqsort/pdqsort.hpp>
 #include <cstdint>
 #include <optional>
@@ -157,6 +159,26 @@ HashBuild::HashBuild(
   hybridJoin_ = operatorCtx_->driverCtx()->queryConfig().hybridJoinEnabled() &&
       numDependents > 0 && !joinNode_->isLeftSemiFilterJoin() &&
       !joinNode_->isLeftSemiProjectJoin() && !joinNode_->isAntiJoin();
+  // A join whose rows an aggregation may reuse as groups (JoinAggReuse.h)
+  // needs the hybrid row ids, whatever its payload width. If the aggregation
+  // may run in rows mode (a single source, no decimal sums), each key row
+  // also reserves the aggregation's slots, used if the probe activates rows
+  // mode and left alone otherwise.
+  if (const auto& reusePlan = operatorCtx_->driverCtx()->joinAggReusePlan;
+      reusePlan != nullptr) {
+    const auto member = reusePlan->forJoin(planNodeId());
+    if (member.source >= 0) {
+      hybridJoin_ = true;
+      if (!member.spec->rightDeep.has_value() &&
+          member.spec->sources.size() == 1 && !member.spec->hasDecimal()) {
+        joinAggReuseSlotInit_ = member.spec->slotInitValues();
+      }
+    }
+    rightDeep_ = reusePlan->forBuild(planNodeId());
+    if (rightDeep_ != nullptr) {
+      hybridJoin_ = true;
+    }
+  }
 
   if (!dropDuplicates_ && numDependents > 0) {
     // Number of join keys (numKeys) may be less then number of input columns
@@ -174,6 +196,14 @@ HashBuild::HashBuild(
     // store dependent columns.
     for (auto i = 0; i < inputType->size(); ++i) {
       if (keyChannelMap_.find(i) == keyChannelMap_.end()) {
+        if (rightDeep_ != nullptr) {
+          const auto& deferred = rightDeep_->rightDeep->deferredColumns;
+          if (std::find(
+                  deferred.begin(), deferred.end(), inputType->nameOf(i)) !=
+              deferred.end()) {
+            continue; // Stored as the reference.
+          }
+        }
         // Always track dependent channels for inputChannel -> storageChannel mapping
         dependentChannels_.emplace_back(i);
         decoders_.emplace_back(std::make_unique<DecodedVector>());
@@ -185,6 +215,13 @@ HashBuild::HashBuild(
     }
   }
 
+  if (rightDeep_ != nullptr) {
+    // The reference column comes last (HashProbe lays the table out alike).
+    names.emplace_back(rightDeep_->rightDeep->refColumn);
+    types.emplace_back(BIGINT());
+    dependentNames.emplace_back(rightDeep_->rightDeep->refColumn);
+    dependentTypes.emplace_back(BIGINT());
+  }
   tableType_ = ROW(std::move(names), std::move(types));
   dependentTypes_ = ROW(std::move(dependentNames), std::move(dependentTypes));
   driverId_ = driverCtx->driverId;
@@ -248,7 +285,8 @@ void HashBuild::setupTable() {
         queryConfig.minTableRowsForParallelJoinBuild(),
         pool(),
         queryConfig.enableJitRowEqVectors(),
-        hybridJoin_);
+        hybridJoin_,
+        static_cast<int32_t>(joinAggReuseSlotInit_.size()));
   } else {
     // Right semi join needs to tag build rows that were probed.
     const bool needProbedFlag = joinNode_->isRightSemiFilterJoin();
@@ -265,7 +303,8 @@ void HashBuild::setupTable() {
           queryConfig.minTableRowsForParallelJoinBuild(),
           pool(),
           queryConfig.enableJitRowEqVectors(),
-          hybridJoin_);
+          hybridJoin_,
+          static_cast<int32_t>(joinAggReuseSlotInit_.size()));
     } else {
       // Ignore null keys
       table_ = HashTable<true>::createForJoin(
@@ -278,7 +317,8 @@ void HashBuild::setupTable() {
           queryConfig.minTableRowsForParallelJoinBuild(),
           pool(),
           queryConfig.enableJitRowEqVectors(),
-          hybridJoin_);
+          hybridJoin_,
+          static_cast<int32_t>(joinAggReuseSlotInit_.size()));
     }
   }
   lookup_ = std::make_unique<HashLookup>(
@@ -286,6 +326,13 @@ void HashBuild::setupTable() {
   lookup_->reset(1);
   analyzeKeys_ = table_->hashMode() != BaseHashTable::HashMode::kHash;
 
+  if (!joinAggReuseSlotInit_.empty()) {
+    // The slots are the accumulator column right after the keys.
+    joinAggReuseSlotOffset_ =
+        table_->rows()->columnAt(table_->hashers().size()).offset();
+    BOLT_CHECK_EQ(
+        joinAggReuseSlotOffset_ % 8, 0, "reuse slots must be 8-byte aligned");
+  }
   if (hybridJoin_) {
     table_->hybridData()->setId(static_cast<uint8_t>(driverId_));
     // Initialize allContainers_ with itself so spilling can work before table
@@ -298,6 +345,42 @@ void HashBuild::setupTable() {
     table_->hybridData()->setReorderEnabled(
         queryConfig.hybridJoinReorderEnabled());
   }
+}
+
+RowVectorPtr HashBuild::rightDeepPayload(const RowVectorPtr& input) {
+  if (rightDeepPublisher_ == nullptr) {
+    const auto& publisherId = rightDeep_->chainJoinIds.back();
+    for (auto* op : operatorCtx_->driver()->operators()) {
+      auto* probe = dynamic_cast<HashProbe*>(op);
+      if (probe != nullptr && probe->planNodeId() == publisherId) {
+        rightDeepPublisher_ = probe;
+        break;
+      }
+    }
+    BOLT_CHECK_NOT_NULL(rightDeepPublisher_);
+    rightDeepSourceTable_ = rightDeepPublisher_->joinAggReuseTable();
+  }
+  BOLT_CHECK(
+      rightDeepPublisher_->joinAggReuseActive(),
+      "right-deep reuse: the join below did not publish its rows");
+  auto& channels = rightDeepPublisher_->joinAggReuseChannels();
+  BOLT_CHECK_EQ(channels.size(), 1);
+  BOLT_CHECK_EQ(channels[0].size(), input->size());
+  auto refs = BaseVector::create<FlatVector<int64_t>>(
+      BIGINT(), input->size(), pool());
+  auto* rawRefs = refs->mutableRawValues();
+  for (vector_size_t i = 0; i < input->size(); ++i) {
+    rawRefs[i] = reinterpret_cast<int64_t>(channels[0][i]);
+  }
+  channels.clear();
+  std::vector<VectorPtr> children;
+  children.reserve(dependentChannels_.size() + 1);
+  for (auto channel : dependentChannels_) {
+    children.push_back(input->childAt(channel));
+  }
+  children.push_back(std::move(refs));
+  return std::make_shared<RowVector>(
+      pool(), dependentTypes_, input->nulls(), input->size(), std::move(children));
 }
 
 void HashBuild::setReusableHashTable(
@@ -673,9 +756,20 @@ void HashBuild::addInput(RowVectorPtr input) {
       uint64_t encodedId = (static_cast<uint64_t>(driverId_) << 56) |
           (static_cast<uint64_t>(rowIndex + baseRow) & ((1ULL << 56) - 1));
       rows->storeSingleRowId(encodedId, newRow);
+      if (joinAggReuseSlotOffset_ >= 0) {
+        std::memcpy(
+            newRow + joinAggReuseSlotOffset_,
+            joinAggReuseSlotInit_.data(),
+            joinAggReuseSlotInit_.size() * sizeof(int64_t));
+      }
     });
-    auto payloadInput = wrapColumns(
-        input->as<RowVector>(), dependentChannels_, dependentTypes_, pool());
+    auto payloadInput = rightDeep_ != nullptr
+        ? rightDeepPayload(input)
+        : wrapColumns(
+              input->as<RowVector>(),
+              dependentChannels_,
+              dependentTypes_,
+              pool());
     table_->hybridData()->addPayload(std::move(payloadInput));
   } else {
     activeRows_.applyToSelected([&](auto rowIndex) {
@@ -1154,6 +1248,9 @@ bool HashBuild::finishHashBuild() {
       build->intermediateStateCleared_ = true;
       BOLT_CHECK_NOT_NULL(build->table_);
       otherTables.push_back(std::move(build->table_));
+      if (rightDeepSourceTable_ == nullptr) {
+        rightDeepSourceTable_ = build->rightDeepSourceTable_;
+      }
       buildSpiller = std::move(build->spiller_);
     }
     if (buildSpiller != nullptr) {
@@ -1207,6 +1304,9 @@ bool HashBuild::finishHashBuild() {
   // https://github.com/facebookincubator/velox/issues/3567 is fixed.
   const bool allowParallelJoinBuild =
       !otherTables.empty() && spillPartitions.empty();
+  if (rightDeep_ != nullptr) {
+    table_->setRightDeepSource(rightDeepSourceTable_);
+  }
   table_->prepareJoinTable(
       std::move(otherTables),
       allowParallelJoinBuild ? operatorCtx_->task()->queryCtx()->executor()

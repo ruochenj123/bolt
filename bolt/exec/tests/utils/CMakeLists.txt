@@ -41,6 +41,7 @@ bolt_add_library(
   PlanBuilder.cpp
   PortUtil.cpp
   QueryAssertions.cpp
+  ResidentTables.cpp
   RowBasedSerde.cpp
   SumNonPODAggregate.cpp
   TpcdsPlanLoader.cpp

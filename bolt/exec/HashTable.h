@@ -35,9 +35,15 @@
 #include "bolt/exec/OneWayStatusFlag.h"
 #include "bolt/exec/RowContainer.h"
 #include "bolt/exec/VectorHasher.h"
+
+#include <functional>
+#include <mutex>
 namespace bytedance {
 namespace bolt {
 namespace exec {
+
+class JoinAggReuseState;
+class JoinAggReuseCodes;
 
 using PartitionBoundIndexType = int64_t;
 /// Provides the partition info for parallel join table build use.
@@ -398,6 +404,44 @@ class BaseHashTable {
 
   virtual std::vector<HybridContainer*> allHybridContainers() const = 0;
 
+  /// Shared state of a partial aggregation that uses this table's build rows
+  /// as its groups (JoinAggReuse.h). 'create' runs for the first caller only.
+  std::shared_ptr<JoinAggReuseState> joinAggReuseState(
+      const std::function<std::shared_ptr<JoinAggReuseState>()>& create) {
+    std::lock_guard<std::mutex> l(joinAggReuseMutex_);
+    if (joinAggReuseState_ == nullptr) {
+      joinAggReuseState_ = create();
+    }
+    return joinAggReuseState_;
+  }
+
+  /// The state if an aggregation created it, else nullptr.
+  std::shared_ptr<JoinAggReuseState> peekJoinAggReuseState() {
+    std::lock_guard<std::mutex> l(joinAggReuseMutex_);
+    return joinAggReuseState_;
+  }
+
+  /// Right-deep reuse (JoinAggReuse.h): the table whose rows this table's
+  /// reference column points to, kept alive with this table.
+  void setRightDeepSource(std::shared_ptr<BaseHashTable> source) {
+    rightDeepSource_ = std::move(source);
+  }
+
+  const std::shared_ptr<BaseHashTable>& rightDeepSource() const {
+    return rightDeepSource_;
+  }
+
+  /// Group codes of this table's build rows for a reusing aggregation
+  /// (JoinAggReuse.h). 'create' runs for the first caller only.
+  std::shared_ptr<JoinAggReuseCodes> joinAggReuseCodes(
+      const std::function<std::shared_ptr<JoinAggReuseCodes>()>& create) {
+    std::lock_guard<std::mutex> l(joinAggReuseMutex_);
+    if (joinAggReuseCodes_ == nullptr) {
+      joinAggReuseCodes_ = create();
+    }
+    return joinAggReuseCodes_;
+  }
+
   /// Static functions for processing internals. Public because used in
   /// structs that define probe and insert algorithms.
 
@@ -463,6 +507,11 @@ class BaseHashTable {
   std::unique_ptr<RowContainer> rows_;
 
   std::unique_ptr<HybridContainer> hybridData_{nullptr};
+
+  std::mutex joinAggReuseMutex_;
+  std::shared_ptr<JoinAggReuseState> joinAggReuseState_;
+  std::shared_ptr<JoinAggReuseCodes> joinAggReuseCodes_;
+  std::shared_ptr<BaseHashTable> rightDeepSource_;
 
   // Time spent in build outside of the calling thread.
   CpuWallTiming offThreadBuildTiming_;
@@ -565,7 +614,8 @@ class HashTable : public BaseHashTable {
       memory::MemoryPool* pool,
       const std::shared_ptr<bolt::HashStringAllocator>& stringArena,
       bool enableJitRowEqVectors,
-      bool hybridMode = false);
+      bool hybridMode = false,
+      int32_t numHybridSlotColumns = 0);
 
   ~HashTable() override = default;
 
@@ -597,7 +647,8 @@ class HashTable : public BaseHashTable {
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
       bool jitRowEqVectors,
-      bool hybridMode = false) {
+      bool hybridMode = false,
+      int32_t numHybridSlotColumns = 0) {
     return std::make_unique<HashTable>(
         std::move(hashers),
         std::vector<Accumulator>{},
@@ -610,7 +661,14 @@ class HashTable : public BaseHashTable {
         pool,
         nullptr,
         jitRowEqVectors,
-        hybridMode);
+        hybridMode,
+        numHybridSlotColumns);
+  }
+
+  /// Hybrid join tables whose rows an aggregation may reuse (JoinAggReuse.h)
+  /// reserve 8-byte aggregate slots in each key row, before the row id.
+  int32_t numHybridSlotColumns() const {
+    return numHybridSlotColumns_;
   }
 
   void groupProbe(HashLookup& lookup) override;
@@ -1166,6 +1224,7 @@ class HashTable : public BaseHashTable {
   std::vector<std::list<std::vector<char*>>> nexts_;
 
   bool enableJit_{false};
+  int32_t numHybridSlotColumns_{0};
   RowEqVectors rowEqVectorsFunc_{nullptr};
   RowRowCompare rowEqRowFunc_{nullptr};
 #ifdef ENABLE_BOLT_JIT

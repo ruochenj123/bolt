@@ -32,6 +32,7 @@
 
 #include <set>
 #include "bolt/exec/HashBuild.h"
+#include "bolt/exec/JoinAggReuse.h"
 #include "bolt/exec/JoinFusionPlanner.h"
 #include "bolt/exec/HashPartitionFunction.h"
 #include "bolt/exec/HashTable.h"
@@ -86,7 +87,84 @@ class HashProbe : public Operator {
 
   void clearDynamicFilters() override;
 
+  /// ===== Join-aggregation reuse (JoinAggReuse.h) =====
+  /// True when this probe publishes build rows for its output rows: those it
+  /// carries from the join below it in the chain, then its own matches if it
+  /// is a source. A source decides when its table arrives (the same way in
+  /// all drivers); a join above follows the join below.
+  bool joinAggReuseActive() const {
+    return joinAggReuseActive_;
+  }
+
+  /// A source in rows mode; otherwise codes mode (JoinAggReuse.h).
+  bool joinAggReuseRowsMode() const {
+    return joinAggReuseRowsMode_;
+  }
+
+  /// Build rows of the latest output batch's rows, one channel per source at
+  /// or below this join, bottom-up. The consumer clears them.
+  std::vector<std::vector<char*>>& joinAggReuseChannels() {
+    return joinAggReuseChannels_;
+  }
+
+  const std::shared_ptr<BaseHashTable>& joinAggReuseTable() const {
+    return table_;
+  }
+
+  /// A source: (table column, aggregation output channel) of its grouping
+  /// keys.
+  const std::vector<IdentityProjection>& joinAggReuseKeyProjections() const {
+    return joinAggReuseKeyProjections_;
+  }
+
+  /// A source in codes mode: the group codes of its build rows.
+  const std::shared_ptr<JoinAggReuseCodes>& joinAggReuseCodes() const {
+    return joinAggReuseCodes_;
+  }
+
+  /// Copies 'projections' of 'table' for 'rows' into 'resultVectors' (keys
+  /// from the key rows, payloads from the HybridContainer).
+  static void extractTableColumns(
+      BaseHashTable* table,
+      folly::Range<char**> rows,
+      folly::Range<const IdentityProjection*> projections,
+      memory::MemoryPool* pool,
+      const std::vector<TypePtr>& resultTypes,
+      std::vector<VectorPtr>& resultVectors);
+
  private:
+  // Join-aggregation reuse, a source: activates it if the table allows
+  // (hybrid, not a spill partition), chooses rows or codes mode, and computes
+  // the grouping key projections and the columns to extract.
+  void maybeActivateJoinAggReuse();
+
+  const JoinAggReuseSource* joinAggReuseSource() const {
+    return joinAggReuseMember_.source >= 0
+        ? &joinAggReuseMember_.spec->sources[joinAggReuseMember_.source]
+        : nullptr;
+  }
+
+  // A source's output: probe-side columns as usual, null constants for the
+  // build columns used above only as grouping keys, the other build columns
+  // extracted; publishes the rows.
+  void fillOutputForJoinAggReuse(vector_size_t size, bool buildSideOnly);
+
+  // Right-deep reuse, the build side's probe: reads the deferred output
+  // columns of 'rows' (this table's rows) through their references into the
+  // rows of the join below.
+  void derefRightDeep(char** rows, vector_size_t size);
+
+  // A join above the chain's lowest join: takes the rows the join below
+  // published for this input batch.
+  void takeCarriedRows(vector_size_t size);
+
+  // Publishes the carried rows of this output batch's rows ('mapping':
+  // output row -> input row; nullptr for the identity), then this source's
+  // matched rows.
+  void publishJoinAggReuseRows(
+      vector_size_t size,
+      const vector_size_t* mapping);
+
   // Indicates if the join type includes misses from the left side in the
   // output.
   bool joinIncludesMissesFromLeft(core::JoinType joinType) {
@@ -352,6 +430,30 @@ class HashProbe : public Operator {
   // Table shared between other HashProbes in other Drivers of the
   // same pipeline.
   std::shared_ptr<BaseHashTable> table_;
+
+  /// ===== Join-aggregation reuse (JoinAggReuse.h) =====
+  JoinAggReusePlan::Member joinAggReuseMember_;
+  bool joinAggReuseActive_{false};
+  bool joinAggReuseRowsMode_{false};
+  std::vector<std::vector<char*>> joinAggReuseChannels_;
+  std::vector<IdentityProjection> joinAggReuseKeyProjections_;
+  // A source: build columns it still extracts, and those it emits as null
+  // constants.
+  std::vector<IdentityProjection> joinAggReuseExtract_;
+  std::vector<column_index_t> joinAggReuseNullChannels_;
+  std::shared_ptr<JoinAggReuseCodes> joinAggReuseCodes_;
+  // A join above the lowest: the join below it and the rows it published for
+  // the current input batch.
+  HashProbe* joinAggReusePublisher_{nullptr};
+  std::vector<std::vector<char*>> joinAggReuseCarried_;
+  // Right-deep reuse (JoinAggReuse.h): this join's build stored references to
+  // the rows of the join below; (that table's channel, output channel) of the
+  // deferred columns, the reference column, and that table.
+  const JoinAggReuseSpec* rightDeepBuild_{nullptr};
+  std::vector<IdentityProjection> rightDeepDeref_;
+  column_index_t rightDeepRefChannel_{0};
+  std::shared_ptr<BaseHashTable> rightDeepSourceTable_;
+  std::vector<char*> rightDeepRows_;
 
   /// ===== Fusion v2 (docs/fusion-v2-design.md) =====
   /// Immutable hop instruction for this probe, or nullptr when not fused.

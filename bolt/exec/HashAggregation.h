@@ -32,6 +32,7 @@
 
 #include "bolt/exec/GroupingSet.h"
 #include "bolt/exec/Operator.h"
+#include "bolt/exec/JoinAggReuse.h"
 namespace bytedance::bolt::exec {
 
 class HashAggregation : public Operator {
@@ -52,6 +53,9 @@ class HashAggregation : public Operator {
   RowVectorPtr getOutput() override;
 
   bool needsInput() const override {
+    if (passThrough_) {
+      return !noMoreInput_ && input_ == nullptr;
+    }
     return !noMoreInput_ && !partialFull_;
   }
 
@@ -175,6 +179,20 @@ class HashAggregation : public Operator {
   bool supportRowBasedOutput_{false};
   std::vector<AggregateInfo> aggregatesForExtractColumns_;
   RowVectorPtr convertedInput_{nullptr};
+
+  // Join-aggregation reuse (JoinAggReuse.h): set when this partial
+  // aggregation may use the build rows of the join below it as its groups;
+  // used instead of 'groupingSet_' once the probe activates the reuse.
+  std::unique_ptr<JoinAggReuseConsumer> joinAggReuse_;
+
+  // A DISTINCT made redundant by a right-semi join above (JoinAggReuse.h):
+  // passes its input through, projected to the grouping key channels.
+  bool passThrough_{false};
+  std::vector<column_index_t> passThroughChannels_;
+
+  bool joinAggReuseActive() const {
+    return joinAggReuse_ != nullptr && joinAggReuse_->active();
+  }
 };
 
 } // namespace bytedance::bolt::exec

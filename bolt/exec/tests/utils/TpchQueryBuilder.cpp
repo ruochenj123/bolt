@@ -328,6 +328,8 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ36Plan();
     case 37:
       return getQ37Plan();
+    case 38:
+      return getQ38Plan();
     case 40:
       return getQ40Plan();
     default:
@@ -4407,6 +4409,95 @@ TpchPlan TpchQueryBuilder::getQ36Plan() const {
 // 
 // This query tests hybrid sort performance on a simple TableScan -> Sort pattern
 // without join overhead.
+// Q38: right-deep chain T x (S x R) on the current synth_join tables. The
+// first join (S probe, R build, 4 keys) emits R's row_id and the first
+// --synth_payload_cols R payloads; its output is the build side of the second
+// join (T probe on t_row_id = row_id), which emits the R payloads and 4 T
+// payloads. --s_selectivity_pct thins S (the second build),
+// --t_selectivity_pct thins T (the second probe).
+TpchPlan TpchQueryBuilder::getQ38Plan() const {
+  static const std::vector<std::string> kRPay = {
+      "l_orderkey",   "l_partkey",      "l_linenumber",  "l_quantity",
+      "l_extendedprice", "l_discount",  "l_tax",         "l_comment",
+      "l_shipdate",   "l_commitdate",   "l_shipinstruct", "l_shipmode"};
+  const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 1, 12);
+  const std::vector<std::string> rPay(
+      kRPay.begin(), kRPay.begin() + numPayloads);
+  const std::vector<std::string> rKeys = {
+      "row_id", "l_suppkey", "l_returnflag", "l_linestatus"};
+  const std::vector<std::string> tPay = {
+      "t_orderkey", "t_partkey", "t_extendedprice", "t_quantity"};
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId rScanId, sScanId, tScanId;
+
+  std::vector<std::string> rCols = rKeys;
+  rCols.insert(rCols.end(), rPay.begin(), rPay.end());
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, getRowType(kTableR, rCols),
+                          getFileColumnNames(kTableR))
+               .captureScanNodeId(rScanId)
+               .planNode();
+
+  PlanBuilder sb(planNodeIdGenerator, pool_.get());
+  sb.filtersAsNode(filtersAsNode_)
+      .tableScan(
+          kTableS,
+          getRowType(
+              kTableS,
+              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+               "s_orderkey"}),
+          getFileColumnNames(kTableS))
+      .captureScanNodeId(sScanId);
+  if (FLAGS_s_selectivity_pct < 100) {
+    sb.filter(
+        fmt::format("(s_orderkey % 10) < {}", FLAGS_s_selectivity_pct / 10));
+  }
+  std::vector<std::string> sJoinROut = {"row_id"};
+  sJoinROut.insert(sJoinROut.end(), rPay.begin(), rPay.end());
+  auto sJoinR = sb.project({"row_id AS s_row_id",
+                            "l_suppkey AS s_suppkey",
+                            "l_returnflag AS s_returnflag",
+                            "l_linestatus AS s_linestatus"})
+                    .hashJoin(
+                        {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},
+                        rKeys,
+                        r,
+                        "",
+                        sJoinROut)
+                    .planNode();
+
+  std::vector<std::string> tCols = {"t_row_id"};
+  tCols.insert(tCols.end(), tPay.begin(), tPay.end());
+  PlanBuilder tb(planNodeIdGenerator, pool_.get());
+  tb.filtersAsNode(filtersAsNode_)
+      .tableScan(kTableT, getRowType(kTableT, tCols),
+                 getFileColumnNames(kTableT))
+      .captureScanNodeId(tScanId);
+  if (FLAGS_t_selectivity_pct < 100) {
+    tb.filter(
+        fmt::format("(t_row_id % 10) < {}", FLAGS_t_selectivity_pct / 10));
+  }
+  std::vector<std::string> out = rPay;
+  out.insert(out.end(), tPay.begin(), tPay.end());
+  auto plan = tb.hashJoin({"t_row_id"}, {"row_id"}, sJoinR, "", out)
+                  .planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format(
+      "q38_p{}_s{}_t{}",
+      numPayloads,
+      FLAGS_s_selectivity_pct,
+      FLAGS_t_selectivity_pct);
+  context.plan = std::move(plan);
+  context.dataFiles[rScanId] = getTableFilePaths(kTableR);
+  context.dataFiles[sScanId] = getTableFilePaths(kTableS);
+  context.dataFiles[tScanId] = getTableFilePaths(kTableT);
+  context.dataFileFormat = format_;
+  return context;
+}
+
 TpchPlan TpchQueryBuilder::getQ40Plan() const {
   // Sort keys ordered by increasing cardinality; --synth_sort_keys=k
   // takes the first k. --synth_payload_cols=N controls carried payload
