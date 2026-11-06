@@ -239,4 +239,19 @@ RowVectorPtr wrapColumns(
     const RowTypePtr& types,
     memory::MemoryPool* pool);
 
+/// Nominal per-row byte width of a payload column for the hybrid layout gates
+/// (hybrid_join_min_payload_bytes, hybrid_sort_min_payload_bytes): the exact
+/// size of a fixed-width type, 32 for VARCHAR/VARBINARY (16-byte StringView
+/// plus a nominal 16-byte body), 16 for other variable-width types.
+inline int64_t hybridPayloadNominalWidth(const TypePtr& type) {
+  if (type->isFixedWidth()) {
+    return type->cppSizeInBytes();
+  }
+  if (type->kind() == TypeKind::VARCHAR ||
+      type->kind() == TypeKind::VARBINARY) {
+    return 32;
+  }
+  return 16;
+}
+
 } // namespace bytedance::bolt::exec

@@ -106,6 +106,24 @@ DEFINE_bool(
     false,
     "Enable hybrid sort optimization");
 
+DEFINE_int32(
+    hybrid_join_min_payload_bytes,
+    8,
+    "Minimum nominal byte width of the payload columns a hash build stores for "
+    "the hybrid join to stay enabled (0 disables the gate)");
+
+DEFINE_int32(
+    hybrid_sort_min_payload_bytes,
+    8,
+    "Minimum nominal byte width of the non-sort-key payload columns for the "
+    "hybrid sort to stay enabled (0 disables the gate)");
+
+DEFINE_bool(
+    bolt_benchmark_print_every_repeat,
+    false,
+    "Print the execution time and the plan with stats of every repeat, each "
+    "between '=== repeat k/N' and '=== end repeat k/N', not only of the last");
+
 DEFINE_bool(fusion_v2_enabled, false, "Enable fusion v2 (deferred-ref columns)");
 
 DEFINE_bool(
@@ -168,6 +186,31 @@ using namespace bytedance::bolt::exec;
 using namespace bytedance::bolt::exec::test;
 using namespace bytedance::bolt::dwio::common;
 namespace bytedance::bolt {
+
+namespace {
+// The timing and plan with stats of one repeat, as the benchmarks print them
+// for the last one.
+void printRepeat(
+    const core::PlanNode& plan,
+    exec::Task& task,
+    int32_t repeat) {
+  const auto stats = task.taskStats();
+  const auto endTime =
+      stats.endTimeMs > 0 ? stats.endTimeMs : stats.executionEndTimeMs;
+  std::cout << fmt::format(
+                   "=== repeat {}/{}\nExecution time: {}\n",
+                   repeat,
+                   FLAGS_bolt_benchmark_num_repeats,
+                   succinctMillis(endTime - stats.executionStartTimeMs))
+            << printPlanWithStats(
+                   plan, stats, FLAGS_bolt_benchmark_include_custom_stats, true)
+            << fmt::format(
+                   "\n=== end repeat {}/{}",
+                   repeat,
+                   FLAGS_bolt_benchmark_num_repeats)
+            << std::endl;
+}
+} // namespace
 
 //  static
 bool QueryBenchmarkBase::validateDataFormat(
@@ -319,6 +362,10 @@ std::unordered_map<std::string, std::string> QueryBenchmarkBase::queryConfigs()
   if (FLAGS_hybrid_sort_enabled) {
     configs[core::QueryConfig::kHybridSortEnabled] = "true";
   }
+  configs[core::QueryConfig::kHybridJoinMinPayloadBytes] =
+      std::to_string(FLAGS_hybrid_join_min_payload_bytes);
+  configs[core::QueryConfig::kHybridSortMinPayloadBytes] =
+      std::to_string(FLAGS_hybrid_sort_min_payload_bytes);
   if (FLAGS_fusion_v2_enabled) {
     configs[core::QueryConfig::kFusionV2Enabled] = "true";
   }
@@ -390,6 +437,9 @@ QueryBenchmarkBase::run(const TpchPlan& originalPlan) {
       };
       auto result = readCursor(params, addSplits);
       ensureTaskCompletion(result.first->task().get());
+      if (FLAGS_bolt_benchmark_print_every_repeat) {
+        printRepeat(*tpchPlan.plan, *result.first->task(), repeat + 1);
+      }
       if (++repeat >= FLAGS_bolt_benchmark_num_repeats) {
         return result;
       }
@@ -434,6 +484,9 @@ QueryBenchmarkBase::run(const TpcdsPlan& originalPlan) {
       };
       auto result = readCursor(params, addSplits);
       ensureTaskCompletion(result.first->task().get());
+      if (FLAGS_bolt_benchmark_print_every_repeat) {
+        printRepeat(*tpcdsPlan.plan, *result.first->task(), repeat + 1);
+      }
       if (++repeat >= FLAGS_bolt_benchmark_num_repeats) {
         return result;
       }

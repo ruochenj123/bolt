@@ -61,7 +61,8 @@ class SortBuffer : public SortBufferBase {
       const common::SpillConfig* spillConfig = nullptr,
       uint64_t spillMemoryThreshold = 0,
       OperatorCtx* operatorCtx = nullptr,
-      bool hybridSortEnabled = false);
+      bool hybridSortEnabled = false,
+      uint32_t hybridSortMinPayloadBytes = 8);
 
   ~SortBuffer() override;
 

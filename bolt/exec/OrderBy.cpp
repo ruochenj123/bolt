@@ -132,7 +132,8 @@ OrderBy::OrderBy(
         spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
         operatorCtx_->driverCtx()->queryConfig().orderBySpillMemoryThreshold(),
         operatorCtx_.get(),
-        hybridSortEnabled);
+        hybridSortEnabled,
+        driverCtx->queryConfig().hybridSortMinPayloadBytes());
   }
 
   this->setRuntimeMetric(

@@ -663,6 +663,19 @@ class QueryConfig {
 
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
+  /// Minimum total nominal byte width of the payload (non-key) columns a hash
+  /// build stores for the join to use the hybrid layout. The hybrid layout
+  /// replaces the payload a row would hold with an 8-byte row reference, so
+  /// the row only shrinks when the payload is wider than that.
+  static constexpr const char* kHybridJoinMinPayloadBytes =
+      "hybrid_join_min_payload_bytes";
+
+  /// Minimum total nominal byte width of the payload (non-sort-key) columns
+  /// for an OrderBy to use the hybrid layout; same rationale as
+  /// kHybridJoinMinPayloadBytes.
+  static constexpr const char* kHybridSortMinPayloadBytes =
+      "hybrid_sort_min_payload_bytes";
+
   /// Fusion v2 (deferred-ref columns; docs/fusion-v2-design.md).
   static constexpr const char* kFusionV2Enabled = "fusion_v2_enabled";
   static constexpr const char* kFusionAdaptiveEnabled =
@@ -1115,6 +1128,14 @@ class QueryConfig {
 
   bool hybridSortEnabled() const {
     return get<bool>(kHybridSortEnabled, false);
+  }
+
+  uint32_t hybridJoinMinPayloadBytes() const {
+    return get<uint32_t>(kHybridJoinMinPayloadBytes, 8);
+  }
+
+  uint32_t hybridSortMinPayloadBytes() const {
+    return get<uint32_t>(kHybridSortMinPayloadBytes, 8);
   }
 
   /// Returns whether fusion v2 (deferred-ref columns) is enabled.

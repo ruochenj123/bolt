@@ -159,6 +159,22 @@ HashBuild::HashBuild(
   hybridJoin_ = operatorCtx_->driverCtx()->queryConfig().hybridJoinEnabled() &&
       numDependents > 0 && !joinNode_->isLeftSemiFilterJoin() &&
       !joinNode_->isLeftSemiProjectJoin() && !joinNode_->isAntiJoin();
+  // Payload width gate: the build stores every non-key column, read by the
+  // probe or not, and the hybrid layout replaces them in the row with an
+  // 8-byte row reference; below the threshold the row layout is kept.
+  if (hybridJoin_) {
+    int64_t payloadBytes = 0;
+    for (auto i = 0; i < inputType->size(); ++i) {
+      if (keyChannelMap_.count(i) == 0) {
+        payloadBytes += hybridPayloadNominalWidth(inputType->childAt(i));
+      }
+    }
+    hybridJoin_ = payloadBytes >=
+        operatorCtx_->driverCtx()->queryConfig().hybridJoinMinPayloadBytes();
+    addRuntimeStat("hybridJoinPayloadBytes", RuntimeCounter(payloadBytes));
+    addRuntimeStat(
+        "hybridJoinGateEnabled", RuntimeCounter(hybridJoin_ ? 1 : 0));
+  }
   // A join whose rows an aggregation may reuse as groups (JoinAggReuse.h)
   // needs the hybrid row ids, whatever its payload width. If the aggregation
   // may run in rows mode (a single source, no decimal sums), each key row

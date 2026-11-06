@@ -53,7 +53,8 @@ SortBuffer::SortBuffer(
     const common::SpillConfig* spillConfig,
     uint64_t spillMemoryThreshold,
     OperatorCtx* operatorCtx,
-    bool hybridSortEnabled)
+    bool hybridSortEnabled,
+    uint32_t hybridSortMinPayloadBytes)
     : input_(input),
       sortCompareFlags_(sortCompareFlags),
       pool_(pool),
@@ -114,6 +115,15 @@ SortBuffer::SortBuffer(
     sortedSpillColumnNames.emplace_back(input->nameOf(i));
   }
   hybridSortEnabled_ = hybridSortEnabled_ && !nonSortedColumnTypes.empty();
+  // Payload width gate: the sort outputs every payload column, so all of them
+  // count against the 8-byte row reference that replaces them in the row.
+  if (hybridSortEnabled_) {
+    int64_t payloadBytes = 0;
+    for (const auto& type : nonSortedColumnTypes) {
+      payloadBytes += hybridPayloadNominalWidth(type);
+    }
+    hybridSortEnabled_ = payloadBytes >= hybridSortMinPayloadBytes;
+  }
   if (hybridSortEnabled_) {
     std::vector<TypePtr> rowIdType = {BIGINT()};
     data_ = std::make_unique<RowContainer>(
