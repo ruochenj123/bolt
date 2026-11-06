@@ -119,12 +119,6 @@ DEFINE_bool(
     "Per-batch trace of fused hops to stderr");
 
 
-DEFINE_bool(
-    hybrid_join_reorder_enabled,
-    true,
-    "Enable driver-aware reorder of rows by containerId during hybrid join "
-    "payload extraction (set =false to disable)");
-
 DEFINE_int32(
     max_output_batch_rows,
     10000,
@@ -334,8 +328,6 @@ std::unordered_map<std::string, std::string> QueryBenchmarkBase::queryConfigs()
   if (FLAGS_fusion_adaptive_trace) {
     configs[core::QueryConfig::kFusionAdaptiveTrace] = "true";
   }
-  configs[core::QueryConfig::kHybridJoinReorderEnabled] =
-      FLAGS_hybrid_join_reorder_enabled ? "true" : "false";
   if (FLAGS_join_agg_reuse_enabled) {
     configs[core::QueryConfig::kJoinAggReuseEnabled] = "true";
   }

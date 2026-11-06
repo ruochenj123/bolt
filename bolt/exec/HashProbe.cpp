@@ -80,18 +80,14 @@ RowTypePtr makeTableType(
 }
 
 // Copy values from 'rows' of 'table' according to 'projections' in
-// 'result'. Reuses 'result' children where possible.
-// 'allowSorting': If false, disables sorting even if the hybridData supports
-// it. This is needed when the caller also has probe-side columns that won't be
-// reordered - we must keep build-side and probe-side in the same order.
+// 'result', in the order of 'rows'. Reuses 'result' children where possible.
 void extractColumns(
     BaseHashTable* table,
     folly::Range<char**> rows,
     folly::Range<const IdentityProjection*> projections,
     memory::MemoryPool* pool,
     const std::vector<TypePtr>& resultTypes,
-    std::vector<VectorPtr>& resultVectors,
-    bool allowSorting = true) {
+    std::vector<VectorPtr>& resultVectors) {
   BOLT_CHECK_EQ(resultTypes.size(), resultVectors.size())
   auto hybridData = table->hybridData();
   if (hybridData != nullptr) {
@@ -100,25 +96,6 @@ void extractColumns(
     static thread_local std::vector<HybridRowId> outputRowIds;
     outputRowIds.resize(rows.size());
     hybridData->getRowIds(rows.data(), rows.size(), outputRowIds);
-
-    // For single container, extract directly without sorting overhead.
-    // For multiple containers, sort by containerId for better cache locality.
-    // Note: sorting is safe here because the output order of hash join results
-    // does not need to match any specific order (SQL doesn't guarantee order).
-    // Sorting can be disabled via query config for deterministic testing,
-    // or disabled by caller when probe-side columns must stay in sync.
-    const bool useSorting = allowSorting && hybridData->shouldUseSorting();
-
-    const char* const* extractRows = rows.data();
-    std::vector<HybridRowId>* extractRowIds = &outputRowIds;
-    HybridContainer::SortedRows sorted;
-
-    if (useSorting) {
-      sorted = hybridData->sortByContainerId(
-          rows.data(), folly::Range<const vector_size_t*>{}, outputRowIds);
-      extractRows = sorted.rows.data();
-      extractRowIds = &sorted.rowIds;
-    }
 
     for (auto projection : projections) {
       const auto resultChannel = projection.outputChannel;
@@ -132,11 +109,11 @@ void extractColumns(
       }
       child->resize(rows.size());
       hybridData->extractColumn(
-          extractRows,
-          extractRowIds->size(),
+          rows.data(),
+          outputRowIds.size(),
           projection.inputChannel,
           child,
-          *extractRowIds);
+          outputRowIds);
     }
   } else {
     for (auto projection : projections) {
@@ -979,15 +956,7 @@ void HashProbe::extractTableColumns(
     memory::MemoryPool* pool,
     const std::vector<TypePtr>& resultTypes,
     std::vector<VectorPtr>& resultVectors) {
-  // No sorting: callers fill other columns in the order of 'rows'.
-  extractColumns(
-      table,
-      rows,
-      projections,
-      pool,
-      resultTypes,
-      resultVectors,
-      /*allowSorting=*/false);
+  extractColumns(table, rows, projections, pool, resultTypes, resultVectors);
 }
 
 void HashProbe::derefRightDeep(char** rows, vector_size_t size) {
@@ -1012,8 +981,7 @@ void HashProbe::derefRightDeep(char** rows, vector_size_t size) {
       refProjection,
       pool(),
       std::vector<TypePtr>{BIGINT()},
-      refs,
-      /*allowSorting=*/false);
+      refs);
   DecodedVector decoded(*refs[0]);
   rightDeepRows_.resize(size);
   for (vector_size_t i = 0; i < size; ++i) {
@@ -1027,8 +995,7 @@ void HashProbe::derefRightDeep(char** rows, vector_size_t size) {
       rightDeepDeref_,
       pool(),
       outputType_->children(),
-      output_->children(),
-      /*allowSorting=*/false);
+      output_->children());
 }
 
 void HashProbe::maybeActivateJoinAggReuse() {
@@ -1196,8 +1163,7 @@ void HashProbe::fillOutputForJoinAggReuse(
         joinAggReuseExtract_,
         pool(),
         outputType_->children(),
-        children,
-        /*allowSorting=*/false);
+        children);
   }
   // Channels no projection fills: an output name that occurs twice gets
   // only its first occurrence mapped (as in the standard path, which leaves
@@ -1264,17 +1230,13 @@ void HashProbe::fillOutput(vector_size_t size) {
       // get dictionary raw value
       RowVectorPtr dictOutput = std::static_pointer_cast<RowVector>(
           BaseVector::create(outputType_, numDistinct, pool()));
-      // Disable sorting when there are probe columns to keep build and probe in
-      // sync.
-      const bool hasProbeColumns = !projectedInputColumns_.empty();
       extractColumns(
           table_.get(),
           folly::Range<char**>(distinctRows.data(), numDistinct),
           tableOutputProjections_,
           pool(),
           outputType_->children(),
-          dictOutput->children(),
-          /*allowSorting=*/!hasProbeColumns);
+          dictOutput->children());
 
       // calculate dictionary index
       BufferPtr indexBuffer;
@@ -1287,17 +1249,13 @@ void HashProbe::fillOutput(vector_size_t size) {
             size, indexBuffer, dictOutput->childAt(projection.outputChannel));
       }
     } else {
-      // Disable sorting when there are probe columns to keep build and probe in
-      // sync.
-      const bool hasProbeColumns = !projectedInputColumns_.empty();
       extractColumns(
           table_.get(),
           folly::Range<char**>(outputTableRows_.data(), size),
           tableOutputProjections_,
           pool(),
           outputType_->children(),
-          output_->children(),
-          /*allowSorting=*/!hasProbeColumns && rightDeepDeref_.empty());
+          output_->children());
     }
     derefRightDeep(outputTableRows_.data(), size);
   }
@@ -1423,8 +1381,7 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
         tableOutputProjections_,
         pool(),
         outputType_->children(),
-        output_->children(),
-        /*allowSorting=*/false);
+        output_->children());
   } else {
     for (column_index_t c = 0; c < fusionNullConstants_.size(); ++c) {
       if (fusionNullConstants_[c] != nullptr) {
@@ -1439,8 +1396,7 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
           fusionImmediate_,
           pool(),
           outputType_->children(),
-          output_->children(),
-          /*allowSorting=*/false);
+          output_->children());
     }
   }
 
@@ -1631,8 +1587,7 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
           remapped,
           pool(),
           outputType_->children(),
-          output_->children(),
-          /*allowSorting=*/false);
+          output_->children());
     }
   }
 }
@@ -1707,8 +1662,7 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
       tableOutputProjections_,
       pool(),
       outputType_->children(),
-      output_->children(),
-      /*allowSorting=*/rightDeepDeref_.empty());
+      output_->children());
   derefRightDeep(outputTableRows_.data(), numOut);
 
   if (isRightSemiProjectJoin(joinType_)) {
@@ -1974,17 +1928,13 @@ RowVectorPtr HashProbe::fillFilterInput(vector_size_t size) {
       outputRowMapping_,
       filterColumns);
 
-  // allowSorting must stay false here: probe-side filter columns above are
-  // wrapped in original row order, so permuting build columns by containerId
-  // would evaluate the filter on misaligned rows.
   extractColumns(
       table_.get(),
       folly::Range<char**>(outputTableRows_.data(), size),
       filterTableProjections_,
       pool(),
       filterInputType_->children(),
-      filterColumns,
-      /*allowSorting=*/false);
+      filterColumns);
 
   return std::make_shared<RowVector>(
       pool(), filterInputType_, nullptr, size, std::move(filterColumns));
@@ -2094,30 +2044,13 @@ void HashProbe::applyFilterOnTableRowsForNullAwareJoin(
     if (hybridData != nullptr) {
       outputRowIds.resize(numRows);
       hybridData->getRowIds(data, numRows, outputRowIds);
-
-      // For single container, extract directly without sorting.
-      // For multiple containers, sort by containerId for better cache locality.
-      // Never reorder here: the filter result is consumed in 'data' order,
-      // so the extracted build columns must stay aligned with it.
-      const bool useSorting = false;
-      const char* const* extractRows = data;
-      std::vector<HybridRowId>* extractRowIds = &outputRowIds;
-      HybridContainer::SortedRows sorted;
-
-      if (useSorting) {
-        sorted = hybridData->sortByContainerId(
-            data, folly::Range<const vector_size_t*>{}, outputRowIds);
-        extractRows = sorted.rows.data();
-        extractRowIds = &sorted.rowIds;
-      }
-
       for (auto& projection : filterTableProjections_) {
         hybridData->extractColumn(
-            extractRows,
-            extractRowIds->size(),
+            data,
+            numRows,
             projection.inputChannel,
             filterTableInput_->childAt(projection.outputChannel),
-            *extractRowIds);
+            outputRowIds);
       }
     } else {
       for (auto& projection : filterTableProjections_) {

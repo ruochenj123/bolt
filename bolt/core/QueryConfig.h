@@ -661,12 +661,6 @@ class QueryConfig {
   static constexpr const char* kParquetRepDefStreamingWindowSize =
       "parquet_repdef_streaming_window_size";
 
-  /// If true, reorder rows by containerId during hybrid join extraction for
-  /// better cache locality. Can be disabled for testing to get deterministic
-  /// output order.
-  static constexpr const char* kHybridJoinReorderEnabled =
-      "hybrid_join_reorder_enabled";
-
   static constexpr const char* kHybridSortEnabled = "hybrid_sort_enabled";
 
   /// Fusion v2 (deferred-ref columns; docs/fusion-v2-design.md).
@@ -1117,13 +1111,6 @@ class QueryConfig {
 
   bool hybridJoinEnabled() const {
     return get<bool>(kHybridJoinEnabled, false);
-  }
-
-  /// Returns whether to reorder rows by containerId during hybrid join
-  /// extraction. Default true for better cache locality. Can be disabled
-  /// for deterministic output order in tests.
-  bool hybridJoinReorderEnabled() const {
-    return get<bool>(kHybridJoinReorderEnabled, true);
   }
 
   bool hybridSortEnabled() const {

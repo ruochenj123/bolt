@@ -2091,22 +2091,6 @@ class HybridContainer {
     return allContainers_;
   }
 
-  // Controls whether to reorder rows by containerId during extraction.
-  // Can be disabled for testing to get deterministic output order.
-  void setReorderEnabled(bool enabled) {
-    reorderEnabled_ = enabled;
-  }
-
-  bool isReorderEnabled() const {
-    return reorderEnabled_;
-  }
-
-  // Returns whether sorting should be used for extraction: reorder is enabled
-  // and there are multiple containers.
-  bool shouldUseSorting() const {
-    return reorderEnabled_ && !isSingleContainer();
-  }
-
   /// Get hybridRowId from a row pointer
   uint64_t getHybridRowId(char* row) const {
     return keys_->valueAt<uint64_t>(row, rowIdColumnOffset_);
@@ -2129,54 +2113,6 @@ class HybridContainer {
   /// Get payload types
   const std::vector<TypePtr>& payloadTypes() const {
     return payloadTypes_;
-  }
-
-  // Reorder rows and rowIds by containerId to improve locality for extraction.
-  // Returns reordered rows, rowIds, and optionally rowNumbers when provided.
-  struct SortedRows {
-    std::vector<const char*> rows;
-    std::vector<vector_size_t> rowNumbers;
-    std::vector<HybridRowId> rowIds;
-  };
-
-  SortedRows sortByContainerId(
-      const char* const* rows,
-      folly::Range<const vector_size_t*> rowNumbers,
-      const std::vector<HybridRowId>& outputRowIds) {
-    const int size = outputRowIds.size();
-    SortedRows out;
-    out.rows.resize(size);
-    out.rowIds.resize(size);
-    if (!rowNumbers.empty()) {
-      out.rowNumbers.resize(size);
-    }
-
-    // Build permutation by counting sort on containerId.
-    std::vector<int32_t> count(maxContainerId_ + 1, 0);
-    for (const auto& item : outputRowIds) {
-      ++count[item.containerId_];
-    }
-    for (int i = 1; i <= maxContainerId_; ++i) {
-      count[i] += count[i - 1];
-    }
-    std::vector<int32_t> perm(size);
-    for (int i = size - 1; i >= 0; --i) {
-      auto cid = outputRowIds[i].containerId_;
-      auto pos = --count[cid];
-      perm[pos] = i;
-    }
-
-    // Apply permutation.
-    for (int outIdx = 0; outIdx < size; ++outIdx) {
-      const int srcIdx = perm[outIdx];
-      out.rowIds[outIdx] = outputRowIds[srcIdx];
-      if (!out.rowNumbers.empty()) {
-        out.rowNumbers[outIdx] = rowNumbers[srcIdx];
-      }
-      out.rows[outIdx] = rows[srcIdx];
-    }
-
-    return out;
   }
 
   // Coalesce all payload batches into a single batch to improve locality.
@@ -3209,11 +3145,6 @@ class HybridContainer {
   uint8_t id_{0};
   std::unordered_map<uint8_t, HybridContainer*> allContainers_;
   uint8_t maxContainerId_{0};
-
-  // Controls whether to reorder rows by containerId during extraction.
-  // Default true for better cache locality. Can be disabled for testing.
-  bool reorderEnabled_{true};
-
 };
 
 template <>

@@ -661,9 +661,6 @@ class HashJoinBuilder {
     config(core::QueryConfig::kJitLevel, "-1");
     config(
         core::QueryConfig::kHybridJoinEnabled, hybridJoin_ ? "true" : "false");
-    // Disable reordering for hybrid join to get deterministic output order in
-    // tests.
-    config(core::QueryConfig::kHybridJoinReorderEnabled, "false");
 
     if (!configs_.empty()) {
       auto configCopy = configs_;

@@ -340,10 +340,6 @@ void HashBuild::setupTable() {
     std::unordered_map<uint8_t, HybridContainer*> selfContainer;
     selfContainer[static_cast<uint8_t>(driverId_)] = table_->hybridData();
     table_->hybridData()->setAllContainers(selfContainer);
-    // Set reorder flag from query config - can be disabled for deterministic
-    // testing.
-    table_->hybridData()->setReorderEnabled(
-        queryConfig.hybridJoinReorderEnabled());
   }
 }
 
