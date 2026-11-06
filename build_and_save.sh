@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=boltbs --nodes=1 --ntasks=1 --cpus-per-task=96 --time=01:00:00 --partition=debug --account=PAS2271
+#SBATCH --job-name=boltbs --nodes=1 --ntasks=1 --cpus-per-task=96 --time=01:00:00 --partition=debug --account=PAS2526
 #SBATCH --output=buildlogs/%x_%j.log --error=buildlogs/%x_%j.err
 # usage: BRANCH=<git ref> TAG=<name> sbatch build_and_save.sh : checkout, benchmarks-build, save + relocate binaries.
 set -o pipefail; cd /users/PAS2065/ruochenj/gpu-db-research/bolt || exit 1

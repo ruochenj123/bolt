@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --time=01:00:00
 #SBATCH --partition=debug
-#SBATCH --account=pas2271
+#SBATCH --account=PAS2526
 #SBATCH --output=buildlogs/%x_%j.log
 #SBATCH --error=buildlogs/%x_%j.err
 # Direct compile of the verified configure (benchmarks ON, link conflicts fixed).
