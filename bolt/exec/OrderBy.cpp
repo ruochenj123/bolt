@@ -30,6 +30,8 @@
 
 #include "bolt/exec/OrderBy.h"
 
+#include "bolt/exec/HashProbe.h"
+#include "bolt/exec/JoinAggReuse.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/SortBuffer.h"
 #include "bolt/exec/Task.h"
@@ -86,13 +88,43 @@ OrderBy::OrderBy(
   maxOutputRows_ = outputBatchRows(std::nullopt);
   BOLT_CHECK(pool()->trackUsage());
 
+  // Join-sort reuse: the sort buffer stores a reference to the join's build
+  // row in place of the deferred build columns.
+  sortInputType_ = outputType_;
+  if (const auto& plan = driverCtx->joinAggReusePlan; plan != nullptr) {
+    deferral_ = plan->forOrderBy(planNodeId());
+  }
+  if (deferral_ != nullptr) {
+    const auto& deferred = *deferral_->rightDeep;
+    std::unordered_map<std::string, column_index_t> tableChannels;
+    for (size_t i = 0; i < deferred.deferredColumns.size(); ++i) {
+      tableChannels[deferred.deferredColumns[i]] =
+          deferred.sourceTableChannels[i];
+    }
+    std::vector<std::string> names;
+    std::vector<TypePtr> types;
+    for (column_index_t i = 0; i < outputType_->size(); ++i) {
+      auto it = tableChannels.find(outputType_->nameOf(i));
+      if (it != tableChannels.end()) {
+        derefProjections_.emplace_back(it->second, i);
+        continue;
+      }
+      keptChannels_.push_back(i);
+      names.push_back(outputType_->nameOf(i));
+      types.push_back(outputType_->childAt(i));
+    }
+    names.push_back(deferred.refColumn);
+    types.push_back(BIGINT());
+    sortInputType_ = ROW(std::move(names), std::move(types));
+  }
+
   std::vector<column_index_t> sortColumnIndices;
   std::vector<CompareFlags> sortCompareFlags;
   sortColumnIndices.reserve(orderByNode->sortingKeys().size());
   sortCompareFlags.reserve(orderByNode->sortingKeys().size());
   for (int i = 0; i < orderByNode->sortingKeys().size(); ++i) {
     const auto channel =
-        exprToChannel(orderByNode->sortingKeys()[i].get(), outputType_);
+        exprToChannel(orderByNode->sortingKeys()[i].get(), sortInputType_);
     BOLT_CHECK(
         channel != kConstantChannel,
         "OrderBy doesn't allow constant sorting keys");
@@ -105,7 +137,7 @@ OrderBy::OrderBy(
   if (useRadixSort &&
       queryConfig.orderByRadixSortFallbackForFloatingPointKeysEnabled()) {
     for (const auto channel : sortColumnIndices) {
-      if (containsFloatingPointType(*outputType_->childAt(channel))) {
+      if (containsFloatingPointType(*sortInputType_->childAt(channel))) {
         useRadixSort = false;
         break;
       }
@@ -113,7 +145,7 @@ OrderBy::OrderBy(
   }
   if (useRadixSort) {
     sortBuffer_ = std::make_unique<radixsort::RadixSortBuffer>(
-        outputType_,
+        sortInputType_,
         sortColumnIndices,
         sortCompareFlags,
         pool(),
@@ -124,7 +156,7 @@ OrderBy::OrderBy(
   } else {
     auto hybridSortEnabled = driverCtx->queryConfig().hybridSortEnabled();
     sortBuffer_ = std::make_unique<SortBuffer>(
-        outputType_,
+        sortInputType_,
         sortColumnIndices,
         sortCompareFlags,
         pool(),
@@ -156,7 +188,70 @@ void OrderBy::addInput(RowVectorPtr input) {
     ReclaimableSectionGuard guard(this);
     input->loadedVector();
   }
-  sortBuffer_->addInput(input);
+  sortBuffer_->addInput(
+      deferral_ != nullptr ? replaceDeferredColumns(input) : input);
+}
+
+RowVectorPtr OrderBy::replaceDeferredColumns(const RowVectorPtr& input) {
+  if (deferralSource_ == nullptr) {
+    const auto& sourceId = deferral_->chainJoinIds.back();
+    for (auto* op : operatorCtx_->driver()->operators()) {
+      auto* probe = dynamic_cast<HashProbe*>(op);
+      if (probe != nullptr && probe->planNodeId() == sourceId) {
+        deferralSource_ = probe;
+        break;
+      }
+    }
+    BOLT_CHECK_NOT_NULL(deferralSource_);
+    deferralTable_ = deferralSource_->joinAggReuseTable();
+  }
+  BOLT_CHECK(
+      deferralSource_->joinAggReuseActive(),
+      "join-sort reuse: the join below did not publish its rows");
+  auto& channels = deferralSource_->joinAggReuseChannels();
+  BOLT_CHECK_EQ(channels.size(), 1);
+  BOLT_CHECK_EQ(channels[0].size(), input->size());
+  auto refs = BaseVector::create<FlatVector<int64_t>>(
+      BIGINT(), input->size(), pool());
+  auto* rawRefs = refs->mutableRawValues();
+  for (vector_size_t i = 0; i < input->size(); ++i) {
+    rawRefs[i] = reinterpret_cast<int64_t>(channels[0][i]);
+  }
+  channels.clear();
+  std::vector<VectorPtr> children;
+  children.reserve(keptChannels_.size() + 1);
+  for (auto channel : keptChannels_) {
+    children.push_back(input->childAt(channel));
+  }
+  children.push_back(std::move(refs));
+  return std::make_shared<RowVector>(
+      pool(),
+      sortInputType_,
+      input->nulls(),
+      input->size(),
+      std::move(children));
+}
+
+RowVectorPtr OrderBy::restoreDeferredColumns(const RowVectorPtr& sorted) {
+  const auto size = sorted->size();
+  DecodedVector refs(*sorted->childAt(keptChannels_.size()));
+  deferralRows_.resize(size);
+  for (vector_size_t i = 0; i < size; ++i) {
+    deferralRows_[i] = reinterpret_cast<char*>(refs.valueAt<int64_t>(i));
+  }
+  std::vector<VectorPtr> children(outputType_->size());
+  for (size_t i = 0; i < keptChannels_.size(); ++i) {
+    children[keptChannels_[i]] = sorted->childAt(i);
+  }
+  HashProbe::extractTableColumns(
+      deferralTable_.get(),
+      folly::Range<char**>(deferralRows_.data(), size),
+      derefProjections_,
+      pool(),
+      outputType_->children(),
+      children);
+  return std::make_shared<RowVector>(
+      pool(), outputType_, nullptr, size, std::move(children));
 }
 
 void OrderBy::reclaim(
@@ -195,11 +290,15 @@ RowVectorPtr OrderBy::getOutput() {
   auto guard = folly::makeGuard([&]() {
     if (finished_) {
       sortBuffer_.reset();
+      deferralTable_.reset();
     }
   });
 
   RowVectorPtr output = sortBuffer_->getOutput(maxOutputRows_);
   finished_ = (output == nullptr);
+  if (!finished_ && deferral_ != nullptr) {
+    output = restoreDeferredColumns(output);
+  }
   if (finished_) {
     recordSpillReadStats();
     recordSortStats();
@@ -218,6 +317,7 @@ RowVectorPtr OrderBy::getOutput() {
 void OrderBy::close() {
   Operator::close();
   sortBuffer_.reset();
+  deferralTable_.reset();
 }
 
 void OrderBy::recordSpillStats() {

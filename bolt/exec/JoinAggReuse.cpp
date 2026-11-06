@@ -657,7 +657,8 @@ void JoinAggReusePlan::add(JoinAggReuseSpec spec) {
   specs_.push_back(std::make_unique<JoinAggReuseSpec>(std::move(spec)));
   const auto* added = specs_.back().get();
   if (added->rightDeep.has_value()) {
-    byBuild_[added->rightDeep->buildJoinNodeId] = added;
+    auto& byConsumer = added->rightDeep->toOrderBy ? byOrderBy_ : byBuild_;
+    byConsumer[added->rightDeep->buildJoinNodeId] = added;
   } else {
     byAggregation_[added->aggregationNodeId] = added;
   }
@@ -732,28 +733,22 @@ RowTypePtr joinTableType(const core::HashJoinNode& join) {
   }
   return ROW(std::move(names), std::move(types));
 }
-} // namespace
 
-std::optional<JoinAggReuseSpec> analyzeRightDeep(
+// The columns of 'consumerInput' that the consumer ('consumerId', an OrderBy if
+// 'toOrderBy', else a join's build) can carry as a reference to the build row
+// of the nearest join below it in the pipeline (J1, through projections):
+// J1's build columns passed through unchanged, except 'excluded'.
+std::optional<JoinAggReuseSpec> deferBuildColumns(
     const std::vector<core::PlanNodePtr>& nodes,
-    const core::PlanNodePtr& consumerNode,
-    const JoinAggReusePlan& plan) {
-  // A build pipeline: its nodes are the build side of the join that consumes
-  // it (the join's HashBuild ends the pipeline).
-  auto buildJoin =
-      std::dynamic_pointer_cast<const core::HashJoinNode>(consumerNode);
-  if (nodes.empty() || buildJoin == nullptr ||
-      buildJoin->sources().size() != 2 ||
-      buildJoin->sources()[1].get() != nodes.back().get() ||
-      plan.forJoin(buildJoin->id()).source >= 0 ||
-      !(buildJoin->isInnerJoin() || buildJoin->isLeftJoin() ||
-        buildJoin->isRightJoin() || buildJoin->isFullJoin())) {
-    return std::nullopt;
-  }
-  // Projections down to the nearest join (J1) below the build input.
+    const core::PlanNodePtr& consumerInput,
+    const std::unordered_set<std::string>& excluded,
+    const JoinAggReusePlan& plan,
+    const core::PlanNodeId& consumerId,
+    bool toOrderBy) {
+  // Projections down to the nearest join (J1) below the consumer.
   std::vector<core::PlanNodePtr> chain;
   std::shared_ptr<const core::HashJoinNode> sourceJoin;
-  for (auto node = buildJoin->sources()[1];;) {
+  for (auto node = consumerInput;;) {
     if (std::dynamic_pointer_cast<const core::ProjectNode>(node)) {
       chain.push_back(node);
       node = node->sources()[0];
@@ -774,23 +769,17 @@ std::optional<JoinAggReuseSpec> analyzeRightDeep(
   chain.push_back(sourceJoin);
   const size_t j = chain.size() - 1;
 
-  // J2 build columns that are J1 build columns passed through unchanged, and
-  // neither J2 keys nor read by J2's filter.
-  std::unordered_set<std::string> excluded;
-  for (const auto& key : buildJoin->rightKeys()) {
-    excluded.insert(key->name());
-  }
-  if (buildJoin->filter() != nullptr) {
-    collectInputColumns(buildJoin->filter(), excluded);
-  }
+  // Consumer input columns that are J1 build columns passed through unchanged
+  // and that the consumer does not need as values ('excluded').
   const auto sourceTable = joinTableType(*sourceJoin);
-  const auto& buildInput = buildJoin->sources()[1]->outputType();
+  const auto& consumerType = consumerInput->outputType();
   JoinAggReuseSpec spec;
   JoinAggReuseSpec::RightDeep rightDeep;
-  rightDeep.buildJoinNodeId = buildJoin->id();
+  rightDeep.buildJoinNodeId = consumerId;
+  rightDeep.toOrderBy = toOrderBy;
   rightDeep.refColumn = "$jar_ref$" + sourceJoin->id();
   std::unordered_set<std::string> sourceColumns;
-  for (const auto& name : buildInput->names()) {
+  for (const auto& name : consumerType->names()) {
     if (excluded.count(name) > 0) {
       continue;
     }
@@ -808,7 +797,7 @@ std::optional<JoinAggReuseSpec> analyzeRightDeep(
     return std::nullopt;
   }
 
-  // J1 need not extract a column that only reaches J2's deferred columns.
+  // J1 need not extract a column that only reaches the deferred columns.
   JoinAggReuseSource source;
   source.joinNodeId = sourceJoin->id();
   const std::unordered_set<std::string> deferred(
@@ -844,12 +833,74 @@ std::optional<JoinAggReuseSpec> analyzeRightDeep(
   spec.chainJoinIds.push_back(sourceJoin->id());
   spec.sources.push_back(std::move(source));
   spec.rightDeep = std::move(rightDeep);
-  LOG(INFO) << "[join-agg-reuse] build of join " << buildJoin->id()
+  LOG(INFO) << "[join-agg-reuse] "
+            << (toOrderBy ? "OrderBy " : "build of join ") << consumerId
             << " stores references to rows of join " << sourceJoin->id()
             << " for " << spec.rightDeep->deferredColumns.size()
             << " columns (" << spec.sources[0].nullableBuildColumns.size()
             << " not extracted)";
   return spec;
+}
+} // namespace
+
+std::optional<JoinAggReuseSpec> analyzeRightDeep(
+    const std::vector<core::PlanNodePtr>& nodes,
+    const core::PlanNodePtr& consumerNode,
+    const JoinAggReusePlan& plan) {
+  // A build pipeline: its nodes are the build side of the join that consumes
+  // it (the join's HashBuild ends the pipeline).
+  auto buildJoin =
+      std::dynamic_pointer_cast<const core::HashJoinNode>(consumerNode);
+  if (nodes.empty() || buildJoin == nullptr ||
+      buildJoin->sources().size() != 2 ||
+      buildJoin->sources()[1].get() != nodes.back().get() ||
+      plan.forJoin(buildJoin->id()).source >= 0 ||
+      !(buildJoin->isInnerJoin() || buildJoin->isLeftJoin() ||
+        buildJoin->isRightJoin() || buildJoin->isFullJoin())) {
+    return std::nullopt;
+  }
+  // J2 build columns that are neither J2 keys nor read by J2's filter.
+  std::unordered_set<std::string> excluded;
+  for (const auto& key : buildJoin->rightKeys()) {
+    excluded.insert(key->name());
+  }
+  if (buildJoin->filter() != nullptr) {
+    collectInputColumns(buildJoin->filter(), excluded);
+  }
+  return deferBuildColumns(
+      nodes,
+      buildJoin->sources()[1],
+      excluded,
+      plan,
+      buildJoin->id(),
+      /*toOrderBy=*/false);
+}
+
+std::vector<JoinAggReuseSpec> analyzeJoinSort(
+    const std::vector<core::PlanNodePtr>& nodes,
+    const JoinAggReusePlan& plan) {
+  std::vector<JoinAggReuseSpec> specs;
+  for (const auto& node : nodes) {
+    auto orderBy = std::dynamic_pointer_cast<const core::OrderByNode>(node);
+    if (orderBy == nullptr) {
+      continue;
+    }
+    // The sort keys are compared, so they stay values.
+    std::unordered_set<std::string> excluded;
+    for (const auto& key : orderBy->sortingKeys()) {
+      excluded.insert(key->name());
+    }
+    if (auto spec = deferBuildColumns(
+            nodes,
+            orderBy->sources()[0],
+            excluded,
+            plan,
+            orderBy->id(),
+            /*toOrderBy=*/true)) {
+      specs.push_back(std::move(*spec));
+    }
+  }
+  return specs;
 }
 
 namespace {

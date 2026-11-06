@@ -330,6 +330,8 @@ TpchPlan TpchQueryBuilder::getQueryPlan(int queryId) const {
       return getQ37Plan();
     case 38:
       return getQ38Plan();
+    case 39:
+      return getQ39Plan();
     case 40:
       return getQ40Plan();
     default:
@@ -4494,6 +4496,74 @@ TpchPlan TpchQueryBuilder::getQ38Plan() const {
   context.dataFiles[rScanId] = getTableFilePaths(kTableR);
   context.dataFiles[sScanId] = getTableFilePaths(kTableS);
   context.dataFiles[tScanId] = getTableFilePaths(kTableT);
+  context.dataFileFormat = format_;
+  return context;
+}
+
+// Q39: join-sort S x R -> ORDER BY s_orderkey on the synth_join tables. The
+// join (S probe, R build, 4 keys) emits s_orderkey and the first
+// --synth_payload_cols R payloads; each driver sorts its rows by s_orderkey
+// and a local merge combines them. --s_selectivity_pct thins S (the probe).
+TpchPlan TpchQueryBuilder::getQ39Plan() const {
+  static const std::vector<std::string> kRPay = {
+      "l_orderkey",   "l_partkey",      "l_linenumber",  "l_quantity",
+      "l_extendedprice", "l_discount",  "l_tax",         "l_comment",
+      "l_shipdate",   "l_commitdate",   "l_shipinstruct", "l_shipmode"};
+  const int numPayloads = std::clamp(FLAGS_synth_payload_cols, 1, 12);
+  const std::vector<std::string> rPay(
+      kRPay.begin(), kRPay.begin() + numPayloads);
+  const std::vector<std::string> rKeys = {
+      "row_id", "l_suppkey", "l_returnflag", "l_linestatus"};
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  core::PlanNodeId rScanId, sScanId;
+
+  std::vector<std::string> rCols = rKeys;
+  rCols.insert(rCols.end(), rPay.begin(), rPay.end());
+  auto r = PlanBuilder(planNodeIdGenerator, pool_.get())
+               .filtersAsNode(filtersAsNode_)
+               .tableScan(kTableR, getRowType(kTableR, rCols),
+                          getFileColumnNames(kTableR))
+               .captureScanNodeId(rScanId)
+               .planNode();
+
+  PlanBuilder sb(planNodeIdGenerator, pool_.get());
+  sb.filtersAsNode(filtersAsNode_)
+      .tableScan(
+          kTableS,
+          getRowType(
+              kTableS,
+              {"row_id", "l_suppkey", "l_returnflag", "l_linestatus",
+               "s_orderkey"}),
+          getFileColumnNames(kTableS))
+      .captureScanNodeId(sScanId);
+  if (FLAGS_s_selectivity_pct < 100) {
+    sb.filter(
+        fmt::format("(s_orderkey % 10) < {}", FLAGS_s_selectivity_pct / 10));
+  }
+  std::vector<std::string> out = {"s_orderkey"};
+  out.insert(out.end(), rPay.begin(), rPay.end());
+  auto plan = sb.project({"row_id AS s_row_id",
+                          "l_suppkey AS s_suppkey",
+                          "l_returnflag AS s_returnflag",
+                          "l_linestatus AS s_linestatus",
+                          "s_orderkey"})
+                  .hashJoin(
+                      {"s_row_id", "s_suppkey", "s_returnflag", "s_linestatus"},
+                      rKeys,
+                      r,
+                      "",
+                      out)
+                  .orderBy({"s_orderkey"}, true)
+                  .localMerge({"s_orderkey"})
+                  .planNode();
+
+  TpchPlan context;
+  context.planName = fmt::format(
+      "q39_p{}_s{}", numPayloads, FLAGS_s_selectivity_pct);
+  context.plan = std::move(plan);
+  context.dataFiles[rScanId] = getTableFilePaths(kTableR);
+  context.dataFiles[sScanId] = getTableFilePaths(kTableS);
   context.dataFileFormat = format_;
   return context;
 }

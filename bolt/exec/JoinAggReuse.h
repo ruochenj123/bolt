@@ -118,15 +118,20 @@ struct JoinAggReuseSpec {
   /// (instead of an aggregation), which stores a reference to the build row
   /// of the source join (J1) in place of J1's build columns it only passes on;
   /// the join's probe reads those columns through the reference. The source
-  /// does not extract them (nullableBuildColumns).
+  /// does not extract them (nullableBuildColumns). Join-sort reuse is the same
+  /// with an OrderBy above instead of a join's build: the sort carries the
+  /// reference in place of those columns and reads them through it when it
+  /// produces its output.
   struct RightDeep {
-    /// The join (J2) whose build input is the chain's output.
+    /// The consumer whose input is the chain's output: the join (J2) whose
+    /// build input it is, or the OrderBy if 'toOrderBy'.
     core::PlanNodeId buildJoinNodeId;
-    /// J2 build input columns stored as the reference, and for each the
+    bool toOrderBy{false};
+    /// Consumer input columns stored as the reference, and for each the
     /// channel of J1's table it comes from.
     std::vector<std::string> deferredColumns;
     std::vector<column_index_t> sourceTableChannels;
-    /// Name of the reference column (BIGINT) appended to J2's table.
+    /// Name of the reference column (BIGINT) that replaces them.
     std::string refColumn;
   };
   std::optional<RightDeep> rightDeep;
@@ -176,6 +181,12 @@ class JoinAggReusePlan {
     return it == byBuild_.end() ? nullptr : it->second;
   }
 
+  /// The join-sort spec whose rows OrderBy 'id' carries, if any.
+  const JoinAggReuseSpec* forOrderBy(const core::PlanNodeId& id) const {
+    auto it = byOrderBy_.find(id);
+    return it == byOrderBy_.end() ? nullptr : it->second;
+  }
+
   /// A DISTINCT aggregation made redundant by the right-semi join above it:
   /// the join marks each build row once however often its key comes, so the
   /// aggregation passes its input through (projected to its keys).
@@ -202,6 +213,7 @@ class JoinAggReusePlan {
       byAggregation_;
   std::unordered_map<core::PlanNodeId, Member> byJoin_;
   std::unordered_map<core::PlanNodeId, const JoinAggReuseSpec*> byBuild_;
+  std::unordered_map<core::PlanNodeId, const JoinAggReuseSpec*> byOrderBy_;
 };
 
 /// Finds the join -> aggregation shapes in the ordered nodes of one pipeline.
@@ -214,6 +226,14 @@ std::vector<JoinAggReuseSpec> analyzeJoinAggReuse(
 std::optional<JoinAggReuseSpec> analyzeRightDeep(
     const std::vector<core::PlanNodePtr>& pipelineNodes,
     const core::PlanNodePtr& consumerNode,
+    const JoinAggReusePlan& plan);
+
+/// Join-sort reuse in one pipeline: OrderBys whose input comes from a join in
+/// the pipeline (through projections) carry a reference to its build rows in
+/// place of the build columns they only pass on (see
+/// JoinAggReuseSpec::RightDeep). Joins in 'plan' are left alone.
+std::vector<JoinAggReuseSpec> analyzeJoinSort(
+    const std::vector<core::PlanNodePtr>& pipelineNodes,
     const JoinAggReusePlan& plan);
 
 /// The DISTINCT aggregations (partial and final, on exactly the probe keys)

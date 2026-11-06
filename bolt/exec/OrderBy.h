@@ -38,6 +38,10 @@
 
 namespace bytedance::bolt::exec {
 
+class BaseHashTable;
+class HashProbe;
+struct JoinAggReuseSpec;
+
 /// OrderBy operator implementation: OrderBy stores all its inputs in a
 /// RowContainer as the inputs are added. Until all inputs are available,
 /// it blocks the pipeline. Once all inputs are available, it sorts pointers
@@ -97,9 +101,30 @@ class OrderBy : public Operator {
   void recordSpillReadStats();
   void recordSortStats();
 
+  // Join-sort reuse (JoinAggReuse.h): replaces the deferred build columns of
+  // 'input' by the references to the build rows of the join below, which that
+  // join published for these rows.
+  RowVectorPtr replaceDeferredColumns(const RowVectorPtr& input);
+
+  // Rebuilds an output batch of 'outputType_' from a sorted batch of
+  // 'sortInputType_', reading the deferred columns from the join's table.
+  RowVectorPtr restoreDeferredColumns(const RowVectorPtr& sorted);
+
   std::unique_ptr<SortBufferBase> sortBuffer_;
   common::SpillStats recordedSpillStats_;
   bool finished_ = false;
   vector_size_t maxOutputRows_;
+
+  // Join-sort reuse: the spec; the type the sort buffer stores (outputType_
+  // without the deferred columns, plus the reference); for each of its
+  // channels but the last, the output channel; and the deferred columns as
+  // join table channel -> output channel.
+  const JoinAggReuseSpec* deferral_{nullptr};
+  RowTypePtr sortInputType_;
+  std::vector<column_index_t> keptChannels_;
+  std::vector<IdentityProjection> derefProjections_;
+  HashProbe* deferralSource_{nullptr};
+  std::shared_ptr<BaseHashTable> deferralTable_;
+  std::vector<char*> deferralRows_;
 };
 } // namespace bytedance::bolt::exec

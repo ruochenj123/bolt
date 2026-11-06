@@ -146,6 +146,7 @@ class TpchQueryBuilder {
   TpchPlan getQ35Plan() const;  // U JOIN (T JOIN (S JOIN R)) (3-way N-way without Sort)
   TpchPlan getQ37Plan() const;  // Left-deep PK-FK chain F x R x T (x U) for fusion v2
   TpchPlan getQ38Plan() const;  // Right-deep T x (S x R): R payloads through the S x R build
+  TpchPlan getQ39Plan() const;  // Join-sort S x R -> ORDER BY: R payloads through the sort
   TpchPlan getQ36Plan() const;  // Q35 + Sort (3-way with Sort)
   TpchPlan getQ40Plan() const;  // Configurable sort benchmark on lineitem (4 sort keys, 16 cols)
 

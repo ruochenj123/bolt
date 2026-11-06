@@ -506,8 +506,9 @@ void LocalPlanner::plan(
     for (const auto& id : findRedundantDistincts(planFragment.planNode)) {
       plan->addPassThrough(id);
     }
-    // Right-deep reuse, one level: a join whose own build stores references
-    // is not the source of another (its table layout differs).
+    // Right-deep and join-sort reuse, one level: a join whose own build
+    // stores references is not the source of another (its table layout
+    // differs).
     std::vector<JoinAggReuseSpec> rightDeep;
     std::unordered_set<core::PlanNodeId> consumers;
     for (auto& factory : *driverFactories) {
@@ -515,6 +516,9 @@ void LocalPlanner::plan(
               factory->planNodes, factory->consumerNode, *plan)) {
         consumers.insert(spec->rightDeep->buildJoinNodeId);
         rightDeep.push_back(std::move(*spec));
+      }
+      for (auto& spec : analyzeJoinSort(factory->planNodes, *plan)) {
+        rightDeep.push_back(std::move(spec));
       }
     }
     for (auto& spec : rightDeep) {
