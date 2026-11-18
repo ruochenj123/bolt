@@ -32,10 +32,10 @@
 
 #include <set>
 #include "bolt/exec/HashBuild.h"
-#include "bolt/exec/JoinAggReuse.h"
-#include "bolt/exec/JoinFusionPlanner.h"
 #include "bolt/exec/HashPartitionFunction.h"
 #include "bolt/exec/HashTable.h"
+#include "bolt/exec/JoinAggReuse.h"
+#include "bolt/exec/JoinFusionPlanner.h"
 #include "bolt/exec/Operator.h"
 #include "bolt/exec/ProbeOperatorState.h"
 #include "bolt/exec/VectorHasher.h"
@@ -117,7 +117,8 @@ class HashProbe : public Operator {
     return joinAggReuseKeyProjections_;
   }
 
-  /// A source in codes mode: the group codes of its build rows.
+  /// A source in codes mode: the group codes of its build rows; null if its
+  /// build rows are the groups.
   const std::shared_ptr<JoinAggReuseCodes>& joinAggReuseCodes() const {
     return joinAggReuseCodes_;
   }
@@ -490,7 +491,6 @@ class HashProbe : public Operator {
   }
 
  private:
-
   // Indicates whether there was no input. Used for right semi join project.
   bool noInput_{true};
 
@@ -834,7 +834,6 @@ class HashProbe : public Operator {
   RowTypePtr matchFlagType_{nullptr};
   RowVectorPtr accumulatedMatchFlag_{nullptr};
   RowVectorPtr tmpMatchFlagForFilter_{nullptr};
-
 };
 
 inline std::ostream& operator<<(std::ostream& os, ProbeOperatorState state) {

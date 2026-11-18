@@ -29,8 +29,6 @@
  */
 
 #include "bolt/exec/HashBuild.h"
-#include "bolt/exec/HashProbe.h"
-#include "bolt/exec/JoinAggReuse.h"
 #include <boost/sort/pdqsort/pdqsort.hpp>
 #include <cstdint>
 #include <optional>
@@ -42,7 +40,10 @@
 #include "bolt/common/base/SpillConfig.h"
 #include "bolt/common/base/StatsReporter.h"
 #include "bolt/common/base/SuccinctPrinter.h"
+#include "bolt/common/process/ProcessBase.h"
 #include "bolt/common/testutil/TestValue.h"
+#include "bolt/exec/HashProbe.h"
+#include "bolt/exec/JoinAggReuse.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/RowContainer.h"
 #include "bolt/exec/Spiller.h"
@@ -220,7 +221,8 @@ HashBuild::HashBuild(
             continue; // Stored as the reference.
           }
         }
-        // Always track dependent channels for inputChannel -> storageChannel mapping
+        // Always track dependent channels for inputChannel -> storageChannel
+        // mapping
         dependentChannels_.emplace_back(i);
         decoders_.emplace_back(std::make_unique<DecodedVector>());
         names.emplace_back(inputType->nameOf(i));
@@ -378,8 +380,8 @@ RowVectorPtr HashBuild::rightDeepPayload(const RowVectorPtr& input) {
   auto& channels = rightDeepPublisher_->joinAggReuseChannels();
   BOLT_CHECK_EQ(channels.size(), 1);
   BOLT_CHECK_EQ(channels[0].size(), input->size());
-  auto refs = BaseVector::create<FlatVector<int64_t>>(
-      BIGINT(), input->size(), pool());
+  auto refs =
+      BaseVector::create<FlatVector<int64_t>>(BIGINT(), input->size(), pool());
   auto* rawRefs = refs->mutableRawValues();
   for (vector_size_t i = 0; i < input->size(); ++i) {
     rawRefs[i] = reinterpret_cast<int64_t>(channels[0][i]);
@@ -392,7 +394,11 @@ RowVectorPtr HashBuild::rightDeepPayload(const RowVectorPtr& input) {
   }
   children.push_back(std::move(refs));
   return std::make_shared<RowVector>(
-      pool(), dependentTypes_, input->nulls(), input->size(), std::move(children));
+      pool(),
+      dependentTypes_,
+      input->nulls(),
+      input->size(),
+      std::move(children));
 }
 
 void HashBuild::setReusableHashTable(
@@ -775,13 +781,12 @@ void HashBuild::addInput(RowVectorPtr input) {
             joinAggReuseSlotInit_.size() * sizeof(int64_t));
       }
     });
-    auto payloadInput = rightDeep_ != nullptr
-        ? rightDeepPayload(input)
-        : wrapColumns(
-              input->as<RowVector>(),
-              dependentChannels_,
-              dependentTypes_,
-              pool());
+    auto payloadInput = rightDeep_ != nullptr ? rightDeepPayload(input)
+                                              : wrapColumns(
+                                                    input->as<RowVector>(),
+                                                    dependentChannels_,
+                                                    dependentTypes_,
+                                                    pool());
     table_->hybridData()->addPayload(std::move(payloadInput));
   } else {
     activeRows_.applyToSelected([&](auto rowIndex) {
@@ -1159,11 +1164,13 @@ void HashBuild::noMoreInputInternal() {
     auto* hybridData = table_->hybridData();
     hybridCoalesceInFlight_ = true;
     hybridCoalesceThread_ = std::thread([this, hybridData]() {
+      const auto cpuStart = process::threadCpuNanos();
       try {
         hybridData->coalesceBatches();
       } catch (...) {
         hybridCoalesceError_ = std::current_exception();
       }
+      hybridCoalesceBgCpuNanos_ += process::threadCpuNanos() - cpuStart;
     });
   }
 
@@ -1909,6 +1916,13 @@ void HashBuild::joinHybridCoalesceThread(bool rethrow) {
   std::lock_guard<std::mutex> l(hybridCoalesceMutex_);
   if (hybridCoalesceThread_.joinable()) {
     hybridCoalesceThread_.join();
+    if (hybridCoalesceBgCpuNanos_ > 0) {
+      addRuntimeStat(
+          "hybridCoalesceBgCpuNanos",
+          RuntimeCounter(
+              hybridCoalesceBgCpuNanos_, RuntimeCounter::Unit::kNanos));
+      hybridCoalesceBgCpuNanos_ = 0;
+    }
   }
   hybridCoalesceInFlight_ = false;
   if (hybridCoalesceError_ != nullptr) {

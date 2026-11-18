@@ -30,8 +30,8 @@
 
 #pragma once
 
-#include <cstddef>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -514,6 +514,10 @@ class HashBuild final : public Operator {
   // triggered by the coalesce thread's own allocations would otherwise try to
   // join the thread from itself, and a peer reclaim would race the merge.
   std::atomic<bool> hybridCoalesceInFlight_{false};
+  // CPU time of the background coalesce thread (off the driver thread, so not
+  // in the operator's CPU time). Written by that thread, read after it is
+  // joined, and reported as the 'hybridCoalesceBgCpuNanos' runtime stat.
+  uint64_t hybridCoalesceBgCpuNanos_{0};
 };
 
 inline std::ostream& operator<<(std::ostream& os, HashBuild::State state) {

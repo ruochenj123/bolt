@@ -127,8 +127,7 @@ void HashAggregation::initialize() {
         }
       }
       if (rowsFrom != nullptr &&
-          std::find(sources.begin(), sources.end(), nullptr) ==
-              sources.end()) {
+          std::find(sources.begin(), sources.end(), nullptr) == sources.end()) {
         joinAggReuse_ = std::make_unique<JoinAggReuseConsumer>(
             *spec, std::move(sources), rowsFrom);
       }
@@ -265,7 +264,62 @@ void HashAggregation::initialize() {
             << ", outputType_ = " << outputType_->toString()
             << ", isPartialStep = " << isPartialStep_;
 
+  if (joinAggReuse_ != nullptr) {
+    createJoinAggReuseGroupingSet(inputType, numHashers);
+  }
+
   aggregationNode_.reset();
+}
+
+void HashAggregation::createJoinAggReuseGroupingSet(
+    const RowTypePtr& inputType,
+    uint32_t numKeys) {
+  const auto numSources = joinAggReuse_->numSources();
+  auto inputNames = inputType->names();
+  auto inputTypes = inputType->children();
+  std::vector<std::string> resultNames;
+  std::vector<TypePtr> resultTypes;
+  std::vector<std::unique_ptr<VectorHasher>> hashers;
+  for (size_t s = 0; s < numSources; ++s) {
+    hashers.push_back(VectorHasher::create(
+        BIGINT(), static_cast<column_index_t>(inputNames.size())));
+    inputNames.push_back(fmt::format("$jar_id${}", s));
+    inputTypes.push_back(BIGINT());
+    resultNames.push_back(inputNames.back());
+    resultTypes.push_back(BIGINT());
+  }
+
+  // The aggregates as in 'groupingSet_'; their inputs keep their channels.
+  std::shared_ptr<core::ExpressionEvaluator> expressionEvaluator;
+  auto aggregateInfos = toAggregateInfo(
+      *aggregationNode_, *operatorCtx_, numKeys, expressionEvaluator);
+  for (size_t i = 0; i < aggregateInfos.size(); ++i) {
+    aggregateInfos[i].output = numSources + i;
+    resultNames.push_back(outputType_->nameOf(numKeys + i));
+    resultTypes.push_back(outputType_->childAt(numKeys + i));
+  }
+
+  auto codedInputType = ROW(std::move(inputNames), std::move(inputTypes));
+  // The ids are never null. Groups stay in memory until the end of the
+  // input: no spill, no flush of the partial output.
+  auto groupingSet = std::make_unique<GroupingSet>(
+      codedInputType,
+      std::move(hashers),
+      std::vector<column_index_t>{},
+      std::move(aggregateInfos),
+      false,
+      isPartialOutput_,
+      isRawInput(aggregationNode_->step()),
+      std::vector<vector_size_t>{},
+      std::nullopt,
+      nullptr,
+      &nonReclaimableSection_,
+      operatorCtx_.get());
+  joinAggReuse_->setCodesGroupingSet(
+      std::move(groupingSet),
+      std::move(codedInputType),
+      ROW(std::move(resultNames), std::move(resultTypes)),
+      static_cast<vector_size_t>(maxInputBatchCount_));
 }
 
 bool HashAggregation::abandonPartialAggregationEarly(int64_t numOutput) const {
@@ -892,6 +946,12 @@ void HashAggregation::close() {
     Operator::recordGroupingSetStats(groupingSet_->getRuntimeStats());
     groupingSet_.reset();
   }
+  if (joinAggReuse_ != nullptr &&
+      joinAggReuse_->codesGroupingSet() != nullptr) {
+    Operator::recordGroupingSetStats(
+        joinAggReuse_->codesGroupingSet()->getRuntimeStats());
+  }
+  joinAggReuse_.reset();
   output_ = nullptr;
 }
 

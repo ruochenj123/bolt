@@ -29,9 +29,8 @@ only projections and inner joins in between (`analyzeJoinAggReuse`): every
 grouping key is a build column of one of those joins (a *source*) passed
 through unchanged, or a probe key equal to a source's build key; aggregates
 are `count`, `sum`, `min`, `max`, `avg` over numeric inputs (and `sum`/`avg`
-over DECIMAL, whose partial state is the serialized
-`LongDecimalWithOverflowState`). At most 4 sources; a right join only as the
-single join. Join spilling off.
+over DECIMAL, which always run in codes mode). At most 4 sources; a right join
+only as the single join. Join spilling off.
 
 **Probe side.** A source emits null constants for the build columns used above
 it only as grouping keys (`nullableBuildColumns`), extracts the others, and
@@ -49,12 +48,27 @@ source probe from its built table, alike in all drivers:
   the slots for such a join; codes mode leaves them unused), updated with
   relaxed atomics by all drivers; the last driver (task barrier) emits one
   partial row per touched build row. TPC-H Q3, Q10, Q13, Q17.
-- *codes*: otherwise. Each source's build rows get a code for their grouping
-  values, lazily when a probe first matches them (a dictionary per table,
-  shared by the drivers; values extracted and encoded outside its lock); a
-  group is the tuple of its sources' codes; each driver aggregates into its
-  own map and emits its groups, reading the grouping values from one build row
-  per code. TPC-H Q5, Q12, SSB Q2.1-Q4.3, TPC-DS star queries.
+- *codes*: otherwise, provided some source skips extracting a build column
+  for the grouping keys (`skipsBuildColumns`; with only probe keys as grouping
+  keys there is nothing to save and the reuse stays off, TPC-DS Q64's
+  `cs_ui`). A group is the tuple of one id per source. A source
+  whose build rows are the groups (the rows-mode condition: unique build keys,
+  and grouping keys covering the join keys or more than 1M build rows) uses the
+  build row itself as the id: no dictionary. Any other source gives its build
+  rows a code for their grouping values, lazily when a probe first matches
+  them (a dictionary per table, shared by the drivers; values extracted and
+  encoded outside its lock). Each driver aggregates in a `GroupingSet` of its
+  own, built by `HashAggregation` from the same aggregates, whose grouping
+  keys are the ids: one BIGINT column per source appended to the input. The
+  hash table thus addresses groups by fixed-width integers (array mode while
+  the product of the code ranges is small), and the aggregate functions and
+  accumulators are the engine's own, so DECIMAL sums and several sources need
+  no shared state. Groups stay in memory until the end of the input (no
+  partial flush, no spill); the driver then emits them, reading the grouping
+  values from the group's build row or from one build row per code. A DISTINCT
+  (no aggregates) keeps the ids of its new groups as the table reports them.
+  TPC-H Q5, Q12, SSB Q2.1-Q4.3, TPC-DS star queries (codes); TPC-DS Q11, Q74,
+  Q38, Q87 (customer rows).
 
 The final aggregation downstream is unchanged.
 

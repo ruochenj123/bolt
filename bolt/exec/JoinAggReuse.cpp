@@ -11,14 +11,13 @@
 #include <optional>
 #include <unordered_set>
 
-#include <folly/hash/Hash.h>
 #include <glog/logging.h>
 
+#include "bolt/exec/GroupingSet.h"
 #include "bolt/exec/HashProbe.h"
 #include "bolt/exec/HashTable.h"
 #include "bolt/exec/Task.h"
-#include "bolt/type/DecimalUtil.h"
-#include "bolt/type/HugeInt.h"
+#include "bolt/vector/LazyVector.h"
 
 namespace bytedance::bolt::exec {
 namespace {
@@ -223,8 +222,7 @@ bool analyzeAggregates(
         return false;
       }
     } else if (
-        fname == "sum" || fname == "min" || fname == "max" ||
-        fname == "avg") {
+        fname == "sum" || fname == "min" || fname == "max" || fname == "avg") {
       if (inputs.size() != 1) {
         return false;
       }
@@ -236,9 +234,8 @@ bool analyzeAggregates(
       return false;
     }
     if (a.kind != JoinAggReuseAgg::Kind::kCountStar) {
-      auto field =
-          std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
-              inputs[0]);
+      auto field = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(
+          inputs[0]);
       if (field == nullptr) {
         return false;
       }
@@ -261,8 +258,7 @@ bool analyzeAggregates(
       // Partial state: VARBINARY (LongDecimalWithOverflowState).
     } else if (a.kind == JoinAggReuseAgg::Kind::kAvg) {
       // Partial avg = ROW(sum DOUBLE, count BIGINT).
-      if (a.resultType->kind() != TypeKind::ROW ||
-          a.resultType->size() != 2 ||
+      if (a.resultType->kind() != TypeKind::ROW || a.resultType->size() != 2 ||
           a.resultType->childAt(0)->kind() != TypeKind::DOUBLE ||
           a.resultType->childAt(1)->kind() != TypeKind::BIGINT) {
         return false;
@@ -389,8 +385,8 @@ std::optional<JoinAggReuseSpec> analyzeAggregation(
   return spec;
 }
 
-// Relaxed atomics on shared slots (rows mode: several drivers update the
-// same build row concurrently), plain updates on a driver's own slots.
+// Rows mode: several drivers update the slots of one build row concurrently,
+// with relaxed atomics.
 inline double bitsToDouble(int64_t bits) {
   double d;
   std::memcpy(&d, &bits, sizeof(d));
@@ -403,74 +399,49 @@ inline int64_t doubleToBits(double d) {
   return bits;
 }
 
-template <bool kAtomic>
 inline void addInt(int64_t* slot, int64_t value) {
-  if constexpr (kAtomic) {
-    __atomic_fetch_add(slot, value, __ATOMIC_RELAXED);
-  } else {
-    *slot += value;
-  }
+  __atomic_fetch_add(slot, value, __ATOMIC_RELAXED);
 }
 
-template <bool kAtomic>
 inline void addDouble(int64_t* slot, double value) {
-  if constexpr (kAtomic) {
-    int64_t current = __atomic_load_n(slot, __ATOMIC_RELAXED);
-    while (!__atomic_compare_exchange_n(
-        slot,
-        &current,
-        doubleToBits(bitsToDouble(current) + value),
-        true,
-        __ATOMIC_RELAXED,
-        __ATOMIC_RELAXED)) {
-    }
-  } else {
-    *slot = doubleToBits(bitsToDouble(*slot) + value);
+  int64_t current = __atomic_load_n(slot, __ATOMIC_RELAXED);
+  while (!__atomic_compare_exchange_n(
+      slot,
+      &current,
+      doubleToBits(bitsToDouble(current) + value),
+      true,
+      __ATOMIC_RELAXED,
+      __ATOMIC_RELAXED)) {
   }
 }
 
-template <bool kAtomic, bool kMin>
+template <bool kMin>
 inline void minMaxInt(int64_t* slot, int64_t value) {
-  if constexpr (kAtomic) {
-    int64_t current = __atomic_load_n(slot, __ATOMIC_RELAXED);
-    while ((kMin ? value < current : value > current) &&
-           !__atomic_compare_exchange_n(
-               slot,
-               &current,
-               value,
-               true,
-               __ATOMIC_RELAXED,
-               __ATOMIC_RELAXED)) {
-    }
-  } else if (kMin ? value < *slot : value > *slot) {
-    *slot = value;
+  int64_t current = __atomic_load_n(slot, __ATOMIC_RELAXED);
+  while ((kMin ? value < current : value > current) &&
+         !__atomic_compare_exchange_n(
+             slot, &current, value, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
   }
 }
 
-template <bool kAtomic, bool kMin>
+template <bool kMin>
 inline void minMaxDouble(int64_t* slot, double value) {
-  if constexpr (kAtomic) {
-    int64_t current = __atomic_load_n(slot, __ATOMIC_RELAXED);
-    while ((kMin ? value < bitsToDouble(current)
-                 : value > bitsToDouble(current)) &&
-           !__atomic_compare_exchange_n(
-               slot,
-               &current,
-               doubleToBits(value),
-               true,
-               __ATOMIC_RELAXED,
-               __ATOMIC_RELAXED)) {
-    }
-  } else if (kMin ? value < bitsToDouble(*slot) : value > bitsToDouble(*slot)) {
-    *slot = doubleToBits(value);
+  int64_t current = __atomic_load_n(slot, __ATOMIC_RELAXED);
+  while (
+      (kMin ? value < bitsToDouble(current) : value > bitsToDouble(current)) &&
+      !__atomic_compare_exchange_n(
+          slot,
+          &current,
+          doubleToBits(value),
+          true,
+          __ATOMIC_RELAXED,
+          __ATOMIC_RELAXED)) {
   }
 }
 
 // An integer-kind value of 'decoded' as int64.
-inline int64_t readInt(
-    const DecodedVector& decoded,
-    vector_size_t row,
-    TypeKind kind) {
+inline int64_t
+readInt(const DecodedVector& decoded, vector_size_t row, TypeKind kind) {
   switch (kind) {
     case TypeKind::BIGINT:
       return decoded.valueAt<int64_t>(row);
@@ -483,7 +454,8 @@ inline int64_t readInt(
   }
 }
 
-template <bool kAtomic>
+// Rows mode: adds the aggregate inputs of 'input' to 'slots', the slots of
+// each row's build row.
 void accumulateInto(
     const JoinAggReuseSpec& spec,
     const RowVectorPtr& input,
@@ -493,44 +465,20 @@ void accumulateInto(
   decodedInputs.resize(spec.aggs.size());
   for (size_t ai = 0; ai < spec.aggs.size(); ++ai) {
     const auto& a = spec.aggs[ai];
+    BOLT_CHECK(!a.decimal, "join-agg reuse: DECIMAL sums run in codes mode");
     if (a.kind == JoinAggReuseAgg::Kind::kCountStar) {
       for (vector_size_t i = 0; i < numRows; ++i) {
-        addInt<kAtomic>(slots[i] + a.slot, 1);
+        addInt(slots[i] + a.slot, 1);
       }
       continue;
     }
     auto& decoded = decodedInputs[ai];
     decoded.decode(*input->childAt(a.inputChannel));
     const bool mayHaveNulls = decoded.mayHaveNulls();
-    if (a.decimal) {
-      // As DecimalAggregate::updateNonNullValue: 128-bit sum with an
-      // overflow count, and the number of values. Codes mode only.
-      if constexpr (kAtomic) {
-        BOLT_UNREACHABLE();
-      } else {
-        const bool isShort = a.inputType->isShortDecimal();
-        for (vector_size_t i = 0; i < numRows; ++i) {
-          if (mayHaveNulls && decoded.isNullAt(i)) {
-            continue;
-          }
-          const int128_t value = isShort
-              ? static_cast<int128_t>(decoded.valueAt<int64_t>(i))
-              : decoded.valueAt<int128_t>(i);
-          int64_t* s = slots[i] + a.slot;
-          int128_t sum = HugeInt::build(
-              static_cast<uint64_t>(s[1]), static_cast<uint64_t>(s[0]));
-          s[3] += DecimalUtil::addWithOverflow(sum, sum, value);
-          s[0] = static_cast<int64_t>(static_cast<uint64_t>(sum));
-          s[1] = static_cast<int64_t>(sum >> 64);
-          s[2] += 1;
-        }
-      }
-      continue;
-    }
     if (a.kind == JoinAggReuseAgg::Kind::kCount) {
       for (vector_size_t i = 0; i < numRows; ++i) {
         if (!mayHaveNulls || !decoded.isNullAt(i)) {
-          addInt<kAtomic>(slots[i] + a.slot, 1);
+          addInt(slots[i] + a.slot, 1);
         }
       }
       continue;
@@ -543,7 +491,7 @@ void accumulateInto(
       }
       int64_t* value = slots[i] + a.slot;
       if (a.kind == JoinAggReuseAgg::Kind::kAvg) {
-        addDouble<kAtomic>(
+        addDouble(
             value,
             isDouble ? decoded.valueAt<double>(i)
                      : static_cast<double>(readInt(decoded, i, kind)));
@@ -551,28 +499,28 @@ void accumulateInto(
         const double v = decoded.valueAt<double>(i);
         switch (a.kind) {
           case JoinAggReuseAgg::Kind::kSum:
-            addDouble<kAtomic>(value, v);
+            addDouble(value, v);
             break;
           case JoinAggReuseAgg::Kind::kMin:
-            minMaxDouble<kAtomic, true>(value, v);
+            minMaxDouble<true>(value, v);
             break;
           default:
-            minMaxDouble<kAtomic, false>(value, v);
+            minMaxDouble<false>(value, v);
         }
       } else {
         const int64_t v = readInt(decoded, i, kind);
         switch (a.kind) {
           case JoinAggReuseAgg::Kind::kSum:
-            addInt<kAtomic>(value, v);
+            addInt(value, v);
             break;
           case JoinAggReuseAgg::Kind::kMin:
-            minMaxInt<kAtomic, true>(value, v);
+            minMaxInt<true>(value, v);
             break;
           default:
-            minMaxInt<kAtomic, false>(value, v);
+            minMaxInt<false>(value, v);
         }
       }
-      addInt<kAtomic>(value + 1, 1);
+      addInt(value + 1, 1);
     }
   }
 }
@@ -687,8 +635,7 @@ std::vector<JoinAggReuseSpec> analyzeJoinAggReuse(
     }
     // Projections and joins below the aggregation in this pipeline.
     std::vector<core::PlanNodePtr> chain;
-    for (auto source = agg->sources()[0];
-         inPipeline.count(source.get()) > 0 &&
+    for (auto source = agg->sources()[0]; inPipeline.count(source.get()) > 0 &&
          (std::dynamic_pointer_cast<const core::ProjectNode>(source) ||
           std::dynamic_pointer_cast<const core::HashJoinNode>(source));
          source = source->sources()[0]) {
@@ -806,8 +753,7 @@ std::optional<JoinAggReuseSpec> deferBuildColumns(
     std::unordered_set<std::string> names{column};
     bool onlyDeferred = true;
     for (size_t k = j; k-- > 0 && onlyDeferred;) {
-      const auto& project =
-          static_cast<const core::ProjectNode&>(*chain[k]);
+      const auto& project = static_cast<const core::ProjectNode&>(*chain[k]);
       std::unordered_set<std::string> passed;
       for (size_t i = 0; i < project.projections().size(); ++i) {
         const auto& expr = project.projections()[i];
@@ -836,9 +782,8 @@ std::optional<JoinAggReuseSpec> deferBuildColumns(
   LOG(INFO) << "[join-agg-reuse] "
             << (toOrderBy ? "OrderBy " : "build of join ") << consumerId
             << " stores references to rows of join " << sourceJoin->id()
-            << " for " << spec.rightDeep->deferredColumns.size()
-            << " columns (" << spec.sources[0].nullableBuildColumns.size()
-            << " not extracted)";
+            << " for " << spec.rightDeep->deferredColumns.size() << " columns ("
+            << spec.sources[0].nullableBuildColumns.size() << " not extracted)";
   return spec;
 }
 } // namespace
@@ -1096,7 +1041,7 @@ void JoinAggReuseCodes::ensure(
 }
 
 void JoinAggReuseCodes::representatives(
-    const int32_t* codes,
+    const int64_t* codes,
     int32_t count,
     char** rows) const {
   std::lock_guard<std::mutex> l(mutex_);
@@ -1110,16 +1055,25 @@ int32_t JoinAggReuseCodes::numCodes() const {
   return static_cast<int32_t>(representatives_.size());
 }
 
-size_t JoinAggReuseConsumer::GroupKeyHash::operator()(
-    const GroupKey& key) const {
-  return folly::hash::hash_range(key.codes.begin(), key.codes.end());
-}
-
 JoinAggReuseConsumer::JoinAggReuseConsumer(
     const JoinAggReuseSpec& spec,
     std::vector<HashProbe*> sources,
     HashProbe* rowsFrom)
     : spec_(spec), sources_(std::move(sources)), rowsFrom_(rowsFrom) {}
+
+JoinAggReuseConsumer::~JoinAggReuseConsumer() = default;
+
+void JoinAggReuseConsumer::setCodesGroupingSet(
+    std::unique_ptr<GroupingSet> groupingSet,
+    RowTypePtr inputType,
+    RowTypePtr resultType,
+    vector_size_t maxInputBatchRows) {
+  BOLT_CHECK_EQ(resultType->size(), sources_.size() + spec_.aggs.size());
+  groupingSet_ = std::move(groupingSet);
+  codedInputType_ = std::move(inputType);
+  codesResultType_ = std::move(resultType);
+  maxInputBatchRows_ = maxInputBatchRows;
+}
 
 bool JoinAggReuseConsumer::active() const {
   // All sources decide alike (hybrid builds, same configuration).
@@ -1172,62 +1126,111 @@ void JoinAggReuseConsumer::addInputRows(
       touched_.push_back(buildRows[i]);
     }
   }
-  accumulateInto<true>(spec_, input, slots, decoded_);
+  accumulateInto(spec_, input, slots, decoded_);
 }
 
 void JoinAggReuseConsumer::addInputCodes(
     Operator& op,
     const RowVectorPtr& input) {
+  BOLT_CHECK_NOT_NULL(
+      groupingSet_, "join-agg reuse: codes mode without a grouping set");
   const auto numSources = sources_.size();
-  if (codes_.empty()) {
-    initValues_ = spec_.slotInitValues();
-    initValues_[0] = 1; // Touched.
+  if (sourceTables_.empty()) {
     for (size_t s = 0; s < numSources; ++s) {
+      // No codes: the source's build rows are the groups.
       codes_.push_back(sources_[s]->joinAggReuseCodes());
       sourceTables_.push_back(sources_[s]->joinAggReuseTable());
-      BOLT_CHECK_NOT_NULL(codes_.back());
+      BOLT_CHECK_NOT_NULL(sourceTables_.back());
     }
-  }
-  const auto& channels = rowsFrom_->joinAggReuseChannels();
-  for (size_t s = 0; s < numSources; ++s) {
-    codes_[s]->ensure(channels[s], op.pool());
   }
 
-  // Group of each row; new groups get their slots at the end.
+  // The id of each row's build row, one BIGINT column per source after the
+  // input's columns: the grouping keys of 'groupingSet_'.
+  const auto& channels = rowsFrom_->joinAggReuseChannels();
   const auto numRows = input->size();
-  static thread_local std::vector<uint32_t> indexes;
-  indexes.resize(numRows);
-  GroupKey key;
-  for (vector_size_t i = 0; i < numRows; ++i) {
-    for (size_t s = 0; s < numSources; ++s) {
-      key.codes[s] = codes_[s]->codeOf(channels[s][i]);
+  auto children = input->children();
+  std::vector<const int64_t*> rawIds(numSources);
+  for (size_t s = 0; s < numSources; ++s) {
+    auto column =
+        BaseVector::create<FlatVector<int64_t>>(BIGINT(), numRows, op.pool());
+    auto* raw = column->mutableRawValues();
+    const auto& rows = channels[s];
+    if (codes_[s] == nullptr) {
+      for (vector_size_t i = 0; i < numRows; ++i) {
+        raw[i] = reinterpret_cast<int64_t>(rows[i]);
+      }
+    } else {
+      bool allCoded = true;
+      for (vector_size_t i = 0; i < numRows; ++i) {
+        raw[i] = codes_[s]->codeOf(rows[i]);
+        allCoded &= raw[i] >= 0;
+      }
+      if (!allCoded) {
+        // Build rows matched for the first time.
+        codes_[s]->ensure(rows, op.pool());
+        for (vector_size_t i = 0; i < numRows; ++i) {
+          if (raw[i] < 0) {
+            raw[i] = codes_[s]->codeOf(rows[i]);
+          }
+        }
+      }
     }
-    auto [it, inserted] = groupIndex_.try_emplace(
-        key, static_cast<uint32_t>(groupKeys_.size()));
-    if (inserted) {
-      groupKeys_.push_back(key);
-      groupSlots_.insert(
-          groupSlots_.end(), initValues_.begin(), initValues_.end());
+    rawIds[s] = raw;
+    children.push_back(std::move(column));
+  }
+  auto coded = std::make_shared<RowVector>(
+      op.pool(), codedInputType_, nullptr, numRows, std::move(children));
+
+  const bool distinct = spec_.aggs.empty();
+  const auto add = [&](const RowVectorPtr& rows, vector_size_t offset) {
+    groupingSet_->addInput(rows, false);
+    if (distinct) {
+      // No accumulators to list at the end: keep the new groups' ids.
+      for (auto row : groupingSet_->hashLookup().newGroups) {
+        for (size_t s = 0; s < numSources; ++s) {
+          distinctIds_.push_back(rawIds[s][offset + row]);
+        }
+      }
     }
-    indexes[i] = it->second;
+  };
+  if (numRows <= maxInputBatchRows_) {
+    add(coded, 0);
+    return;
   }
-  static thread_local std::vector<int64_t*> slots;
-  slots.resize(numRows);
-  for (vector_size_t i = 0; i < numRows; ++i) {
-    slots[i] = groupSlots_.data() + indexes[i] * spec_.numSlots;
+  // As HashAggregation::addInput.
+  if (isLazyNotLoaded(*coded)) {
+    coded->loadedVector();
   }
-  accumulateInto<false>(spec_, input, slots, decoded_);
+  for (vector_size_t i = 0; i < numRows; i += maxInputBatchRows_) {
+    const auto length = std::min(numRows - i, maxInputBatchRows_);
+    add(std::static_pointer_cast<RowVector>(coded->slice(i, length)), i);
+  }
 }
 
 void JoinAggReuseConsumer::noMoreInput(Operator& op) {
   op.addRuntimeStat("joinAggReuseInputRows", RuntimeCounter(numInputRows_));
   if (!rowsMode()) {
-    op.addRuntimeStat("joinAggReuseGroups", RuntimeCounter(groupKeys_.size()));
+    BOLT_CHECK_NOT_NULL(groupingSet_);
+    groupingSet_->noMoreInput();
+    op.addRuntimeStat(
+        "joinAggReuseGroups", RuntimeCounter(groupingSet_->numDistinct()));
     int64_t numCodes = 0;
+    int64_t numRowSources = 0;
     for (const auto& codes : codes_) {
-      numCodes += codes->numCodes();
+      if (codes != nullptr) {
+        numCodes += codes->numCodes();
+      } else {
+        ++numRowSources;
+      }
     }
     op.addRuntimeStat("joinAggReuseCodes", RuntimeCounter(numCodes));
+    // Sources whose build rows are the groups (no codes).
+    op.addRuntimeStat("joinAggReuseRowSources", RuntimeCounter(numRowSources));
+    // How the grouping set's table addresses the codes: 0 hash, 1 array
+    // (direct by code), 2 normalized key.
+    op.addRuntimeStat(
+        "joinAggReuseHashMode",
+        RuntimeCounter(static_cast<int64_t>(groupingSet_->hashMode())));
     return;
   }
   if (state_ != nullptr) {
@@ -1243,7 +1246,13 @@ void JoinAggReuseConsumer::noMoreInput(Operator& op) {
   }
   // All drivers have added their rows (the barrier orders their updates
   // before this point). No state means no driver received a matched row.
-  table_ = sources_[0]->joinAggReuseTable();
+  // Keep the reference taken in addInputRows: in a single-driver pipeline
+  // HashProbe::resetHashTable() has already released the probe's table, so
+  // re-reading it here would return null and drop the last reference while
+  // emitRows_ still points into the table's rows.
+  if (table_ == nullptr) {
+    table_ = sources_[0]->joinAggReuseTable();
+  }
   if (table_ != nullptr && state_ == nullptr) {
     state_ = table_->peekJoinAggReuseState();
   }
@@ -1268,6 +1277,8 @@ RowVectorPtr JoinAggReuseConsumer::outputRows(
   if (!emitter_ || emitPosition_ >= emitRows_.size()) {
     return nullptr;
   }
+  BOLT_CHECK_NOT_NULL(
+      table_, "join-agg reuse: emitting rows without the table");
   const auto numOut = static_cast<vector_size_t>(
       std::min<size_t>(maxRows, emitRows_.size() - emitPosition_));
   char** rows = emitRows_.data() + emitPosition_;
@@ -1295,38 +1306,71 @@ RowVectorPtr JoinAggReuseConsumer::outputCodes(
     Operator& op,
     const RowTypePtr& outputType,
     int32_t maxRows) {
-  if (emitPosition_ >= groupKeys_.size()) {
-    return nullptr;
-  }
-  const auto first = emitPosition_;
-  const auto numOut = static_cast<vector_size_t>(
-      std::min<size_t>(maxRows, groupKeys_.size() - first));
-  emitPosition_ += numOut;
-
-  auto result = std::static_pointer_cast<RowVector>(
-      BaseVector::create(outputType, numOut, op.pool()));
-  // Grouping keys of each source, from a build row with the group's code.
-  std::vector<int32_t> codes(numOut);
-  std::vector<char*> rows(numOut);
-  for (size_t s = 0; s < sources_.size(); ++s) {
-    for (vector_size_t i = 0; i < numOut; ++i) {
-      codes[i] = groupKeys_[first + i].codes[s];
+  const auto numSources = sources_.size();
+  // The next groups: their ids and, in 'groups', their partial results.
+  RowVectorPtr groups;
+  vector_size_t numOut = 0;
+  std::vector<const int64_t*> rawIds(numSources);
+  if (spec_.aggs.empty()) {
+    const auto numGroups = distinctIds_.size() / numSources;
+    if (emitPosition_ >= numGroups) {
+      return nullptr;
     }
-    codes_[s]->representatives(codes.data(), numOut, rows.data());
+    numOut = static_cast<vector_size_t>(
+        std::min<size_t>(maxRows, numGroups - emitPosition_));
+  } else {
+    groups =
+        BaseVector::create<RowVector>(codesResultType_, maxRows, op.pool());
+    if (!groupingSet_->getOutput(
+            maxRows,
+            op.operatorCtx()
+                ->driverCtx()
+                ->queryConfig()
+                .preferredOutputBatchBytes(),
+            resultIterator_,
+            groups)) {
+      return nullptr;
+    }
+    numOut = groups->size();
+    for (size_t s = 0; s < numSources; ++s) {
+      rawIds[s] =
+          groups->childAt(s)->asUnchecked<FlatVector<int64_t>>()->rawValues();
+    }
+  }
+
+  // Grouping keys of each source, from the group's build row or, for a
+  // coded source, from a build row with the group's code.
+  std::vector<VectorPtr> children(outputType->size());
+  std::vector<int64_t> ids(numOut);
+  std::vector<char*> rows(numOut);
+  for (size_t s = 0; s < numSources; ++s) {
+    for (vector_size_t i = 0; i < numOut; ++i) {
+      ids[i] = groups != nullptr
+          ? rawIds[s][i]
+          : distinctIds_[(emitPosition_ + i) * numSources + s];
+    }
+    if (codes_[s] == nullptr) {
+      for (vector_size_t i = 0; i < numOut; ++i) {
+        rows[i] = reinterpret_cast<char*>(ids[i]);
+      }
+    } else {
+      codes_[s]->representatives(ids.data(), numOut, rows.data());
+    }
     HashProbe::extractTableColumns(
         sourceTables_[s].get(),
         folly::Range<char**>(rows.data(), numOut),
         sources_[s]->joinAggReuseKeyProjections(),
         op.pool(),
         outputType->children(),
-        result->children());
+        children);
   }
-  std::vector<const int64_t*> slots(numOut);
-  for (vector_size_t i = 0; i < numOut; ++i) {
-    slots[i] = groupSlots_.data() + (first + i) * spec_.numSlots;
+  emitPosition_ += numOut;
+  const auto numKeys = outputType->size() - spec_.aggs.size();
+  for (size_t i = 0; i < spec_.aggs.size(); ++i) {
+    children[numKeys + i] = groups->childAt(numSources + i);
   }
-  fillAggregates(op, result, slots);
-  return result;
+  return std::make_shared<RowVector>(
+      op.pool(), outputType, nullptr, numOut, std::move(children));
 }
 
 void JoinAggReuseConsumer::fillAggregates(
@@ -1343,23 +1387,7 @@ void JoinAggReuseConsumer::fillAggregates(
         a.kind == JoinAggReuseAgg::Kind::kCount;
     const bool inputIsDouble =
         a.inputType != nullptr && a.inputType->kind() == TypeKind::DOUBLE;
-    if (a.decimal) {
-      // LongDecimalWithOverflowState::serialize: count, overflow, sum low,
-      // sum high; null without values.
-      auto* flat = child->asUnchecked<FlatVector<StringView>>();
-      for (vector_size_t i = 0; i < numOut; ++i) {
-        const int64_t* s = slots[i] + a.slot;
-        if (s[2] == 0) {
-          flat->setNull(i, true);
-          continue;
-        }
-        const int64_t fields[4] = {s[2], s[3], s[0], s[1]};
-        char* buffer = flat->getRawStringBufferWithSpace(sizeof(fields));
-        std::memcpy(buffer, fields, sizeof(fields));
-        flat->setNoCopy(i, StringView(buffer, sizeof(fields)));
-      }
-      continue;
-    }
+    BOLT_CHECK(!a.decimal, "join-agg reuse: DECIMAL sums run in codes mode");
     if (a.kind == JoinAggReuseAgg::Kind::kAvg) {
       auto* rowChild = child->asUnchecked<RowVector>();
       auto* sums = rowChild->childAt(0)->asUnchecked<FlatVector<double>>();
@@ -1385,7 +1413,8 @@ void JoinAggReuseConsumer::fillAggregates(
       switch (a.resultType->kind()) {
         case TypeKind::DOUBLE:
           child->asUnchecked<FlatVector<double>>()->set(
-              i, inputIsDouble ? bitsToDouble(bits) : static_cast<double>(bits));
+              i,
+              inputIsDouble ? bitsToDouble(bits) : static_cast<double>(bits));
           break;
         case TypeKind::BIGINT:
           child->asUnchecked<FlatVector<int64_t>>()->set(i, bits);

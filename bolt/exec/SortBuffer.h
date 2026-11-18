@@ -133,6 +133,10 @@ class SortBuffer : public SortBufferBase {
     return sortOutputTimeUs_;
   }
 
+  uint64_t hybridCoalesceBackgroundCpuNanos() const override {
+    return hybridCoalesceBackgroundCpuNanos_;
+  }
+
   int64_t getSortColToRowTime() const {
     return sortColToRowTimeUs_;
   }
@@ -154,13 +158,13 @@ class SortBuffer : public SortBufferBase {
   void setSortAlgo(SortAlgo algo) {
     sorter_ = HybridSorter{algo};
   }
-  
+
   /// Returns the sorted row pointers after noMoreInput() is called.
   /// Only valid after noMoreInput() and before spilling.
   const std::vector<char*>& getSortedRows() const {
     return sortedRows_;
   }
-  
+
   /// Returns the original row indices in sorted order.
   /// Uses the stored rowId in hybrid mode (low 56 bits = original index).
   /// Only valid when hybridSortEnabled_ is true.
@@ -250,6 +254,8 @@ class SortBuffer : public SortBufferBase {
   // For hybrid design
   bool hybridSortEnabled_{false};
   std::unique_ptr<HybridContainer> hybridData_{nullptr};
+  // Written by the background coalesce thread, read after it is joined.
+  uint64_t hybridCoalesceBackgroundCpuNanos_{0};
   std::vector<IdentityProjection> keyColumnMap_;
   std::vector<IdentityProjection> payloadColumnMap_;
   std::vector<column_index_t> payloadChannels_;

@@ -29,9 +29,9 @@
  */
 
 #include "bolt/exec/LocalPlanner.h"
-#include "bolt/exec/JoinFusionPlanner.h"
-#include "bolt/exec/JoinAggReuse.h"
 #include "bolt/common/base/SparkCompatibility.h"
+#include "bolt/exec/JoinAggReuse.h"
+#include "bolt/exec/JoinFusionPlanner.h"
 
 #include "RoundRobinPartitionFunction.h"
 #include "bolt/common/process/ExceptionTraceContext.h"

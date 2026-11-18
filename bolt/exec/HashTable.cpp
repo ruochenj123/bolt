@@ -688,7 +688,7 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
   incrementProbes(lookup.rows.size());
-  
+
   if (hashMode_ == HashMode::kArray) {
     arrayJoinProbe(lookup);
     return;
@@ -2401,6 +2401,5 @@ void BaseHashTable::prepareForJoinProbe(
 
   populateLookupRows(rows, lookup.rows);
 }
-
 
 } // namespace bytedance::bolt::exec

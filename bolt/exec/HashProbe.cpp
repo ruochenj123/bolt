@@ -30,13 +30,13 @@
 
 #include "bolt/exec/HashProbe.h"
 
-#include <chrono>
 #include <common/time/Timer.h>
 #include <core/PlanNode.h>
 #include <core/QueryConfig.h>
 #include <exec/Driver.h>
 #include <exec/Operator.h>
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/Task.h"
@@ -194,7 +194,6 @@ HashProbe::HashProbe(
     joinAggReuseMember_ = driverCtx->joinAggReusePlan->forJoin(planNodeId());
     rightDeepBuild_ = driverCtx->joinAggReusePlan->forBuild(planNodeId());
   }
-
 }
 
 void HashProbe::initialize() {
@@ -286,7 +285,6 @@ void HashProbe::initialize() {
   if (nullAware_) {
     filterTableResult_.resize(1);
   }
-
 }
 
 void HashProbe::initializeFilter(
@@ -1051,17 +1049,26 @@ void HashProbe::maybeActivateJoinAggReuse() {
     return;
   }
 
-  // Rows mode when a single source's build rows are the groups: unique keys
-  // (every probe row matches at most one build row, a build row absorbs all
-  // matches of its key; with duplicate keys, e.g. a lineitem build probed by
-  // orders, each build row tends to match once) and grouping keys that are
-  // the join keys, or too many rows to code. The plan does not say; the built
-  // table does. Otherwise codes mode: dense codes of the grouping values.
-  joinAggReuseRowsMode_ = spec.sources.size() == 1 && !spec.hasDecimal() &&
-      !table_->hasDuplicateKeys() &&
+  // This source's build rows are the groups: unique keys (every probe row
+  // matches at most one build row, a build row absorbs all matches of its
+  // key; with duplicate keys, e.g. a lineitem build probed by orders, each
+  // build row tends to match once) and grouping keys that are the join keys,
+  // or too many rows to code. The plan does not say; the built table does.
+  const bool rowsAreGroups = !table_->hasDuplicateKeys() &&
       (source->keysCoverJoinKeys ||
        table_->numDistinct() > kJoinAggReuseMaxCodedRows);
-  if (!joinAggReuseRowsMode_) {
+  // Rows mode when it is the only source and the accumulators can sit in its
+  // rows. Otherwise codes mode, where a source whose rows are not the groups
+  // gives them dense codes of their grouping values.
+  joinAggReuseRowsMode_ =
+      spec.sources.size() == 1 && !spec.hasDecimal() && rowsAreGroups;
+  joinAggReuseCodes_ = nullptr;
+  if (!joinAggReuseRowsMode_ && !spec.skipsBuildColumns()) {
+    // Nothing to save (JoinAggReuseSpec::skipsBuildColumns): the aggregation
+    // runs as usual. All sources of the spec decide alike.
+    return;
+  }
+  if (!joinAggReuseRowsMode_ && !rowsAreGroups) {
     // Codes are assigned lazily, to the build rows probes match.
     joinAggReuseCodes_ = table_->joinAggReuseCodes([&]() {
       return std::make_shared<JoinAggReuseCodes>(
@@ -1076,8 +1083,8 @@ void HashProbe::maybeActivateJoinAggReuse() {
 
 void HashProbe::takeCarriedRows(vector_size_t size) {
   if (joinAggReusePublisher_ == nullptr) {
-    const auto& below =
-        joinAggReuseMember_.spec->chainJoinIds[joinAggReuseMember_.position - 1];
+    const auto& below = joinAggReuseMember_.spec
+                            ->chainJoinIds[joinAggReuseMember_.position - 1];
     for (auto* op : operatorCtx_->driver()->operators()) {
       auto* probe = dynamic_cast<HashProbe*>(op);
       if (probe != nullptr && probe->planNodeId() == below) {
@@ -1262,8 +1269,7 @@ void HashProbe::fillOutput(vector_size_t size) {
 
   // Fusion v2: resolve upstream deferred refs at the run's final hop.
   if (fusionHop_ != nullptr && fusionHop_->isMaterializationPoint &&
-      input_ != nullptr &&
-      input_->childrenSize() > probeType_->size()) {
+      input_ != nullptr && input_->childrenSize() > probeType_->size()) {
     materializeFusionRefs(size);
   }
 
@@ -1271,7 +1277,6 @@ void HashProbe::fillOutput(vector_size_t size) {
     publishJoinAggReuseRows(size, outputRowMapping_->as<vector_size_t>());
   }
 }
-
 
 void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
   // The previous batch replaced output_ with the extended (ref-carrying)
@@ -1286,7 +1291,8 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
     static std::atomic<bool> logged{false};
     bool expected = false;
     if (logged.compare_exchange_strong(expected, true)) {
-      LOG(INFO) << "[fusion-v2] deferred output ACTIVE at node " << planNodeId();
+      LOG(INFO) << "[fusion-v2] deferred output ACTIVE at node "
+                << planNodeId();
     }
   }
   const auto traceStart = fusionTraceEnabled_
@@ -1323,10 +1329,9 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
           kFusionKappaBytes * (1 + fusionHop_->hopsAfter);
       fusionEager_ = !deferPays;
       LOG(ERROR) << "[fusion-adaptive] node " << planNodeId()
-                 << (fusionEager_ ? " -> EAGER" : " -> DEFER")
-                 << " at batch " << fusionBatchCount_
-                 << " (B=" << fusionDeferredBytesPerRow_ << " e=" << e
-                 << " hopsAfter=" << fusionHop_->hopsAfter << ")";
+                 << (fusionEager_ ? " -> EAGER" : " -> DEFER") << " at batch "
+                 << fusionBatchCount_ << " (B=" << fusionDeferredBytesPerRow_
+                 << " e=" << e << " hopsAfter=" << fusionHop_->hopsAfter << ")";
     }
   }
 
@@ -1356,7 +1361,8 @@ void HashProbe::fillOutputFusionDeferred(vector_size_t size) {
       if (deferredSet.count(projection.outputChannel) > 0) {
         fusionNullConstants_[projection.outputChannel] =
             BaseVector::createNullConstant(
-                outputType_->childAt(projection.outputChannel), kMaxBatch,
+                outputType_->childAt(projection.outputChannel),
+                kMaxBatch,
                 pool());
       } else {
         fusionImmediate_.push_back(projection);
@@ -1513,7 +1519,8 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
     static std::atomic<bool> logged{false};
     bool expected = false;
     if (logged.compare_exchange_strong(expected, true)) {
-      LOG(INFO) << "[fusion-v2] materialization ACTIVE at node " << planNodeId();
+      LOG(INFO) << "[fusion-v2] materialization ACTIVE at node "
+                << planNodeId();
     }
   }
   const auto planned = probeType_->size();
@@ -1532,7 +1539,8 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
     const auto hopId = name.substr(6);
     auto* peerOp = operatorCtx_->driverCtx()->driver->findOperator(hopId);
     auto* peer = dynamic_cast<HashProbe*>(peerOp);
-    BOLT_CHECK_NOT_NULL(peer, "fusion v2: producing probe not found: {}", hopId);
+    BOLT_CHECK_NOT_NULL(
+        peer, "fusion v2: producing probe not found: {}", hopId);
     const auto* peerHop = peer->fusionHop();
     BOLT_CHECK_NOT_NULL(peerHop);
 
@@ -1576,7 +1584,7 @@ void HashProbe::materializeFusionRefs(vector_size_t size) {
       const auto& colName = peerOutputType.nameOf(projection.outputChannel);
       auto ourChannel = outputType_->getChildIdxIfExists(colName);
       if (!ourChannel.has_value()) {
-        continue;  // column projected away before the run end
+        continue; // column projected away before the run end
       }
       remapped.emplace_back(projection.inputChannel, ourChannel.value());
     }

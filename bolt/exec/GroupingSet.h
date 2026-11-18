@@ -173,6 +173,11 @@ class GroupingSet {
     return table_ ? table_->stats() : HashTableStats{};
   }
 
+  /// Returns the hash mode of the table; kHash before the first input.
+  BaseHashTable::HashMode hashMode() const {
+    return table_ ? table_->hashMode() : BaseHashTable::HashMode::kHash;
+  }
+
   /// Return the number of rows kept in memory.
   int64_t numRows() const {
     return table_ ? table_->rows()->numRows() : 0;

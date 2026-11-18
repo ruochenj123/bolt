@@ -31,8 +31,8 @@
 #pragma once
 
 #include "bolt/exec/GroupingSet.h"
-#include "bolt/exec/Operator.h"
 #include "bolt/exec/JoinAggReuse.h"
+#include "bolt/exec/Operator.h"
 namespace bytedance::bolt::exec {
 
 class HashAggregation : public Operator {
@@ -108,6 +108,14 @@ class HashAggregation : public Operator {
 
   // Invoked to record runtime metrics every output
   void recordRuntimeMetrics();
+
+  // Gives 'joinAggReuse_' the grouping set of its codes mode (JoinAggReuse.h):
+  // this aggregation's aggregates, grouped by one BIGINT id column per source
+  // join, appended to the input. 'numKeys' is the number of grouping keys of
+  // this aggregation.
+  void createJoinAggReuseGroupingSet(
+      const RowTypePtr& inputType,
+      uint32_t numKeys);
 
   const bool isPartialOutput_;
   const bool isPartialStep_;

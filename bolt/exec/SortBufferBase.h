@@ -50,6 +50,13 @@ class SortBufferBase {
 
   virtual std::optional<common::SortStats> sortStats() const = 0;
 
+  /// CPU time of the background hybrid payload-coalesce thread, which runs
+  /// off the driver thread and is therefore not in the operator's CPU time;
+  /// 0 if no such thread ran.
+  virtual uint64_t hybridCoalesceBackgroundCpuNanos() const {
+    return 0;
+  }
+
   virtual size_t numInputRows() const = 0;
 
   virtual size_t numOutputRows() const = 0;

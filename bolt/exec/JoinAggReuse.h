@@ -5,7 +5,6 @@
 
 #pragma once
 
-#include <array>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +23,7 @@
 namespace bytedance::bolt::exec {
 
 class BaseHashTable;
+class GroupingSet;
 class HashProbe;
 class RowContainer;
 
@@ -47,10 +47,15 @@ class RowContainer;
 ///    the groups (TPC-H Q17: the part row of l_partkey). Accumulators are
 ///    arrays indexed by the build rows' hybrid row ids, shared by all drivers
 ///    (relaxed atomics); the last driver emits one row per touched build row.
-///  - codes: every source's build rows get a dense code for their grouping
-///    values (computed once per table); a group is a combination of codes
-///    (SSB Q2.1: d_year x p_brand1). Each driver aggregates into its own
-///    array (or map) indexed by the combined code and emits its groups.
+///  - codes: a group is a combination of one id per source: the build row
+///    itself if the source's build rows are the groups (unique keys covered
+///    by the grouping keys, or too many rows to code), else a dense code of
+///    the row's grouping values (computed once per table; SSB Q2.1: d_year x
+///    p_brand1). Each driver aggregates in a GroupingSet of its own, with the
+///    aggregation's own aggregate functions, whose grouping keys are these
+///    ids (one BIGINT column per source): the hash table sees fixed-width
+///    integers (array mode while the codes are few) in place of the grouping
+///    values, and the driver emits its groups.
 /// Grouping keys are read from the joins' rows and HybridContainers once per
 /// group; the final aggregation downstream merges as usual.
 struct JoinAggReuseAgg {
@@ -64,24 +69,24 @@ struct JoinAggReuseAgg {
   TypePtr resultType;
   /// First accumulator slot of this aggregate.
   int32_t slot{0};
-  /// sum/avg over DECIMAL: the partial result is the serialized
-  /// LongDecimalWithOverflowState (count, overflow, 128-bit sum).
+  /// sum/avg over DECIMAL: its 128-bit state has no lock-free update, so the
+  /// spec runs in codes mode, on the aggregate function's own accumulator.
   bool decimal{false};
 
-  /// count uses one slot; sum/min/max/avg use value + non-null count; a
-  /// decimal sum/avg uses sum low, sum high, count and overflow.
+  /// Rows mode: count uses one slot; sum/min/max/avg use value + non-null
+  /// count. A decimal sum/avg has none (codes mode).
   int32_t numSlots() const {
     if (decimal) {
-      return 4;
+      return 0;
     }
     return (kind == Kind::kCountStar || kind == Kind::kCount) ? 1 : 2;
   }
 };
 
-/// A single source with unique build keys whose groups are coarser than its
-/// build rows (grouping keys not covering the join keys) uses codes mode up to
-/// this many build rows; beyond, it likely touches enough of them that coding
-/// costs more than rows mode.
+/// A source with unique build keys whose groups are coarser than its build
+/// rows (grouping keys not covering the join keys) codes its rows up to this
+/// many build rows; beyond, its build rows are the groups: it likely touches
+/// enough of them that coding costs more than it saves.
 constexpr uint64_t kJoinAggReuseMaxCodedRows = 1 << 20;
 
 /// A join whose build rows provide grouping keys.
@@ -111,7 +116,7 @@ struct JoinAggReuseSpec {
   /// Bottom-up; the order of the published row channels.
   std::vector<JoinAggReuseSource> sources;
   std::vector<JoinAggReuseAgg> aggs;
-  /// Slot 0 marks a touched group; the aggregates' slots follow.
+  /// Rows mode: slot 0 marks a touched group; the aggregates' slots follow.
   int32_t numSlots{1};
 
   /// Right-deep reuse: the chain's rows go to the build of a join above
@@ -139,8 +144,22 @@ struct JoinAggReuseSpec {
   /// Initial 64-bit pattern of every slot (min/max start at the extremes).
   std::vector<int64_t> slotInitValues() const;
 
+  /// True if some source need not extract a build column it would otherwise
+  /// extract for the grouping keys. Codes mode saves nothing else: without
+  /// such a column (the grouping keys are probe keys) the aggregation hashes
+  /// its keys as cheaply itself, and flushes or abandons when they do not
+  /// reduce.
+  bool skipsBuildColumns() const {
+    for (const auto& source : sources) {
+      if (!source.nullableBuildColumns.empty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /// Decimal sums have no lock-free update: such a spec runs in codes mode,
-  /// where each driver has its own slots.
+  /// where each driver has its own accumulators.
   bool hasDecimal() const {
     for (const auto& a : aggs) {
       if (a.decimal) {
@@ -209,8 +228,7 @@ class JoinAggReusePlan {
  private:
   std::unordered_set<core::PlanNodeId> passThrough_;
   std::vector<std::unique_ptr<JoinAggReuseSpec>> specs_;
-  std::unordered_map<core::PlanNodeId, const JoinAggReuseSpec*>
-      byAggregation_;
+  std::unordered_map<core::PlanNodeId, const JoinAggReuseSpec*> byAggregation_;
   std::unordered_map<core::PlanNodeId, Member> byJoin_;
   std::unordered_map<core::PlanNodeId, const JoinAggReuseSpec*> byBuild_;
   std::unordered_map<core::PlanNodeId, const JoinAggReuseSpec*> byOrderBy_;
@@ -221,8 +239,8 @@ std::vector<JoinAggReuseSpec> analyzeJoinAggReuse(
     const std::vector<core::PlanNodePtr>& pipelineNodes);
 
 /// Right-deep reuse in one pipeline, if it is the build pipeline of a join
-/// ('consumerNode') fed by another join (see JoinAggReuseSpec::RightDeep). Joins that
-/// are sources of an aggregation reuse in 'plan' are left alone.
+/// ('consumerNode') fed by another join (see JoinAggReuseSpec::RightDeep).
+/// Joins that are sources of an aggregation reuse in 'plan' are left alone.
 std::optional<JoinAggReuseSpec> analyzeRightDeep(
     const std::vector<core::PlanNodePtr>& pipelineNodes,
     const core::PlanNodePtr& consumerNode,
@@ -328,7 +346,7 @@ class JoinAggReuseCodes {
   }
 
   /// A build row with the values of each of 'codes'.
-  void representatives(const int32_t* codes, int32_t count, char** rows) const;
+  void representatives(const int64_t* codes, int32_t count, char** rows) const;
 
   int32_t numCodes() const;
 
@@ -354,6 +372,20 @@ class JoinAggReuseConsumer {
       std::vector<HashProbe*> sources,
       HashProbe* rowsFrom);
 
+  ~JoinAggReuseConsumer();
+
+  /// Codes mode aggregates in 'groupingSet': the aggregation's aggregates,
+  /// grouped by one id per source (its code or its build row). 'inputType' is
+  /// the aggregation's input with one BIGINT id column per source appended
+  /// (the grouping keys of 'groupingSet'); 'resultType' is the id columns
+  /// followed by the partial results. Inputs longer than 'maxInputBatchRows'
+  /// are added in slices, as HashAggregation does.
+  void setCodesGroupingSet(
+      std::unique_ptr<GroupingSet> groupingSet,
+      RowTypePtr inputType,
+      RowTypePtr resultType,
+      vector_size_t maxInputBatchRows);
+
   /// True when the sources activated the reuse (decided from their tables;
   /// the same for all drivers).
   bool active() const;
@@ -363,31 +395,31 @@ class JoinAggReuseConsumer {
   void addInput(Operator& op, const RowVectorPtr& input);
 
   /// Rows mode: hands this driver's touched rows over and joins the barrier
-  /// of the aggregation's drivers; the last one emits. Codes mode: nothing.
+  /// of the aggregation's drivers; the last one emits. Codes mode: nothing
+  /// to coordinate, every driver emits its own groups.
   void noMoreInput(Operator& op);
 
   /// Next batch of partial results; nullptr when done.
-  RowVectorPtr getOutput(
-      Operator& op,
-      const RowTypePtr& outputType,
-      int32_t maxRows);
+  RowVectorPtr
+  getOutput(Operator& op, const RowTypePtr& outputType, int32_t maxRows);
+
+  /// Codes mode: the grouping set, for the operator's stats.
+  GroupingSet* codesGroupingSet() const {
+    return groupingSet_.get();
+  }
+
+  size_t numSources() const {
+    return sources_.size();
+  }
 
  private:
   bool rowsMode() const;
   void addInputRows(Operator& op, const RowVectorPtr& input);
   void addInputCodes(Operator& op, const RowVectorPtr& input);
-  void accumulate(
-      const RowVectorPtr& input,
-      const std::vector<int64_t*>& slots,
-      bool atomic);
-  RowVectorPtr outputRows(
-      Operator& op,
-      const RowTypePtr& outputType,
-      int32_t maxRows);
-  RowVectorPtr outputCodes(
-      Operator& op,
-      const RowTypePtr& outputType,
-      int32_t maxRows);
+  RowVectorPtr
+  outputRows(Operator& op, const RowTypePtr& outputType, int32_t maxRows);
+  RowVectorPtr
+  outputCodes(Operator& op, const RowTypePtr& outputType, int32_t maxRows);
   void fillAggregates(
       Operator& op,
       const RowVectorPtr& result,
@@ -407,24 +439,19 @@ class JoinAggReuseConsumer {
   std::vector<char*> emitRows_;
   size_t emitPosition_{0};
 
-  // Codes mode: a group is the tuple of its sources' codes; each driver
-  // keeps its groups in a map, in the order they appear.
-  static constexpr size_t kMaxSources = 4;
-  struct GroupKey {
-    std::array<int32_t, kMaxSources> codes{};
-    bool operator==(const GroupKey& other) const {
-      return codes == other.codes;
-    }
-  };
-  struct GroupKeyHash {
-    size_t operator()(const GroupKey& key) const;
-  };
+  // Codes mode: a group is the tuple of its sources' ids, the grouping keys
+  // of 'groupingSet_'. The id of a build row is its code, or the row itself
+  // (its address) for a source without codes (null in 'codes_').
   std::vector<std::shared_ptr<JoinAggReuseCodes>> codes_;
   std::vector<std::shared_ptr<BaseHashTable>> sourceTables_;
-  folly::F14FastMap<GroupKey, uint32_t, GroupKeyHash> groupIndex_;
-  std::vector<GroupKey> groupKeys_;
-  std::vector<int64_t> groupSlots_;
-  std::vector<int64_t> initValues_;
+  std::unique_ptr<GroupingSet> groupingSet_;
+  RowTypePtr codedInputType_;
+  RowTypePtr codesResultType_;
+  vector_size_t maxInputBatchRows_{0};
+  RowContainerIterator resultIterator_;
+  // A DISTINCT (no aggregates) has no accumulators to list at the end: the
+  // ids of its groups, in the order they appear ('sources_.size()' each).
+  std::vector<int64_t> distinctIds_;
 };
 
 } // namespace bytedance::bolt::exec

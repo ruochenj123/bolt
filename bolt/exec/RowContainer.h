@@ -30,12 +30,12 @@
 
 #pragma once
 
+#include <folly/CPortability.h>
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
-#include <folly/CPortability.h>
 #include "bolt/common/memory/HashStringAllocator.h"
 #include "bolt/core/PlanNode.h"
 #include "bolt/exec/ContainerRowSerde.h"
@@ -350,7 +350,7 @@ class RowContainer {
   void storeSingleRowId(uint64_t& value, char* FOLLY_NONNULL row) {
     *reinterpret_cast<int64_t*>(row + rowIdOffset_) = value;
   }
-  
+
   // Get the stored row id from the row at the reserved offset for hybrid design
   uint64_t getSingleRowId(char* FOLLY_NONNULL row) const {
     return *reinterpret_cast<int64_t*>(row + rowIdOffset_);
@@ -365,8 +365,9 @@ class RowContainer {
       char* FOLLY_NONNULL row,
       int32_t column);
 
-  /// Velox-style store: stores all values from 'decoded' into 'rows' at 'column'.
-  /// Uses the existing store() method which handles type dispatch internally.
+  /// Velox-style store: stores all values from 'decoded' into 'rows' at
+  /// 'column'. Uses the existing store() method which handles type dispatch
+  /// internally.
   void storeColumnVelox(
       const DecodedVector& decoded,
       size_t size,
@@ -2087,7 +2088,8 @@ class HybridContainer {
 
   /// Get all containers map (keyed by containerId/driverId).
   /// Used for looking up the correct container when extracting upstream refs.
-  const std::unordered_map<uint8_t, HybridContainer*>& getAllContainers() const {
+  const std::unordered_map<uint8_t, HybridContainer*>& getAllContainers()
+      const {
     return allContainers_;
   }
 
@@ -2148,11 +2150,10 @@ class HybridContainer {
     bool first = true;
     for (const auto& buffer : source->stringBuffers()) {
       if (first) {
-        result->addStringBuffer(
-            BufferView<HybridPayloadBufferReleaser>::create(
-                buffer->as<uint8_t>(),
-                std::min<uint64_t>(referencedBytes, buffer->size()),
-                HybridPayloadBufferReleaser{buffer}));
+        result->addStringBuffer(BufferView<HybridPayloadBufferReleaser>::create(
+            buffer->as<uint8_t>(),
+            std::min<uint64_t>(referencedBytes, buffer->size()),
+            HybridPayloadBufferReleaser{buffer}));
         first = false;
       } else {
         result->addStringBuffer(buffer);
@@ -3090,9 +3091,9 @@ class HybridContainer {
       uint32_t numRows,
       std::vector<HybridRowId>& outputRowIds) {
     BOLT_CHECK_EQ(numRows, outputRowIds.size());
-    // NOTE: For N-way late-m, payloadTypes can be empty (join only stores keys).
-    // We still need to extract rowIds for upstream traversal.
-    // The rowIdColumnOffset_ is always valid since it's the uint64_t column
+    // NOTE: For N-way late-m, payloadTypes can be empty (join only stores
+    // keys). We still need to extract rowIds for upstream traversal. The
+    // rowIdColumnOffset_ is always valid since it's the uint64_t column
     // appended after the key columns.
     constexpr int32_t kPrefetchDist = 16;
     for (int32_t i = 0; i < numRows; ++i) {

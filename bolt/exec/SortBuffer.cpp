@@ -29,12 +29,13 @@
  */
 
 #include "SortBuffer.h"
+#include <folly/ScopeGuard.h>
 #include <algorithm>
 #include <numeric>
 #include <thread>
-#include <folly/ScopeGuard.h>
 #include "HashTable.h"
 #include "Spiller.h"
+#include "bolt/common/process/ProcessBase.h"
 #include "bolt/exec/MemoryReclaimer.h"
 #include "bolt/exec/RowToColumnVector.h"
 #include "bolt/jit/RowContainer/RowContainerCodeGenerator.h"
@@ -195,10 +196,7 @@ void SortBuffer::addInput(const VectorPtr& input) {
       DecodedVector decoded(
           *inputRow->childAt(columnProjection.outputChannel), allRows);
       data_->storeColumnVelox(
-          decoded,
-          input->size(),
-          rows,
-          columnProjection.inputChannel);
+          decoded, input->size(), rows, columnProjection.inputChannel);
     }
   }
 
@@ -227,7 +225,10 @@ void SortBuffer::noMoreInput() {
   if (hybridCoalesce && spiller_ == nullptr) {
     coalesceThread = std::thread([&]() {
       try {
+        const auto cpuStart = process::threadCpuNanos();
         hybridData_->coalesceBatches();
+        hybridCoalesceBackgroundCpuNanos_ +=
+            process::threadCpuNanos() - cpuStart;
       } catch (...) {
         coalesceError = std::current_exception();
       }
@@ -739,7 +740,7 @@ void SortBuffer::prepareOutputWithSpill() {
 std::vector<size_t> SortBuffer::getOriginalRowIndices() const {
   std::vector<size_t> indices;
   indices.reserve(sortedRows_.size());
-  
+
   if (hybridSortEnabled_ && data_) {
     // Extract original row index from stored rowId (low 56 bits)
     for (char* row : sortedRows_) {
@@ -748,14 +749,15 @@ std::vector<size_t> SortBuffer::getOriginalRowIndices() const {
       indices.push_back(originalIndex);
     }
   } else {
-    // Non-hybrid mode: rows are stored in order, so we need to find original index
-    // by comparing pointers. This is less efficient but provides fallback.
-    // For now, just return sequential indices (no reordering supported).
+    // Non-hybrid mode: rows are stored in order, so we need to find original
+    // index by comparing pointers. This is less efficient but provides
+    // fallback. For now, just return sequential indices (no reordering
+    // supported).
     for (size_t i = 0; i < sortedRows_.size(); ++i) {
       indices.push_back(i);
     }
   }
-  
+
   return indices;
 }
 

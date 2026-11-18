@@ -211,8 +211,8 @@ RowVectorPtr OrderBy::replaceDeferredColumns(const RowVectorPtr& input) {
   auto& channels = deferralSource_->joinAggReuseChannels();
   BOLT_CHECK_EQ(channels.size(), 1);
   BOLT_CHECK_EQ(channels[0].size(), input->size());
-  auto refs = BaseVector::create<FlatVector<int64_t>>(
-      BIGINT(), input->size(), pool());
+  auto refs =
+      BaseVector::create<FlatVector<int64_t>>(BIGINT(), input->size(), pool());
   auto* rawRefs = refs->mutableRawValues();
   for (vector_size_t i = 0; i < input->size(); ++i) {
     rawRefs[i] = reinterpret_cast<int64_t>(channels[0][i]);
@@ -274,6 +274,14 @@ void OrderBy::reclaim(
 void OrderBy::noMoreInput() {
   Operator::noMoreInput();
   sortBuffer_->noMoreInput();
+  // The coalesce thread was joined in noMoreInput(); its CPU is not in this
+  // operator's CPU time, so report it separately.
+  if (const auto coalesceCpu = sortBuffer_->hybridCoalesceBackgroundCpuNanos();
+      coalesceCpu > 0) {
+    addRuntimeStat(
+        "hybridCoalesceBgCpuNanos",
+        RuntimeCounter(coalesceCpu, RuntimeCounter::Unit::kNanos));
+  }
   maxOutputRows_ = outputBatchRows(sortBuffer_->estimateOutputRowSize());
   recordSpillStats();
 }
